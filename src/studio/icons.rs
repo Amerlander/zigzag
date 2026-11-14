@@ -85,6 +85,11 @@ pub enum Icon {
     Check,
     /// A rounded corner.
     RoundCorner,
+    /// A shape inside a heavy edge: Add Outline.
+    AddOutline,
+    /// An empty outline with a line struck through it: no outline
+    /// (Remove Outline), as "none" is drawn for a stroke in Illustrator.
+    NoOutline,
     /// The Brush group's clean-up tools: a brush over a smooth wave, an
     /// eraser cutting a line, two lines meeting at a point.
     Smooth,
@@ -108,21 +113,82 @@ pub enum Icon {
     ShapeLine,
 }
 
+/// An icon's line weight in a box `side` points across: a whole number of
+/// screen pixels, so that every line of every icon is as heavy as the next
+/// (a line a fraction of a pixel wide is drawn soft, and looks thinner).
+pub fn line_width(side: f32, pixels_per_point: f32) -> f32 {
+    ((side / 11.0).clamp(1.1, 1.8) * pixels_per_point)
+        .round()
+        .max(1.0)
+        / pixels_per_point
+}
+
+/// Level and upright lines of a path moved onto the pixel grid, where a
+/// line `width` wide is drawn crisp, as egui does for the rectangles icons
+/// are also made of (it leaves paths where they are, and a line that falls
+/// between pixels looks thinner than a rectangle's side next to it). Slanted
+/// and curved parts stay where they are.
+fn on_pixels(pts: &mut [Pos2], closed: bool, width: f32, pixels_per_point: f32) {
+    let n = pts.len();
+    if n < 2 {
+        return;
+    }
+    // An odd number of pixels wide: centered on a pixel; even: between two.
+    let odd = (width * pixels_per_point).round() as i64 % 2 == 1;
+    let snap = |v: f32| {
+        if odd {
+            ((v * pixels_per_point - 0.5).round() + 0.5) / pixels_per_point
+        } else {
+            (v * pixels_per_point).round() / pixels_per_point
+        }
+    };
+    let was = pts.to_vec();
+    for i in 0..n {
+        let before = if i > 0 {
+            Some(was[i - 1])
+        } else {
+            closed.then(|| was[n - 1])
+        };
+        let after = if i + 1 < n {
+            Some(was[i + 1])
+        } else {
+            closed.then(|| was[0])
+        };
+        for q in [before, after].into_iter().flatten() {
+            if q == was[i] {
+                continue;
+            }
+            if (q.x - was[i].x).abs() < 1e-3 {
+                pts[i].x = snap(was[i].x);
+            }
+            if (q.y - was[i].y).abs() < 1e-3 {
+                pts[i].y = snap(was[i].y);
+            }
+        }
+    }
+}
+
 pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
-    let w = (r.width().min(r.height()) / 11.0).clamp(1.1, 1.8);
-    let s = Stroke::new(w, c);
     // Unit coordinates: (0,0) top-left .. (1,1) bottom-right of a square box.
     let side = r.width().min(r.height());
+    let ppp = p.pixels_per_point();
+    let w = line_width(side, ppp);
+    let s = Stroke::new(w, c);
     let o = r.center() - Vec2::splat(side / 2.0);
     let at = |x: f32, y: f32| Pos2::new(o.x + x * side, o.y + y * side);
     let line = |pts: &[(f32, f32)]| {
-        p.add(Shape::line(pts.iter().map(|&(x, y)| at(x, y)).collect(), s));
+        let mut v: Vec<Pos2> = pts.iter().map(|&(x, y)| at(x, y)).collect();
+        on_pixels(&mut v, false, w, ppp);
+        p.add(Shape::line(v, s));
     };
     let closed = |pts: &[(f32, f32)], fill: Option<Color32>| {
-        let v: Vec<Pos2> = pts.iter().map(|&(x, y)| at(x, y)).collect();
+        let mut v: Vec<Pos2> = pts.iter().map(|&(x, y)| at(x, y)).collect();
         match fill {
             Some(f) => p.add(Shape::convex_polygon(v, f, Stroke::NONE)),
-            None => p.add(Shape::closed_line(v, s)),
+            None => {
+                on_pixels(&mut v, true, w, ppp);
+                p.add(Shape::closed_line(v, s))
+            }
         };
     };
     let arc = |cx: f32, cy: f32, rad: f32, a0: f32, a1: f32| {
@@ -375,9 +441,39 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
             }
         }
         Icon::RoundCorner => {
-            line(&[(0.15, 0.88), (0.15, 0.55)]);
-            arc(0.55, 0.55, 0.4, PI, 1.5 * PI);
-            line(&[(0.55, 0.15), (0.88, 0.15)]);
+            // One line: up, round the corner, across.
+            let mut v = vec![(0.15, 0.88)];
+            v.extend((0..=16).map(|k| {
+                let a = PI + 0.5 * PI * k as f32 / 16.0;
+                (0.55 + 0.4 * a.cos(), 0.55 + 0.4 * a.sin())
+            }));
+            v.push((0.88, 0.15));
+            line(&v);
+        }
+        Icon::AddOutline => {
+            // The shape, and the outline round it (at the weight of every
+            // other icon's lines).
+            p.rect_filled(
+                Rect::from_min_max(at(0.25, 0.25), at(0.75, 0.75)),
+                side * 0.09,
+                c,
+            );
+            p.rect_stroke(
+                Rect::from_min_max(at(0.08, 0.08), at(0.92, 0.92)),
+                side * 0.2,
+                s,
+                eframe::egui::StrokeKind::Middle,
+            );
+        }
+        Icon::NoOutline => {
+            p.rect_stroke(
+                Rect::from_min_max(at(0.1, 0.1), at(0.9, 0.9)),
+                side * 0.2,
+                s,
+                eframe::egui::StrokeKind::Middle,
+            );
+            // (Struck through from corner to corner, a little past each.)
+            line(&[(0.0, 1.0), (1.0, 0.0)]);
         }
         Icon::ShapeRect => {
             p.rect_stroke(
@@ -573,19 +669,24 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
             line(&[(0.72, 0.44), (0.84, 0.6), (0.96, 0.44)]);
         }
         Icon::Gear => {
-            // Eight square teeth round a ring, and the hole for the shaft.
-            let (teeth, outer, inner) = (8, 0.5, 0.37);
+            // Six broad teeth round a ring, and the hole for the shaft:
+            // few enough, and with room enough round the hole, to read as
+            // a gear at the size of a button (eight narrow ones crowded
+            // it). Its teeth stop short of the box's edge, as the other
+            // icons' lines do.
+            let (teeth, outer, inner) = (6, 0.46, 0.33);
             let step = std::f32::consts::TAU / teeth as f32;
             let mut rim = Vec::with_capacity(teeth * 4);
             for k in 0..teeth {
-                let a = k as f32 * step;
-                for (da, rad) in [(-0.27, inner), (-0.17, outer), (0.17, outer), (0.27, inner)] {
+                // (A tooth straight up, so it sits level in its box.)
+                let a = k as f32 * step - std::f32::consts::FRAC_PI_2;
+                for (da, rad) in [(-0.3, inner), (-0.19, outer), (0.19, outer), (0.3, inner)] {
                     let b = a + da * step;
                     rim.push(at(0.5 + rad * b.cos(), 0.5 + rad * b.sin()));
                 }
             }
             p.add(Shape::closed_line(rim, s));
-            p.circle_stroke(at(0.5, 0.5), side * 0.15, s);
+            p.circle_stroke(at(0.5, 0.5), side * 0.11, s);
         }
         Icon::Target => {
             p.circle_stroke(at(0.5, 0.5), side * 0.3, s);

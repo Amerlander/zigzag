@@ -488,6 +488,8 @@ mod tests {
             },
             uid: 0,
             groups: Vec::new(),
+            outline: false,
+            origin: P::default(),
         }
     }
 

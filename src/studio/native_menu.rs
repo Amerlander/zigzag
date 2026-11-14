@@ -155,8 +155,11 @@ mod imp {
                 &PredefinedMenuItem::hide_others(None),
                 &PredefinedMenuItem::show_all(None),
                 &PredefinedMenuItem::separator(),
-                &PredefinedMenuItem::quit(None),
             ])?;
+            // Quit ZigZag: ZigZag's own, so that documents with unsaved
+            // changes are asked about first (the system's ends the app
+            // there and then).
+            me.fill(&app, &[crate::commands::QUIT_ITEM], studio)?;
             me._menu.append(&app)?;
             for (title, entries) in menus() {
                 let sub = Submenu::new(title, true);

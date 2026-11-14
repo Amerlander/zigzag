@@ -833,13 +833,12 @@ pub fn path_corners(path: &BezPath) -> Vec<Corner> {
         .collect()
 }
 
-/// `path` with its corners cut: `radius(corner)` gives each one's radius
-/// (0: leave it), fitted so that neighbouring cuts never pass each other.
-pub fn cut_corners(path: &BezPath, radius: impl Fn(AnchorRef) -> f64, kind: CornerKind) -> BezPath {
-    let corners = path_corners(path);
+/// The radius each corner gets when `radius(corner)` is asked of it: no
+/// more than its sides have room for beside its neighbours' cuts.
+fn fit_radii(corners: &[Corner], radius: &impl Fn(AnchorRef) -> f64) -> Vec<(AnchorRef, f64)> {
     let find = |r: AnchorRef| corners.iter().find(|c| c.at_ref == r);
     let asked = |r: AnchorRef| find(r).map_or(0.0, |c| c.setback(radius(r).max(0.0)));
-    let fitted: Vec<(AnchorRef, f64)> = corners
+    corners
         .iter()
         .map(|c| {
             let own = radius(c.at_ref).max(0.0);
@@ -848,8 +847,42 @@ pub fn cut_corners(path: &BezPath, radius: impl Fn(AnchorRef) -> f64, kind: Corn
                 own.min(c.max_radius_beside(asked(c.before), asked(c.after))),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// The radius [`cut_corners`] really gives each corner of `path`.
+pub fn fitted_radii(path: &BezPath, radius: impl Fn(AnchorRef) -> f64) -> Vec<(AnchorRef, f64)> {
+    fit_radii(&path_corners(path), &radius)
+}
+
+/// The radius [`cut_corners`] really gives the corner at `at` (what a
+/// readout should say: asking for more than fits changes nothing).
+pub fn fitted_radius(path: &BezPath, radius: impl Fn(AnchorRef) -> f64, at: AnchorRef) -> f64 {
+    fit_radii(&path_corners(path), &radius)
+        .into_iter()
+        .find(|(r, _)| *r == at)
+        .map_or(0.0, |(_, r)| r)
+}
+
+/// `path` with its corners cut: `radius(corner)` gives each one's radius
+/// (0: leave it), fitted so that neighbouring cuts never pass each other.
+pub fn cut_corners(path: &BezPath, radius: impl Fn(AnchorRef) -> f64, kind: CornerKind) -> BezPath {
+    cut_corners_from(path, radius, kind).0
+}
+
+/// [`cut_corners`], and for each anchor of the result (per subpath) the
+/// anchor of `path` it comes from: a cut corner's two points both come from
+/// that corner.
+pub fn cut_corners_from(
+    path: &BezPath,
+    radius: impl Fn(AnchorRef) -> f64,
+    kind: CornerKind,
+) -> (BezPath, Vec<Vec<usize>>) {
+    let corners = path_corners(path);
+    let find = |r: AnchorRef| corners.iter().find(|c| c.at_ref == r);
+    let fitted = fit_radii(&corners, &radius);
     let mut out = Vec::with_capacity(path.len());
+    let mut sources = Vec::with_capacity(path.len());
     for (s, sp) in path.iter().enumerate() {
         let n = sp.anchors.len();
         let cuts: Vec<Option<Cut>> = (0..n)
@@ -881,6 +914,7 @@ pub fn cut_corners(path: &BezPath, radius: impl Fn(AnchorRef) -> f64, kind: Corn
             })
             .collect();
         let mut anchors = Vec::with_capacity(n + 4);
+        let mut from = Vec::with_capacity(n + 4);
         let mut closing = None;
         for (i, a) in sp.anchors.iter().enumerate() {
             let h_in = if i > 0 || sp.closed {
@@ -905,25 +939,91 @@ pub fn cut_corners(path: &BezPath, radius: impl Fn(AnchorRef) -> f64, kind: Corn
                         closing = Some(start);
                     } else {
                         anchors.push(start);
+                        from.push(i);
                     }
                     anchors.push(end);
+                    from.push(i);
                 }
-                None => anchors.push(Anchor {
-                    p: a.p,
-                    h_in,
-                    h_out,
-                }),
+                None => {
+                    anchors.push(Anchor {
+                        p: a.p,
+                        h_in,
+                        h_out,
+                    });
+                    from.push(i);
+                }
             }
         }
         if let Some(a) = closing {
             anchors.push(a);
+            from.push(0);
         }
         out.push(SubPath {
             anchors,
             closed: sp.closed,
         });
+        sources.push(from);
     }
-    out
+    (out, sources)
+}
+
+/// A path whose corners stay live, after VectorCraft's Live Corners
+/// (`doc/src/corners.rs`, MIT OR Apache-2.0): the outline as it was before
+/// any corner was rounded, and the radius each of its anchors' corners is
+/// rounded with (0: left sharp). The path as drawn is cut from the two
+/// ([`LiveCorners::path`]), so a rounded corner can be rounded more, or
+/// less, or made sharp again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveCorners {
+    pub base: BezPath,
+    /// A radius for every anchor of `base`, subpath by subpath.
+    pub radii: Vec<Vec<f64>>,
+}
+
+impl LiveCorners {
+    /// `path` with no corner rounded.
+    pub fn plain(path: BezPath) -> LiveCorners {
+        let radii = path.iter().map(|sp| vec![0.0; sp.anchors.len()]).collect();
+        LiveCorners { base: path, radii }
+    }
+
+    /// The radius asked of the corner at `at` (it may be drawn with less:
+    /// [`LiveCorners::drawn`]).
+    pub fn radius(&self, (s, k): AnchorRef) -> f64 {
+        self.radii
+            .get(s)
+            .and_then(|r| r.get(k))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    pub fn set_radius(&mut self, (s, k): AnchorRef, radius: f64) {
+        if let Some(r) = self.radii.get_mut(s).and_then(|r| r.get_mut(k)) {
+            *r = radius.max(0.0);
+        }
+    }
+
+    /// The radius the corner at `at` is drawn with: its own, no larger
+    /// than its sides have room for.
+    pub fn drawn(&self, at: AnchorRef) -> f64 {
+        fitted_radius(&self.base, |r| self.radius(r), at)
+    }
+
+    /// No corner is rounded: the path is its outline.
+    pub fn is_plain(&self) -> bool {
+        self.radii.iter().flatten().all(|r| *r <= 0.0)
+    }
+
+    /// The path as drawn.
+    pub fn path(&self) -> BezPath {
+        cut_corners(&self.base, |r| self.radius(r), CornerKind::Round)
+    }
+
+    /// The path as drawn, and the anchor of `base` each of its anchors
+    /// comes from ([`cut_corners_from`]).
+    pub fn path_from(&self) -> (BezPath, Vec<Vec<usize>>) {
+        cut_corners_from(&self.base, |r| self.radius(r), CornerKind::Round)
+    }
 }
 
 // ------------------------------------------------------------ freehand
@@ -1601,6 +1701,21 @@ mod tests {
                 .collect(),
             closed,
         }]
+    }
+
+    #[test]
+    fn a_fitted_radius_is_what_the_corner_has_room_for() {
+        let sq = poly(
+            &[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+            true,
+        );
+        // All four together: each can take half a side.
+        assert_eq!(fitted_radius(&sq, |_| 10.0, (0, 0)), 10.0);
+        assert!((fitted_radius(&sq, |_| 200.0, (0, 0)) - 50.0).abs() < 1e-9);
+        // One alone: the whole side.
+        let one = |r: AnchorRef| if r == (0, 0) { 200.0 } else { 0.0 };
+        assert!((fitted_radius(&sq, one, (0, 0)) - 100.0).abs() < 1e-9);
+        assert_eq!(fitted_radius(&sq, one, (0, 1)), 0.0);
     }
 
     #[test]

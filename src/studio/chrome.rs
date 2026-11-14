@@ -260,10 +260,12 @@ impl Studio {
                 SelThread::None => "Select layers to set their thread color".into(),
             });
             if resp.clicked() {
-                self.picker = match self.picker {
-                    Some(_) => None,
-                    None => Some(r.right_top() + Vec2::new(10.0, -8.0)),
-                };
+                // (Open for an outline, it becomes the selection's.)
+                if self.picker.is_some() && self.picker_for.is_none() {
+                    self.close_picker();
+                } else {
+                    self.open_picker(r.right_top() + Vec2::new(10.0, -8.0), None);
+                }
             }
             // A floating panel rather than a popup, so the palette menus
             // inside it can open their own popups.
@@ -285,7 +287,7 @@ impl Studio {
                             .is_some_and(|p| !area.response.rect.contains(p) && !r.contains(p))
                 });
                 if outside && !egui::Popup::is_any_open(&ctx) {
-                    self.picker = None;
+                    self.close_picker();
                 }
             }
             // At the bottom, apart from the tools: the agent's panel.

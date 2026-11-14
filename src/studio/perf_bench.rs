@@ -177,3 +177,241 @@ fn typing_and_dragging_on_a_traced_logo() {
     report("pan", &pan);
     h.drop_at(p0 + Vec2::new(40.0, 0.0));
 }
+
+/// Frame times of the everyday gestures on designs of your own: every
+/// `.svg` in the folder `ZIGZAG_DESIGNS` names. Each figure is the UI pass
+/// of a frame (what [`Studio::frame`] takes; the app draws stitches on the
+/// GPU, so the painter's tessellation of them here would say nothing).
+/// With `TL_PROFILE=1`, each frame's sections go to stderr as well.
+///
+/// `ZIGZAG_DESIGNS=<folder> cargo test --release --features gui --bin zigzag-studio perf_bench::gestures -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gestures_on_designs_of_your_own() {
+    let dir = std::env::var("ZIGZAG_DESIGNS").expect("ZIGZAG_DESIGNS: a folder of .svg files");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "svg"))
+        .collect();
+    files.sort();
+    for file in files {
+        let name = file.file_stem().unwrap().to_string_lossy().into_owned();
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1600.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        h.state_mut().planner.timed = true;
+        let doc = zigzag::document::Document::open(&file).unwrap();
+        h.state_mut().set_document(doc);
+        h.run_steps(5);
+        let step = |h: &mut Harness<'static, Studio>,
+                    what: &str,
+                    n: usize,
+                    f: &mut dyn FnMut(&mut Harness<'static, Studio>, usize)| {
+            eprintln!("-- {name}: {what}");
+            let ms: Vec<f64> = (0..n)
+                .map(|k| {
+                    f(h, k);
+                    let t = std::time::Instant::now();
+                    h.step();
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            report(&format!("  {what}"), &ms);
+        };
+        // A plan of the whole design, from nothing.
+        let t = std::time::Instant::now();
+        let fresh = h.state().doc.plan_cached(&mut Default::default());
+        println!(
+            "{name}: {} objects, {} stitches; a plan from nothing {:.1} ms, the last one {:.1} ms{}",
+            h.state().doc.shapes.len(),
+            fresh.stitch_count(),
+            t.elapsed().as_secs_f64() * 1000.0,
+            h.state().plan_ms,
+            if h.state().planner.slow {
+                " (planned in the background)"
+            } else {
+                ""
+            },
+        );
+        let rect = h.state().canvas_rect;
+        let c = rect.center();
+        step(&mut h, "idle", 10, &mut |_, _| {});
+        step(&mut h, "pointer moving over the design", 20, &mut |h, k| {
+            h.hover_at(c + Vec2::new(k as f32 * 9.0 - 90.0, k as f32 * 5.0 - 50.0))
+        });
+        // The object with the most corners showing widgets, selected.
+        let mut best = (0, 0);
+        for i in 0..h.state().doc.shapes.len() {
+            h.state_mut().set_selection(&[i]);
+            if h.state_mut().editable_path().is_some() {
+                let n = h.state().corner_widgets().len();
+                if n > best.1 {
+                    best = (i, n);
+                }
+            }
+        }
+        let (i, n) = best;
+        h.state_mut().set_selection(&[i]);
+        h.run_steps(2);
+        step(
+            &mut h,
+            &format!("idle, one selected ({n} corner widgets)"),
+            10,
+            &mut |_, _| {},
+        );
+        let at = h.state().view.to_screen(
+            rect,
+            crate::app::shape_bounds(&h.state().doc.shapes[i]).center(),
+        );
+        step(
+            &mut h,
+            "pointer moving over the selection",
+            20,
+            &mut |h, k| h.hover_at(at + Vec2::new(k as f32 * 2.0 - 20.0, k as f32 - 10.0)),
+        );
+        // Rounding its corners.
+        h.state_mut().editable_path();
+        if let Some(&(corner, w)) = h.state().corner_widgets().first() {
+            let from = h.state().view.to_screen(rect, w);
+            let to = h
+                .state()
+                .view
+                .to_screen(rect, w + (corner.u + corner.v).norm() * 30.0);
+            h.hover_at(from);
+            h.run_steps(1);
+            h.drag_at(from);
+            h.run_steps(1);
+            step(&mut h, "dragging a corner widget", 20, &mut |h, k| {
+                h.hover_at(from + (to - from) * ((k + 1) as f32 / 20.0))
+            });
+            step(&mut h, "letting it go", 1, &mut |h, _| h.drop_at(to));
+            h.run_steps(2);
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+            h.run_steps(3);
+        }
+        // Moving it.
+        h.hover_at(at);
+        h.run_steps(1);
+        h.drag_at(at);
+        h.run_steps(1);
+        step(&mut h, "dragging the object", 20, &mut |h, k| {
+            h.hover_at(at + Vec2::new(k as f32 * 3.0 + 3.0, k as f32))
+        });
+        step(&mut h, "letting it go", 1, &mut |h, _| {
+            h.drop_at(at + Vec2::new(60.0, 20.0))
+        });
+        step(&mut h, "the frames after", 3, &mut |_, _| {});
+        // A setting changed (a slider's every step re-plans).
+        step(&mut h, "a stitch setting, step by step", 10, &mut |h, k| {
+            if let Some(i) = h.state().sel_index() {
+                h.state_mut().doc.shapes[i].params.spacing = Some(0.3 + k as f64 * 0.01);
+            }
+        });
+        // Everything selected, and moved.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.run_steps(2);
+        let n = h.state().sel_indices().len();
+        step(
+            &mut h,
+            &format!("idle, all {n} selected"),
+            10,
+            &mut |_, _| {},
+        );
+        let at = h
+            .state()
+            .view
+            .to_screen(rect, h.state().selection_bounds().center());
+        h.hover_at(at);
+        h.run_steps(1);
+        h.drag_at(at);
+        h.run_steps(1);
+        step(&mut h, "dragging everything", 20, &mut |h, k| {
+            h.hover_at(at + Vec2::new(k as f32 * 3.0 + 3.0, 0.0))
+        });
+        step(&mut h, "letting it go", 1, &mut |h, _| {
+            h.drop_at(at + Vec2::new(60.0, 0.0))
+        });
+        step(&mut h, "the frames after", 3, &mut |_, _| {});
+        // The recovery copy written (it is after every edit settles).
+        let t = std::time::Instant::now();
+        let svg = h.state().doc.to_svg().unwrap();
+        println!(
+            "  writing it out as SVG                {:6.2} ms ({} KB)",
+            t.elapsed().as_secs_f64() * 1000.0,
+            svg.len() / 1024
+        );
+    }
+}
+
+/// Planning a design of your own from nothing, over and over (to look at
+/// with a sampling profiler), and how long each object takes by itself.
+///
+/// `ZIGZAG_DESIGN=<file.svg> cargo test --release --features gui --bin zigzag-studio perf_bench::planning -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn planning_a_design_of_your_own() {
+    let file = std::env::var("ZIGZAG_DESIGN").expect("ZIGZAG_DESIGN: an .svg file");
+    let doc = zigzag::document::Document::open(std::path::Path::new(&file)).unwrap();
+    let names = zigzag::svg::display_names(&doc.shapes);
+    let opt = doc.plan_options();
+    for (i, s) in doc.shapes.iter().enumerate() {
+        let t = std::time::Instant::now();
+        let d = zigzag::design::plan_cached(
+            "one",
+            std::slice::from_ref(s),
+            &opt,
+            &mut Default::default(),
+        );
+        println!(
+            "{:>8.2} ms  {:>6} stitches  {} ({:?})",
+            t.elapsed().as_secs_f64() * 1000.0,
+            d.stitch_count(),
+            names[i],
+            s.params.kind
+        );
+    }
+    let secs: f64 = std::env::var("ZIGZAG_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let start = std::time::Instant::now();
+    let mut n = 0;
+    let mut total = 0.0;
+    loop {
+        let t = std::time::Instant::now();
+        let d = doc.plan_cached(&mut Default::default());
+        total += t.elapsed().as_secs_f64() * 1000.0;
+        n += 1;
+        std::hint::black_box(d);
+        if start.elapsed().as_secs_f64() >= secs {
+            break;
+        }
+    }
+    println!(
+        "the whole design from nothing: {:.2} ms (mean of {n})",
+        total / n as f64
+    );
+    let d = doc.plan_cached(&mut Default::default());
+    for (k, b) in d.blocks.iter().enumerate() {
+        println!(
+            "block {k}: thread {:?}, {} runs, objects {:?}",
+            b.color,
+            b.runs.len(),
+            d.block_shapes[k]
+                .iter()
+                .map(|i| names[*i].as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+    let t = std::time::Instant::now();
+    let issues = zigzag::checks::check(&doc.shapes, &d, &opt, None);
+    println!(
+        "checks: {:.2} ms, {} issues",
+        t.elapsed().as_secs_f64() * 1000.0,
+        issues.len()
+    );
+}

@@ -13,10 +13,15 @@
 //! curve are tried for first; ones that turn a sharp corner (their
 //! stitches fanning round it) only if those won't do.
 //!
+//! A ring (an O) is one column round between its outline and its hole, but
+//! not one whose two outlines turn corners out of step (a triangle with a
+//! triangle cut out of it, a D): its stitches would lean, so it's cut at
+//! its corners like any other shape.
+//!
 //! A stroke that only bends (a C, an S) has no such corners: its tips are
 //! found as the pair of points that makes the narrowest column.
 
-use super::satin::{AUTO_MAX_WIDTH, Rails, pairs, split_at_tips};
+use super::satin::{AUTO_MAX_WIDTH, RING_LEAN, Rails, lean, pairs, split_at_tips};
 use crate::geom::{FillRule, P, Polyline, cross, point_inside, polyline_length};
 
 /// A corner turns at least this sharply (radians), measured a little way
@@ -32,6 +37,9 @@ const MIN_AREA: f64 = 40.0;
 /// How many cuts deep the search goes, and how many pieces it will try.
 const MAX_DEPTH: usize = 7;
 const BUDGET: usize = 600;
+/// The same for a ring that would do as one column, its stitches leaning:
+/// there's the ring to fall back on, so less looking for better is worth it.
+const RING_BUDGET: usize = 60;
 /// Cuts tried at each step, nearest first.
 const TRIES: usize = 6;
 
@@ -470,8 +478,12 @@ impl Piece {
         let walls = self.walls();
         let rails = match self.holes.len() {
             0 => squared(self.open_column(&outlines, &walls)?),
+            // (Not a ring whose stitches would lean, its outlines turning
+            // corners out of step: that one is cut at the corners.)
             1 if self.rings().all(|r| !r.cut.contains(&true)) => {
-                return super::satin::auto_rails(&outlines).ok();
+                return super::satin::auto_rails(&outlines)
+                    .ok()
+                    .filter(|r| lean(std::slice::from_ref(r)) <= RING_LEAN);
             }
             _ => return None,
         };
@@ -893,8 +905,13 @@ pub fn split(comp: &[Polyline]) -> Option<Vec<Rails>> {
         // shape can be cut into those: cleaner than a column turning a
         // sharp corner. Else columns that turn corners too.
         let piece = Piece { outer, holes };
+        let tries = if piece.holes.len() == 1 && super::satin::auto_rails(comp).is_ok() {
+            RING_BUDGET
+        } else {
+            BUDGET
+        };
         [false, true].into_iter().find_map(|turns| {
-            let mut budget = BUDGET;
+            let mut budget = tries;
             solve(&piece, MAX_DEPTH, &mut budget, turns)
         })
     })();
@@ -1056,5 +1073,51 @@ mod tests {
             })
             .collect();
         assert!(split(&[blob]).is_none());
+    }
+
+    /// A 30 mm triangle with a triangle cut out of it, its stroke 3 mm
+    /// thick (a Δ).
+    fn delta() -> Vec<Polyline> {
+        vec![
+            poly(&[(0.0, 0.0), (300.0, 0.0), (150.0, -259.8)]),
+            poly(&[(51.96, -30.0), (248.04, -30.0), (150.0, -199.8)]),
+        ]
+    }
+
+    #[test]
+    fn a_triangle_round_a_triangle_is_three_columns_not_a_leaning_ring() {
+        let delta = delta();
+        // Round between the two outlines its stitches stay inside it, so
+        // that was taken for a column: but they point at its middle, leaning
+        // more the nearer a corner.
+        let ring = super::super::satin::auto_rails(&delta).expect("a ring");
+        let leaning = lean(std::slice::from_ref(&ring));
+        assert!(leaning > RING_LEAN, "the ring leans {leaning}°");
+        let rails = split(&delta).expect("columns");
+        assert_eq!(rails.len(), 3, "a column a side");
+        assert!(rails.iter().all(|r| !r.closed));
+        covers(&delta, &rails);
+        let now = lean(&rails);
+        assert!(
+            now < leaning * 0.5,
+            "{now}° across, where the ring's {leaning}°"
+        );
+    }
+
+    #[test]
+    fn a_round_ring_is_still_one_column_round_its_hole() {
+        let circle = |r: f64| -> Polyline {
+            (0..64)
+                .map(|i| {
+                    let t = i as f64 / 64.0 * std::f64::consts::TAU;
+                    P::new(r * t.cos(), r * t.sin())
+                })
+                .collect()
+        };
+        let o = vec![circle(60.0), circle(40.0)];
+        let rails = split(&o).expect("a column");
+        assert_eq!(rails.len(), 1);
+        assert!(rails[0].closed);
+        assert!(lean(&rails) < 2.0);
     }
 }

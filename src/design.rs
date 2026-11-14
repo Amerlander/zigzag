@@ -621,7 +621,11 @@ pub fn satin_rails(shape: &Shape) -> Vec<Result<Rails, (Vec<Polyline>, String)>>
     match &shape.geometry {
         Geometry::Stroke { lines, width } => {
             let w = p.width.map(mm).unwrap_or(*width);
-            if let Some(r) = satin::rails_from_subpaths(lines) {
+            // (A shape's outline is sewn along each of its edges: a shape
+            // in two parts, or with a hole, isn't a column between them.)
+            if !shape.outline
+                && let Some(r) = satin::rails_from_subpaths(lines)
+            {
                 return vec![Ok(r)];
             }
             // (A subpath without length, a dot drawn as `M p L p`, has no
@@ -648,41 +652,56 @@ pub fn satin_rails(shape: &Shape) -> Vec<Result<Rails, (Vec<Polyline>, String)>>
             // failing that, filled.
             let mut out = Vec::new();
             for comp in satin::components(rings, *rule) {
-                match satin::auto_rails(&comp) {
-                    Ok(rails) => out.push(Ok(rails)),
-                    Err(e) => match crate::stitch::columns::split(&comp) {
-                        Some(columns) => out.extend(columns.into_iter().map(Ok)),
-                        None => {
-                            // "Too wide" as one column may only mean it
-                            // isn't one: say so only of a shape that's
-                            // wide whichever way it's sewn (its area over
-                            // half its outline's length is how thick it
-                            // is, as a stroke).
-                            let area: f64 = comp
-                                .iter()
-                                .enumerate()
-                                .map(|(k, r)| {
-                                    let a = boolean::ring_area(r).abs();
-                                    if k == 0 { a } else { -a }
-                                })
-                                .sum();
-                            let around: f64 = comp
-                                .iter()
-                                .map(|r| {
-                                    crate::geom::polyline_length(r)
-                                        + r.last().map_or(0.0, |l| l.dist(r[0]))
-                                })
-                                .sum();
-                            let thick = 2.0 * area / around.max(1.0);
-                            let why = match e {
-                                satin::AutoSatinError::TooWide(_) if thick < 50.0 => {
-                                    satin::AutoSatinError::TooComplex
-                                }
-                                e => e,
-                            };
-                            out.push(Err((comp, why.to_string())));
-                        }
-                    },
+                let one = satin::auto_rails(&comp);
+                // A ring whose stitches lean (one with corners: a triangle
+                // and the triangle cut out of it) is better cut into
+                // columns too, where those come out clearly squarer. (Only
+                // a ring: a column between two tips is left as it is.)
+                let leaning = one
+                    .as_ref()
+                    .ok()
+                    .filter(|r| r.closed)
+                    .map(|r| satin::lean(std::slice::from_ref(r)))
+                    .filter(|l| *l > satin::RING_LEAN);
+                let cut = if one.is_err() || leaning.is_some() {
+                    crate::stitch::columns::split(&comp)
+                        .filter(|c| leaning.is_none_or(|l| satin::lean(c) < l * 0.7))
+                } else {
+                    None
+                };
+                match (cut, one) {
+                    (Some(columns), _) => out.extend(columns.into_iter().map(Ok)),
+                    (None, Ok(rails)) => out.push(Ok(rails)),
+                    (None, Err(e)) => {
+                        // "Too wide" as one column may only mean it
+                        // isn't one: say so only of a shape that's
+                        // wide whichever way it's sewn (its area over
+                        // half its outline's length is how thick it
+                        // is, as a stroke).
+                        let area: f64 = comp
+                            .iter()
+                            .enumerate()
+                            .map(|(k, r)| {
+                                let a = boolean::ring_area(r).abs();
+                                if k == 0 { a } else { -a }
+                            })
+                            .sum();
+                        let around: f64 = comp
+                            .iter()
+                            .map(|r| {
+                                crate::geom::polyline_length(r)
+                                    + r.last().map_or(0.0, |l| l.dist(r[0]))
+                            })
+                            .sum();
+                        let thick = 2.0 * area / around.max(1.0);
+                        let why = match e {
+                            satin::AutoSatinError::TooWide(_) if thick < 50.0 => {
+                                satin::AutoSatinError::TooComplex
+                            }
+                            e => e,
+                        };
+                        out.push(Err((comp, why.to_string())));
+                    }
                 }
             }
             out
@@ -726,6 +745,7 @@ fn fill_runs(
             stagger: 1,
             bottom_up: opt.hat_order,
             min_stitch: opt.min_stitch,
+            origin: shape.origin,
         };
         let u: Vec<Piece> = tatami(rings, rule, &under)
             .into_iter()
@@ -744,6 +764,7 @@ fn fill_runs(
         stagger: 4,
         bottom_up: opt.hat_order,
         min_stitch: opt.min_stitch,
+        origin: shape.origin,
     };
     groups.push(
         tatami(rings, rule, &top)
@@ -935,23 +956,111 @@ fn spiral_runs(
 }
 
 /// Blanket (E-stitch): a running line with prongs of `width` every `spacing`,
-/// on the `side` (+1 left of travel, -1 right).
+/// on the `side` (+1 left of travel, -1 right). The line keeps its corners
+/// (each stretch between two is spaced out on its own, so the line goes
+/// through every corner rather than across it), and a corner's prong
+/// points between its two sides.
 pub fn blanket(line: &[P], closed: bool, spacing: f64, width: f64, side: f64) -> Polyline {
-    let mut base: Polyline = line.to_vec();
-    if closed && base.len() > 2 {
+    let mut base: Polyline = Vec::with_capacity(line.len() + 1);
+    for &q in line {
+        if base.last().is_none_or(|l: &P| l.dist(q) > 1e-6) {
+            base.push(q);
+        }
+    }
+    if closed && base.len() > 2 && base[0].dist(base[base.len() - 1]) > 1e-6 {
         base.push(base[0]);
     }
-    let samples = crate::geom::sample_by_arclength(&base, spacing);
-    let mut out = Vec::with_capacity(samples.len() * 3);
-    for (k, (q, t)) in samples.iter().enumerate() {
-        out.push(*q);
-        if closed && k == samples.len() - 1 {
-            break;
+    if base.len() < 2 {
+        return Vec::new();
+    }
+    // A turn sharper than this is a corner (a curve's points turn far less).
+    let corner = |a: P, b: P, c: P| (b - a).norm().dot((c - b).norm()) < 0.82;
+    let n = base.len();
+    // (Not one closer than half a prong's spacing to the corner before
+    // it or to the line's end: a tight little curve turns that sharply at
+    // every point, and would get a prong at each.)
+    let mut along = vec![0.0; n];
+    for k in 1..n {
+        along[k] = along[k - 1] + base[k - 1].dist(base[k]);
+    }
+    let apart = spacing * 0.5;
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut last = 0.0;
+    for k in 1..n - 1 {
+        if corner(base[k - 1], base[k], base[k + 1])
+            && along[k] - last >= apart
+            && along[n - 1] - along[k] >= apart
+        {
+            cuts.push(k);
+            last = along[k];
         }
-        out.push(*q + t.perp() * (width * side));
-        out.push(*q);
+    }
+    // (A closed line's first point is a corner too if the line turns there.)
+    let wraps = closed && n > 3 && corner(base[n - 2], base[0], base[1]);
+    cuts.insert(0, 0);
+    cuts.push(n - 1);
+    let stretches: Vec<Vec<(P, P)>> = cuts
+        .windows(2)
+        .map(|w| crate::geom::sample_by_arclength(&base[w[0]..=w[1]], spacing))
+        .filter(|s| s.len() >= 2)
+        .collect();
+    let prong = |out: &mut Polyline, q: P, dir: P| {
+        out.push(q);
+        out.push(q + dir * (width * side));
+        out.push(q);
+    };
+    // The prong at a corner: between the two sides' (or the one before
+    // the corner's, where the line doubles back on itself).
+    let between = |before: P, after: P| {
+        let d = before.perp() + after.perp();
+        if d.len() > 1e-6 {
+            d.norm()
+        } else {
+            before.perp()
+        }
+    };
+    let mut out = Vec::new();
+    for (j, st) in stretches.iter().enumerate() {
+        let last = st.len() - 1;
+        for (k, (q, t)) in st.iter().enumerate() {
+            if k == 0 {
+                // A stretch begins where the one before ended, with that
+                // corner's prong: only the line's first point is new.
+                if j == 0 {
+                    match stretches.last().filter(|_| wraps) {
+                        Some(prev) => prong(&mut out, *q, between(prev[prev.len() - 1].1, *t)),
+                        None => prong(&mut out, *q, t.perp()),
+                    }
+                }
+            } else if k < last {
+                prong(&mut out, *q, t.perp());
+            } else if let Some(next) = stretches.get(j + 1) {
+                prong(&mut out, *q, between(*t, next[0].1));
+            } else if closed {
+                // Back at the start, whose prong is sewn already.
+                out.push(*q);
+            } else {
+                prong(&mut out, *q, t.perp());
+            }
+        }
     }
     out
+}
+
+/// Which side of closed line `r` (one of `rings`) a blanket's prongs go on
+/// to point into the shape the rings enclose (see [`blanket`]).
+fn prongs_inward(rings: &[Polyline], rule: FillRule, r: &[P]) -> f64 {
+    let probe = crate::geom::sample_by_arclength(r, 20.0);
+    probe
+        .get(probe.len() / 2)
+        .map(|(q, t)| {
+            if crate::geom::point_inside(rings, rule, *q + t.perp() * 3.0) {
+                1.0
+            } else {
+                -1.0
+            }
+        })
+        .unwrap_or(1.0)
 }
 
 fn blanket_pieces(shape: &Shape, geometry: &Geometry) -> Vec<Piece> {
@@ -964,24 +1073,34 @@ fn blanket_pieces(shape: &Shape, geometry: &Geometry) -> Vec<Piece> {
             .filter(|r| r.len() >= 3)
             .map(|r| {
                 // Prongs point into the shape.
-                let probe = crate::geom::sample_by_arclength(r, 20.0);
-                let side = probe
-                    .get(probe.len() / 2)
-                    .map(|(q, t)| {
-                        if crate::geom::point_inside(rings, *rule, *q + t.perp() * 3.0) {
-                            1.0
-                        } else {
-                            -1.0
-                        }
-                    })
-                    .unwrap_or(1.0);
-                Piece::fixed(blanket(r, true, sp, w, side))
+                Piece::fixed(blanket(r, true, sp, w, prongs_inward(rings, *rule, r)))
             })
             .collect(),
-        Geometry::Stroke { lines, .. } => lines
-            .iter()
-            .map(|(l, c)| Piece::fixed(blanket(l, *c, sp, w, 1.0)))
-            .collect(),
+        Geometry::Stroke { lines, .. } => {
+            // A shape's outline: prongs into the shape too, whichever way
+            // its path was drawn (a hole's count as outside: where one
+            // part of the path is inside another). A line's are on its left.
+            let rings: Vec<Polyline> = if shape.outline {
+                lines
+                    .iter()
+                    .filter(|(l, c)| *c && l.len() >= 3)
+                    .map(|(l, _)| l.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            lines
+                .iter()
+                .map(|(l, c)| {
+                    let side = if shape.outline && *c && l.len() >= 3 {
+                        prongs_inward(&rings, FillRule::EvenOdd, l)
+                    } else {
+                        1.0
+                    };
+                    Piece::fixed(blanket(l, *c, sp, w, side))
+                })
+                .collect()
+        }
     }
 }
 
@@ -1756,6 +1875,8 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
         let key = {
             let mut h = hasher();
             geo_keys[si].hash(&mut h);
+            shape.origin.x.to_bits().hash(&mut h);
+            shape.origin.y.to_bits().hash(&mut h);
             geometry_key(&geometry[si]).hash(&mut h);
             format!("{:?}{:?}", shape.params, shape.part).hash(&mut h);
             // A tartan's default sett comes from the thread color, and a
@@ -2712,6 +2833,146 @@ impl Design {
             .sum()
     }
 
+    /// Put the stitches of the input shapes `picked` (see
+    /// [`Design::stitch_shapes`]) in blocks of their own: a block with
+    /// their stitches and others' becomes two in the same thread, the
+    /// others' and then theirs, each run cut where stitching went to the
+    /// other. So that they can be shown apart from the rest (moving with a
+    /// drag, or not at all): it isn't a plan to sew, with its extra
+    /// blocks. True if any block was split.
+    pub fn split_shapes(&mut self, picked: &[usize]) -> bool {
+        if picked.is_empty()
+            || self.stitch_shapes.len() != self.blocks.len()
+            || self.block_shapes.len() != self.blocks.len()
+        {
+            return false;
+        }
+        // The stretches of `run` that are (or aren't) the picked shapes'.
+        fn part(
+            run: &Run,
+            spans: &[(usize, usize)],
+            of: impl Fn(usize) -> bool,
+        ) -> Vec<(Run, Vec<(usize, usize)>)> {
+            let mut out = Vec::new();
+            let mut piece: Option<(Run, Vec<(usize, usize)>)> = None;
+            let mut cut = run.trim_before;
+            for (k, &(from, shape)) in spans.iter().enumerate() {
+                let to = spans.get(k + 1).map_or(run.pts.len(), |s| s.0);
+                let (from, to) = (from.min(run.pts.len()), to.min(run.pts.len()));
+                if !of(shape) || from >= to {
+                    if let Some(done) = piece.take() {
+                        out.push(done);
+                    }
+                    cut |= !of(shape);
+                    continue;
+                }
+                let (r, owners) = piece.get_or_insert_with(|| {
+                    (
+                        Run {
+                            pts: Vec::new(),
+                            trim_before: cut,
+                        },
+                        Vec::new(),
+                    )
+                });
+                owners.push((r.pts.len(), shape));
+                r.pts.extend_from_slice(&run.pts[from..to]);
+            }
+            out.extend(piece);
+            out
+        }
+        let mut any = false;
+        let mut blocks = Vec::with_capacity(self.blocks.len() + 1);
+        let mut block_shapes = Vec::with_capacity(self.blocks.len() + 1);
+        let mut stitch_shapes = Vec::with_capacity(self.blocks.len() + 1);
+        let old = (
+            std::mem::take(&mut self.blocks),
+            std::mem::take(&mut self.block_shapes),
+            std::mem::take(&mut self.stitch_shapes),
+        );
+        for ((blk, shapes), owners) in old.0.into_iter().zip(old.1).zip(old.2) {
+            let theirs = |s: usize| picked.contains(&s);
+            let mixed = owners.len() == blk.runs.len()
+                && owners.iter().flatten().any(|(_, s)| theirs(*s))
+                && owners.iter().flatten().any(|(_, s)| !theirs(*s));
+            if !mixed {
+                blocks.push(blk);
+                block_shapes.push(shapes);
+                stitch_shapes.push(owners);
+                continue;
+            }
+            any = true;
+            for pick in [false, true] {
+                let (runs, spans): (Vec<Run>, Vec<Vec<(usize, usize)>>) = blk
+                    .runs
+                    .iter()
+                    .zip(&owners)
+                    .flat_map(|(run, spans)| part(run, spans, |s| theirs(s) == pick))
+                    .unzip();
+                if runs.is_empty() {
+                    continue;
+                }
+                blocks.push(Block {
+                    color: blk.color,
+                    runs,
+                });
+                block_shapes.push(
+                    shapes
+                        .iter()
+                        .copied()
+                        .filter(|s| theirs(*s) == pick)
+                        .collect(),
+                );
+                stitch_shapes.push(spans);
+            }
+        }
+        self.blocks = blocks;
+        self.block_shapes = block_shapes;
+        self.stitch_shapes = stitch_shapes;
+        any
+    }
+
+    /// Take the stitches of the input shapes `gone` out of the plan (see
+    /// [`Design::stitch_shapes`]): what's left is the others' stitches as
+    /// they were, with a cut where stitching was taken out of the middle
+    /// of a run. For showing a plan without objects that have just gone
+    /// (or are hidden) until it's planned again: it isn't a plan to sew,
+    /// since the others aren't planned afresh without them. True if
+    /// anything was taken out.
+    pub fn drop_shapes(&mut self, gone: &[usize]) -> bool {
+        if gone.is_empty()
+            || self.stitch_shapes.len() != self.blocks.len()
+            || self.block_shapes.len() != self.blocks.len()
+        {
+            return false;
+        }
+        self.split_shapes(gone);
+        // Now every block is theirs or the others'.
+        let keep: Vec<bool> = self
+            .stitch_shapes
+            .iter()
+            .map(|runs| !runs.iter().flatten().any(|(_, s)| gone.contains(s)))
+            .collect();
+        if keep.iter().all(|k| *k) {
+            return false;
+        }
+        let mut k = keep.iter();
+        self.blocks.retain(|_| *k.next().unwrap());
+        let mut k = keep.iter();
+        self.block_shapes.retain(|_| *k.next().unwrap());
+        let mut k = keep.iter();
+        self.stitch_shapes.retain(|_| *k.next().unwrap());
+        for shapes in &mut self.block_shapes {
+            shapes.retain(|s| !gone.contains(s));
+        }
+        for &s in gone {
+            if let Some(n) = self.per_shape.get_mut(s) {
+                *n = 0;
+            }
+        }
+        true
+    }
+
     pub fn trim_count(&self) -> usize {
         self.blocks
             .iter()
@@ -2742,6 +3003,8 @@ mod tests {
             },
             uid: 0,
             groups: Vec::new(),
+            outline: false,
+            origin: P::default(),
         }
     }
 
@@ -2777,6 +3040,88 @@ mod tests {
     /// Overlap removal is cached per shape: after moving one object, the
     /// cached plan must still equal a plan made from scratch (what moved
     /// and what it overlapped are redone; the rest is reused).
+    #[test]
+    fn dropping_a_shapes_stitches_leaves_the_others_as_they_were() {
+        // Three squares in one thread: one block, sewn one after another.
+        let sq = |x: f64| Shape {
+            id: format!("s{x}"),
+            part: crate::svg::Part::Fill,
+            label: String::new(),
+            color: [0, 0, 0],
+            paint: [0, 0, 0],
+            geometry: Geometry::Fill {
+                rings: vec![vec![
+                    P::new(x, 0.0),
+                    P::new(x + 100.0, 0.0),
+                    P::new(x + 100.0, 100.0),
+                    P::new(x, 100.0),
+                ]],
+                rule: FillRule::NonZero,
+            },
+            params: Params {
+                kind: Some(Kind::Fill),
+                ..Default::default()
+            },
+            uid: x as usize,
+            groups: Vec::new(),
+            outline: false,
+            origin: P::default(),
+        };
+        let shapes = [sq(0.0), sq(105.0), sq(210.0)];
+        let whole = plan("t", &shapes, &PlanOptions::default());
+        assert_eq!(whole.blocks.len(), 1);
+        let inside = |d: &Design, x: f64| {
+            d.blocks
+                .iter()
+                .flat_map(|b| &b.runs)
+                .flat_map(|r| &r.pts)
+                .filter(|p| p.x > x + 4.0 && p.x < x + 96.0)
+                .count()
+        };
+        let (a, b, c) = (
+            inside(&whole, 0.0),
+            inside(&whole, 105.0),
+            inside(&whole, 210.0),
+        );
+        assert!(a > 50 && b > 50 && c > 50);
+        // The middle one out: nothing of it left, the other two whole.
+        let mut d = whole.clone();
+        assert!(d.drop_shapes(&[1]));
+        assert_eq!(inside(&d, 105.0), 0);
+        assert_eq!((inside(&d, 0.0), inside(&d, 210.0)), (a, c));
+        assert_eq!(d.per_shape[1], 0);
+        assert_eq!(d.block_shapes, vec![vec![0, 2]]);
+        assert_eq!(d.stitch_shapes.len(), 1);
+        assert_eq!(d.stitch_shapes[0].len(), d.blocks[0].runs.len());
+        assert!(
+            d.blocks[0].runs.iter().skip(1).any(|r| r.trim_before),
+            "a cut where it was"
+        );
+        // Or in a block of its own, for showing it apart from the others.
+        let mut e = whole.clone();
+        assert!(e.split_shapes(&[1]));
+        assert_eq!(e.block_shapes, vec![vec![0, 2], vec![1]]);
+        assert_eq!(e.stitch_count(), whole.stitch_count());
+        assert_eq!(e.blocks[0].color, e.blocks[1].color);
+        let of = |blk: &Block, x: f64| {
+            blk.runs
+                .iter()
+                .flat_map(|r| &r.pts)
+                .filter(|p| p.x > x + 4.0 && p.x < x + 96.0)
+                .count()
+        };
+        assert_eq!((of(&e.blocks[1], 105.0), of(&e.blocks[0], 105.0)), (b, 0));
+        assert_eq!((of(&e.blocks[0], 0.0), of(&e.blocks[0], 210.0)), (a, c));
+        assert!(!e.split_shapes(&[1]), "already apart");
+        // All of them out: nothing left at all.
+        assert!(d.drop_shapes(&[0, 2]));
+        assert!(d.blocks.is_empty() && d.block_shapes.is_empty());
+        // Nothing to take out: nothing changes.
+        let mut e = whole.clone();
+        assert!(!e.drop_shapes(&[7]));
+        assert_eq!(e.stitch_count(), whole.stitch_count());
+    }
+
     #[test]
     fn a_caught_panic_is_known_to_be_one_while_its_caught() {
         assert!(!catching());
@@ -3039,6 +3384,95 @@ mod tests {
             sp.stitch_count(),
             plain.stitch_count()
         );
+    }
+
+    #[test]
+    fn a_blanket_outline_keeps_corners_and_points_into_the_shape() {
+        let all = |d: &Design| -> Vec<P> {
+            d.blocks
+                .iter()
+                .flat_map(|b| &b.runs)
+                .flat_map(|r| r.pts.iter().copied())
+                .collect()
+        };
+        // A square's outline, drawn either way round: the line goes
+        // through all four corners, and no prong leaves the square.
+        for reversed in [false, true] {
+            let mut ring = sq(0.0, 0.0, 200.0);
+            if reversed {
+                ring.reverse();
+            }
+            let mut s = shape(
+                Geometry::Stroke {
+                    lines: vec![(ring.clone(), true)],
+                    width: 20.0,
+                },
+                Kind::Blanket,
+                [0, 0, 0],
+            );
+            s.outline = true;
+            let pts = all(&plan("t", &[s], &PlanOptions::default()));
+            for c in &ring {
+                assert!(
+                    pts.iter().any(|p| p.dist(*c) < 0.5),
+                    "through the corner {c:?} (reversed: {reversed})"
+                );
+            }
+            assert!(
+                pts.iter()
+                    .all(|p| p.x > -1.0 && p.y > -1.0 && p.x < 201.0 && p.y < 201.0),
+                "none point outward (reversed: {reversed})"
+            );
+            let inner = pts
+                .iter()
+                .filter(|p| p.x > 10.0 && p.x < 190.0 && p.y > 10.0 && p.y < 190.0)
+                .count();
+            assert!(inner > 20, "prongs reach in: {inner}");
+        }
+        // A square with a square hole: the hole's prongs point away from
+        // the hole, into what's filled.
+        let mut s = shape(
+            Geometry::Stroke {
+                lines: vec![(sq(0.0, 0.0, 300.0), true), (sq(100.0, 100.0, 100.0), true)],
+                width: 20.0,
+            },
+            Kind::Blanket,
+            [0, 0, 0],
+        );
+        s.outline = true;
+        let pts = all(&plan("t", &[s], &PlanOptions::default()));
+        assert!(
+            pts.iter()
+                .all(|p| !(p.x > 105.0 && p.x < 195.0 && p.y > 105.0 && p.y < 195.0)),
+            "none in the hole"
+        );
+        assert!(
+            pts.iter()
+                .all(|p| p.x > -1.0 && p.y > -1.0 && p.x < 301.0 && p.y < 301.0)
+        );
+        // Tight little curves (a dot under a millimetre across, the corners
+        // of a rounded box) aren't a prong at every point: no closer
+        // together than half the spacing asked for.
+        let dot: Polyline = (0..10)
+            .map(|k| {
+                let a = std::f64::consts::TAU * k as f64 / 10.0;
+                P::new(4.0 * a.cos(), 4.0 * a.sin())
+            })
+            .collect();
+        let around = 2.0 * std::f64::consts::PI * 4.0;
+        let b = blanket(&dot, true, 30.0, 25.0, 1.0);
+        let prongs = b.iter().filter(|p| p.len() > 6.0).count();
+        assert!(
+            prongs as f64 <= around / 15.0 + 2.0,
+            "{prongs} prongs round a {around:.0}-unit dot"
+        );
+        // A line (not a shape's outline) keeps its prongs on its left, and
+        // its corner.
+        let bend = vec![P::new(0.0, 0.0), P::new(100.0, 0.0), P::new(100.0, 100.0)];
+        let b = blanket(&bend, false, 30.0, 25.0, 1.0);
+        assert!(b.iter().any(|p| p.dist(P::new(100.0, 0.0)) < 1e-6));
+        let on_line = |p: &P| (p.y.abs() < 1e-6 && p.x <= 100.0) || ((p.x - 100.0).abs() < 1e-6);
+        assert!(b.iter().filter(|p| !on_line(p)).count() >= 6, "{b:?}");
     }
 
     #[test]
@@ -3864,6 +4298,55 @@ mod tests {
         assert_eq!(d.notes.len(), 1);
         assert!(d.stitch_count() > 100);
     }
+
+    #[test]
+    fn a_ring_with_corners_is_sewn_as_columns_and_a_round_one_as_a_ring() {
+        // A Δ: round between its outlines every stitch would point at its
+        // middle, leaning. A column a side instead, each sewn square across.
+        let delta = shape(
+            Geometry::Fill {
+                rings: vec![
+                    vec![P::new(0.0, 0.0), P::new(300.0, 0.0), P::new(150.0, -259.8)],
+                    vec![
+                        P::new(51.96, -30.0),
+                        P::new(248.04, -30.0),
+                        P::new(150.0, -199.8),
+                    ],
+                ],
+                rule: FillRule::EvenOdd,
+            },
+            Kind::Satin,
+            [0, 0, 0],
+        );
+        let rails: Vec<Rails> = satin_rails(&delta)
+            .into_iter()
+            .map(|r| r.expect("a column"))
+            .collect();
+        assert_eq!(rails.len(), 3);
+        assert!(rails.iter().all(|r| !r.closed));
+        assert!(satin::lean(&rails) < satin::RING_LEAN);
+
+        // An O has no corners to get out of step at: one ring, as ever.
+        let circle = |r: f64| -> Polyline {
+            (0..64)
+                .map(|i| {
+                    let t = i as f64 / 64.0 * std::f64::consts::TAU;
+                    P::new(r * t.cos(), r * t.sin())
+                })
+                .collect()
+        };
+        let o = shape(
+            Geometry::Fill {
+                rings: vec![circle(60.0), circle(40.0)],
+                rule: FillRule::EvenOdd,
+            },
+            Kind::Satin,
+            [0, 0, 0],
+        );
+        let rails = satin_rails(&o);
+        assert_eq!(rails.len(), 1);
+        assert!(rails[0].as_ref().is_ok_and(|r| r.closed));
+    }
 }
 
 #[cfg(test)]
@@ -3912,6 +4395,8 @@ mod concave_fill_tests {
                 },
                 uid: 0,
                 groups: Vec::new(),
+                outline: false,
+                origin: P::default(),
             };
             let d = plan("t", &[s], &PlanOptions::default());
             for r in d.blocks.iter().flat_map(|b| &b.runs) {

@@ -22,7 +22,7 @@ An object is named for its id without the settings (id=\"Face_mask_fill\" is \"F
 list_machines and set_document's machine set a document up for a machine: its hoop, the file it reads, its shortest stitch and its lock stitches. \
 Hat designs are small (about 50 × 50 mm on the front of a cap): keep satin columns under 7 mm wide, letters at least 5 mm tall, and details at least 1.5 mm. \
 open_file also opens machine files (pes, pec, dst, exp, jef) as manual stitches. \
-trace_image turns a logo (PNG, JPEG, WebP, GIF, BMP or TIFF) into shapes (snap colors to Brother or Janome threads with `threads`). simplify_design makes the whole design quicker to sew (fewer threads, no details too small to sew, fewer trims; try it with dry_run first to see what it comes to). round_corners softens sharp corners, which stitch more cleanly; simplify takes extra points out of outlines (traced ones especially) and clean_up removes stray points, objects too small to sew and extra points across the design. \
+trace_image turns a logo (PNG, JPEG, WebP, GIF, BMP or TIFF) into shapes (snap colors to Brother or Janome threads with `threads`). simplify_design makes the whole design quicker to sew (fewer threads, no details too small to sew, fewer trims; try it with dry_run first to see what it comes to). add_outline gives a filled shape an outline (a running stitch, or satin) that is an object of its own, named \"<shape> (outline)\", with its own thread and stitch type. round_corners softens sharp corners, which stitch more cleanly; simplify takes extra points out of outlines (traced ones especially) and clean_up removes stray points, objects too small to sew and extra points across the design. \
 Use batch to make several changes in one call: it is all or nothing and one undo step, each step is {\"tool\": name, \"arguments\": {…}}, and later steps can use earlier results (\"$0.added.0.name\"). \
 Tools that change the design return the whole object or document; pass terse: true (on a tool, or on a batch for all its steps) for a short answer instead: ok, the names of objects added, and new_problems, the design problems that weren't there before.";
 
@@ -234,7 +234,7 @@ pub fn tool_specs() -> Value {
         }),
         json!({
             "name": "delete_object",
-            "description": "Delete an object.",
+            "description": "Delete an object. A filled shape's outline (the object named \"<shape> (outline)\") goes with it; deleting the outline alone leaves the shape.",
             "inputSchema": { "type": "object", "properties": { "object": obj_schema() }, "required": ["object"] },
             "annotations": { "destructiveHint": true }
         }),
@@ -417,6 +417,20 @@ pub fn tool_specs() -> Value {
                     "replace": { "type": "boolean", "description": "Start a new document with only the trace, keeping the document settings (fabric, hoop, machine, preview color). Default false." }
                 },
                 "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "add_outline",
+            "description": "Give filled shapes an outline: a stroke along each shape's edge, as an object of its own (named \"<shape> (outline)\") with its own thread, stitch type and place in the sewing order, right after its shape to start with. It stays on the shape's edge when the shape is moved or reshaped. A running stitch unless kind says satin; change its stitch type, thread and width with set_object. Lines, text and shapes that already have an outline are left as they are.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "objects": { "description": "The shapes to outline: one (index or name) or a list of them.", "oneOf": [{ "type": "integer" }, { "type": "string" }, { "type": "array", "items": { "oneOf": [{ "type": "integer" }, { "type": "string" }] } }] },
+                    "kind": { "type": "string", "enum": ["run", "satin"], "description": "How the outline is sewn. Default run." },
+                    "width_mm": { "type": "number", "description": "How wide a satin outline is, centered on the edge. Default 2." },
+                    "color": { "type": "string", "description": "Thread color #rrggbb. Default: a darker shade of each shape's thread." }
+                },
+                "required": ["objects"]
             }
         }),
         json!({
@@ -996,6 +1010,7 @@ impl Studio {
             "batch" => return self.tool_batch(args),
             "trace_image" => self.tool_trace_image(args),
             "round_corners" => self.tool_round_corners(args),
+            "add_outline" => self.tool_add_outline(args),
             "simplify" => self.tool_simplify(args),
             "clean_up" => self.tool_clean_up(args),
             "simplify_design" => self.tool_simplify_design(args),
@@ -1004,7 +1019,9 @@ impl Studio {
             "set_object" => self.tool_set_object(args),
             "delete_object" => self.resolve(args.get("object")).and_then(|i| {
                 let name = self.names[i].clone();
-                self.structural(|d| d.delete(i))
+                // (A shape's outline goes with it.)
+                let gone = self.doc.with_outlines(&[i]);
+                self.structural(|d| d.delete_many(&gone))
                     .map_err(|e| e.to_string())?;
                 self.selected = self
                     .selected
@@ -1741,6 +1758,41 @@ impl Studio {
             "reordered": report.reordered,
             "connect_mm": report.connect_mm.1,
         })))
+    }
+
+    fn tool_add_outline(&mut self, args: &Value) -> Result<ToolResult, String> {
+        let idx = self.resolve_many(args.get("objects"))?;
+        let width = args
+            .get("width_mm")
+            .and_then(Value::as_f64)
+            .unwrap_or(zigzag::params::defaults::OUTLINE_SATIN_WIDTH);
+        if !(width.is_finite() && width > 0.0) {
+            return Err("width_mm must be a positive number".into());
+        }
+        let color = match args.get("color") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_str()
+                    .and_then(parse_hex)
+                    .ok_or("color must look like #rrggbb")?,
+            ),
+        };
+        let kind = match args.get("kind").and_then(Value::as_str) {
+            None | Some("run") => Kind::Run,
+            Some("satin") => Kind::Satin,
+            Some(k) => return Err(format!("kind must be run or satin, not {k}")),
+        };
+        let mut new = Vec::new();
+        self.structural(|d| {
+            new = d.add_outline(&idx, kind, width, color)?;
+            Ok(())
+        })
+        .map_err(|e| format!("{e:#}"))?;
+        self.replan_soon();
+        self.set_selection(&new);
+        Ok(ToolResult::json(
+            &json!({ "added": new.iter().map(|&i| self.object_json(i)).collect::<Vec<_>>() }),
+        ))
     }
 
     fn tool_round_corners(&mut self, args: &Value) -> Result<ToolResult, String> {
@@ -3610,6 +3662,95 @@ mod tests {
         let p = s.doc.edit_path(0).unwrap();
         assert!(zigzag::bezier::path_corners(&p).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_outline_gives_a_shape_an_outline_to_set_up_on_its_own() {
+        let mut s = Studio::with_file(None, None);
+        ok(s.run_tool("add_svg", &json!({ "svg": BADGE })));
+        let r = ok(s.run_tool(
+            "add_outline",
+            &json!({ "objects": ["bar", "stitchline"], "kind": "satin", "width_mm": 1.5, "color": "#ffb703" }),
+        ));
+        let added = r["added"].as_array().unwrap();
+        assert_eq!(added.len(), 1, "{r}");
+        assert_eq!(added[0]["name"], "bar (outline)");
+        assert_eq!(added[0]["kind"], "satin");
+        assert_eq!(added[0]["color"], "#ffb703");
+        assert_eq!(added[0]["source"], "stroke");
+        // Its thread and stitch type are its own.
+        let r = ok(s.run_tool(
+            "set_object",
+            &json!({ "object": "bar (outline)", "kind": "run", "color": "#000000" }),
+        ));
+        assert_eq!(r["kind"], "run");
+        let bar = s
+            .doc
+            .shapes
+            .iter()
+            .find(|o| o.id.starts_with("bar"))
+            .unwrap();
+        assert_eq!(bar.part, zigzag::svg::Part::Fill);
+        assert_eq!(
+            (bar.params.kind, bar.color),
+            (Some(Kind::Fill), [0xe6, 0x39, 0x46])
+        );
+        // One undo step takes the outline away again.
+        let n = s.doc.shapes.len();
+        ok(s.run_tool("undo", &json!({})));
+        ok(s.run_tool("undo", &json!({})));
+        assert_eq!(s.doc.shapes.len(), n - 1);
+
+        // The menu's Add Outline does the same for the selection.
+        let patch = s
+            .doc
+            .shapes
+            .iter()
+            .position(|o| o.id.starts_with("patch"))
+            .unwrap();
+        s.select_index(Some(patch));
+        s.run_action(crate::commands::Action::AddOutline);
+        assert!(s.status.starts_with("Added an outline"), "{}", s.status);
+        assert_eq!(s.sel_indices(), [patch], "the shape stays selected");
+        assert_eq!(s.doc.shapes[patch + 1].part, zigzag::svg::Part::Stroke);
+        assert_eq!(s.doc.shapes[patch + 1].params.kind, Some(Kind::Run));
+        assert_eq!(s.outline_index(patch), Some(patch + 1));
+        assert_eq!(
+            s.outline_index(patch + 1),
+            None,
+            "an outline has none itself"
+        );
+        assert!(s.outline_on(patch) && !s.can_outline(patch));
+        s.run_action(crate::commands::Action::AddOutline);
+        assert!(
+            s.status.starts_with("Couldn't add an outline"),
+            "{}",
+            s.status
+        );
+
+        // Deleting the shape (Delete, or an agent's delete_object) takes
+        // its outline with it; one undo brings both back.
+        let n = s.doc.shapes.len();
+        s.select_index(Some(patch));
+        s.delete_selection();
+        assert_eq!(s.doc.shapes.len(), n - 2);
+        assert!(s.status.starts_with("Deleted patch"), "{}", s.status);
+        ok(s.run_tool("undo", &json!({})));
+        assert_eq!(s.doc.shapes.len(), n);
+        ok(s.run_tool("add_outline", &json!({ "objects": "bar" })));
+        let n = s.doc.shapes.len();
+        ok(s.run_tool("delete_object", &json!({ "object": "bar" })));
+        assert_eq!(s.doc.shapes.len(), n - 2);
+        assert!(s.doc.shapes.iter().all(|o| !o.id.starts_with("bar")));
+
+        let r = s.run_tool("add_outline", &json!({ "objects": "stitchline" }));
+        assert!(
+            r.is_error && text(&r).contains("filled shape"),
+            "{}",
+            text(&r)
+        );
+        let r = s.run_tool("add_outline", &json!({ "objects": "ring", "width_mm": 0 }));
+        assert!(r.is_error && text(&r).contains("width_mm"), "{}", text(&r));
     }
 
     #[test]

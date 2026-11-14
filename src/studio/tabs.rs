@@ -7,8 +7,10 @@
 //! front goes into its slot and the chosen one comes out of its own, leaving
 //! a small husk in the slot of whichever is in front.
 //!
-//! Closing a tab with unsaved changes asks first. Quitting doesn't need to:
-//! every tab comes back next time, unsaved changes and all (see `session.rs`).
+//! Closing a tab with unsaved changes asks first. So does quitting (as
+//! VectorCraft does), though nothing is lost by not saving then: every tab
+//! comes back next time, unsaved changes and all (see `session.rs`). The
+//! question is whether the files should have them.
 
 use crate::app::{Snap, Studio};
 use crate::canvas::View;
@@ -115,6 +117,8 @@ pub struct Tabs {
     pub(crate) pending: Option<TabOp>,
     /// Asking whether to save the tab in front before closing it.
     pub(crate) asking: bool,
+    /// Quitting: asking about unsaved changes first, or going.
+    pub(crate) quit: Quit,
     /// A tab being dragged to another place: (its index, the pointer's x
     /// offset from the tab's left edge).
     drag: Option<(usize, f32)>,
@@ -128,6 +132,7 @@ impl Default for Tabs {
             next_rec: 1,
             pending: None,
             asking: false,
+            quit: Quit::No,
             drag: None,
         }
     }
@@ -235,10 +240,12 @@ impl Studio {
         self.layout.swatch_dialog = None;
         self.shapes.dialog = None;
         self.lettering.edit = None;
-        self.picker = None;
+        self.close_picker();
         self.drag = None;
         self.panning = false;
         self.gesture = Default::default();
+        // (A corner being rounded shows in the shapes: put them back.)
+        self.cancel_point_drag();
         self.path_edit = Default::default();
         self.playing = false;
         self.pending_history = None;
@@ -710,6 +717,154 @@ impl Studio {
         }
     }
 
+    /// The open documents with unsaved changes, by tab.
+    pub(crate) fn unsaved_tabs(&self) -> Vec<usize> {
+        (0..self.tab_count())
+            .filter(|&i| {
+                if i == self.tabs.active {
+                    self.modified
+                } else {
+                    self.tabs.list[i].modified
+                }
+            })
+            .collect()
+    }
+
+    /// Quit ZigZag (⌘Q, the menu): at once when every document is saved;
+    /// otherwise the question comes first (see [`Studio::quit_prompt`]).
+    pub fn request_quit(&mut self) {
+        // What's being typed is part of what there is to save.
+        self.finish_typing();
+        if self.unsaved_tabs().is_empty() {
+            self.quit_now();
+        } else {
+            self.tabs.asking = false;
+            self.tabs.quit = Quit::Asking;
+        }
+    }
+
+    /// Close the window, no more questions.
+    fn quit_now(&mut self) {
+        self.tabs.quit = Quit::Go;
+        if let Some(ctx) = &self.egui_ctx {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// The window was asked to close (its close button, or a quit that
+    /// came some other way): true when it may, false when the question
+    /// about unsaved changes is asked first.
+    pub(crate) fn may_close(&mut self) -> bool {
+        // (A script taking pictures quits by itself; an update restarts.)
+        if self.tabs.quit == Quit::Go || self.capture.is_some() {
+            return true;
+        }
+        self.finish_typing();
+        if self.unsaved_tabs().is_empty() {
+            return true;
+        }
+        self.tabs.asking = false;
+        self.tabs.quit = Quit::Asking;
+        false
+    }
+
+    /// Save every document with unsaved changes to its file (one that has
+    /// none yet asks where). False as soon as one isn't saved (its Save
+    /// As… was canceled, or it couldn't be written): that one's in front.
+    fn save_all_unsaved(&mut self) -> bool {
+        for i in self.unsaved_tabs() {
+            self.switch_tab(i);
+            self.run_action(crate::commands::Action::Save);
+            if self.modified {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Quitting with unsaved changes asks first, as VectorCraft does:
+    /// save them (all of them), don't, or don't quit after all. Not saving
+    /// loses nothing: the documents come back next time as they are, and
+    /// their files stay as they were.
+    pub fn quit_prompt(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.may_close() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if self.tabs.quit != Quit::Asking {
+            return;
+        }
+        let unsaved = self.unsaved_tabs();
+        if unsaved.is_empty() {
+            // (Saved meanwhile.)
+            self.quit_now();
+            return;
+        }
+        let heading = match unsaved.as_slice() {
+            [i] => {
+                let name = if *i == self.tabs.active {
+                    display_name(&self.doc)
+                } else {
+                    display_name(&self.tabs.list[*i].doc)
+                };
+                format!("Do you want to save the changes you made to “{name}”?")
+            }
+            many => format!(
+                "{} documents have changes that aren't saved. Save them before quitting?",
+                many.len()
+            ),
+        };
+        let save = if unsaved.len() == 1 {
+            "Save"
+        } else {
+            "Save All"
+        };
+        let mut choice = None;
+        use crate::dialog;
+        let modal = dialog::show(
+            ctx,
+            egui::Id::unique("quit-prompt"),
+            dialog::Place::Center,
+            |ui| {
+                dialog::heading(ui, &heading);
+                dialog::body(
+                    ui,
+                    "If you don't, nothing is lost: they come back as they are the next time you open ZigZag. Their files stay as they were until you save.",
+                );
+                dialog::buttons(ui, |ui| {
+                    if dialog::primary(ui, save, true).clicked() {
+                        choice = Some(Close::Save);
+                    }
+                    if dialog::secondary(ui, "Cancel").clicked() {
+                        choice = Some(Close::Cancel);
+                    }
+                    dialog::apart(ui, |ui| {
+                        if dialog::secondary(ui, "Don't Save").clicked() {
+                            choice = Some(Close::Discard);
+                        }
+                    });
+                });
+            },
+        );
+        if modal.should_close() {
+            choice = choice.or(Some(Close::Cancel));
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+            choice = Some(Close::Save);
+        }
+        match choice {
+            Some(Close::Cancel) => self.tabs.quit = Quit::No,
+            Some(Close::Discard) => self.quit_now(),
+            Some(Close::Save) => {
+                if self.save_all_unsaved() {
+                    self.quit_now();
+                } else {
+                    self.tabs.quit = Quit::No;
+                }
+            }
+            None => {}
+        }
+    }
+
     /// "Save changes to … before closing?" for the tab in front.
     pub fn close_prompt(&mut self, ctx: &egui::Context) {
         if !self.tabs.asking {
@@ -774,6 +929,17 @@ enum Close {
     Cancel,
 }
 
+/// Where quitting has got to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum Quit {
+    #[default]
+    No,
+    /// Asking whether to save the documents with unsaved changes first.
+    Asking,
+    /// Answered (or nothing to ask): the window closes.
+    Go,
+}
+
 /// The first of tabs `widths` wide that the strip shows in `room`: the first
 /// one, or a later one so that the `active` tab fits.
 fn first_tab_shown(widths: &[f32], active: usize, room: f32) -> usize {
@@ -805,6 +971,77 @@ mod tests {
         )
         .unwrap();
         f
+    }
+
+    #[test]
+    fn quitting_asks_about_unsaved_changes_first() {
+        let a = svg_file("quit", "a.svg");
+        let b = svg_file("quit", "b.svg");
+        let c = svg_file("quit", "c.svg");
+        let mut h = Harness::builder()
+            .with_size(egui::Vec2::new(1400.0, 900.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(Some(a.clone()), None),
+            );
+        h.state_mut().load(&b);
+        h.state_mut().load(&c);
+        h.run_steps(3);
+        assert_eq!(h.state().tab_count(), 3);
+        // Nothing unsaved: it just quits.
+        h.state_mut().request_quit();
+        assert_eq!(h.state().tabs.quit, Quit::Go);
+        assert!(h.state_mut().may_close());
+        h.state_mut().tabs.quit = Quit::No;
+
+        // One document changed (the one at the back): asked about, by name.
+        h.state_mut().switch_tab(0);
+        h.state_mut().structural(|d| d.delete(0)).unwrap();
+        h.state_mut().switch_tab(2);
+        assert_eq!(h.state().unsaved_tabs(), [0]);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Q);
+        h.run_steps(3);
+        assert_eq!(h.state().tabs.quit, Quit::Asking);
+        h.get_by_label("Do you want to save the changes you made to “a”?");
+        // Cancel: still here, nothing saved.
+        h.get_by_label("Cancel").click();
+        h.run_steps(3);
+        assert_eq!(h.state().tabs.quit, Quit::No);
+        assert_eq!(h.state().unsaved_tabs(), [0]);
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+
+        // The window's close button asks the same.
+        assert!(!h.state_mut().may_close());
+        assert_eq!(h.state().tabs.quit, Quit::Asking);
+        h.run_steps(2);
+        // Don't Save: it quits; the file is as it was, and the changes
+        // are the session's to bring back.
+        h.get_by_label("Don't Save").click();
+        h.run_steps(3);
+        assert_eq!(h.state().tabs.quit, Quit::Go);
+        assert!(h.state_mut().may_close(), "no second question");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), on_disk);
+        assert_eq!(h.state().unsaved_tabs(), [0]);
+        h.state_mut().tabs.quit = Quit::No;
+
+        // Two changed: Save All writes both files, then it quits.
+        h.state_mut().structural(|d| d.delete(0)).unwrap();
+        assert_eq!(h.state().unsaved_tabs(), [0, 2]);
+        h.state_mut().request_quit();
+        h.run_steps(3);
+        h.get_by_label("2 documents have changes that aren't saved. Save them before quitting?");
+        let c_before = std::fs::read_to_string(&c).unwrap();
+        h.get_by_label("Save All").click();
+        h.run_steps(3);
+        assert_eq!(h.state().tabs.quit, Quit::Go);
+        assert!(h.state().unsaved_tabs().is_empty());
+        assert_ne!(std::fs::read_to_string(&a).unwrap(), on_disk);
+        assert_ne!(std::fs::read_to_string(&c).unwrap(), c_before);
+        // Each saved as itself (one object gone from each, b untouched).
+        for (file, objects) in [(&a, 1), (&b, 2), (&c, 1)] {
+            let doc = zigzag::document::Document::open(file).unwrap();
+            assert_eq!(doc.shapes.len(), objects, "{}", file.display());
+        }
     }
 
     #[test]

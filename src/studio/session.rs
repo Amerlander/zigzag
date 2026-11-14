@@ -27,6 +27,13 @@ use zigzag::geom::P;
 
 /// How long edits wait before they're written (a burst of them, one write).
 const SETTLE_S: f64 = 1.5;
+/// A write waits for the hand to be off the mouse for this long: it stops
+/// the frame for as long as the disk takes to say the file is safe (ten or
+/// twenty milliseconds each, on a fast one), which shows as a stutter in
+/// the middle of a drag, a pan or a zoom.
+const QUIET_S: f64 = 0.4;
+/// But a change never waits longer than this, however long the gesture.
+const LONGEST_S: f64 = 10.0;
 
 #[derive(Default)]
 pub struct SessionState {
@@ -34,6 +41,8 @@ pub struct SessionState {
     dir: Option<PathBuf>,
     /// When the next write is due (egui time), if something changed.
     due: Option<f64>,
+    /// When the change that's waiting to be written was noticed.
+    since: Option<f64>,
     /// The document in front as last written to its recovery file.
     saved_doc: Option<(u64, Snap)>,
     /// The recovery file of the document in front (see [`recovery_file`]);
@@ -190,14 +199,22 @@ impl Studio {
     pub(crate) fn keep_session(&mut self, ctx: &eframe::egui::Context) {
         let now = ctx.input(|i| i.time);
         let closing = ctx.input(|i| i.viewport().close_requested());
-        if let Some(wait) = self.keep_session_at(now, closing) {
+        // A gesture under way: a button held, or the view being scrolled
+        // or zoomed.
+        let busy = ctx.input(|i| {
+            i.pointer.any_down()
+                || i.smooth_scroll_delta != eframe::egui::Vec2::ZERO
+                || i.zoom_delta() != 1.0
+        });
+        if let Some(wait) = self.keep_session_at(now, closing, busy) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
     }
 
     /// [`Studio::keep_session`] at time `now`: how long until a write is
-    /// due, if one is waiting.
-    fn keep_session_at(&mut self, now: f64, closing: bool) -> Option<f64> {
+    /// due, if one is waiting. `busy`: a gesture is under way, and the
+    /// write waits for it to end (see [`QUIET_S`]).
+    fn keep_session_at(&mut self, now: f64, closing: bool, busy: bool) -> Option<f64> {
         if self.session.dir.is_none() || self.previewing() {
             return None;
         }
@@ -214,8 +231,17 @@ impl Studio {
             || self.session.saved_meta.as_ref() != Some(&self.session_meta(self.modified));
         if changed && self.session.due.is_none() {
             self.session.due = Some(now + SETTLE_S);
+            self.session.since = Some(now);
         }
         let t = self.session.due?;
+        if !closing
+            && busy
+            && now + QUIET_S > t
+            && self.session.since.is_some_and(|s| now - s < LONGEST_S)
+        {
+            self.session.due = Some(now + QUIET_S);
+            return Some(QUIET_S);
+        }
         if closing || now >= t {
             self.write_session();
             None
@@ -229,7 +255,7 @@ impl Studio {
     pub(crate) fn flush_session(&mut self) {
         // (Documents just restored, not yet through a frame, stay as kept.)
         if !self.session.restoring {
-            self.keep_session_at(f64::INFINITY, true);
+            self.keep_session_at(f64::INFINITY, true, false);
         }
     }
 
@@ -247,6 +273,7 @@ impl Studio {
     /// Write the session now.
     pub(crate) fn write_session(&mut self) {
         self.session.due = None;
+        self.session.since = None;
         let (Some(json), Some(svg)) = (
             self.session.file("session.json"),
             self.session.file(&recovery_file(self.session.rec)),
@@ -721,7 +748,7 @@ mod tests {
         std::fs::rename(dir.join("recovery-crashed.svg"), dir.join("recovery.svg")).unwrap();
         let mut d = studio_in(&dir);
         assert!(d.restore_session());
-        assert!(d.keep_session_at(0.0, false).is_none());
+        assert!(d.keep_session_at(0.0, false, false).is_none());
         assert!(!dir.join(RESTORING).exists(), "cleared after a frame");
         let mut e = studio_in(&dir);
         assert!(e.restore_session(), "reopens as usual");
@@ -798,7 +825,7 @@ mod tests {
         std::fs::write(&file, SVG).unwrap();
         let mut a = studio_in(&dir);
         a.load(&file);
-        let at = |a: &mut Studio, t: f64| a.keep_session_at(t, false);
+        let at = |a: &mut Studio, t: f64| a.keep_session_at(t, false, false);
         at(&mut a, 0.0);
         at(&mut a, 2.0);
         assert!(dir.join("session.json").exists(), "the open file is noted");
@@ -813,10 +840,48 @@ mod tests {
         // Closing writes at once.
         a.structural(|d| d.delete(0)).unwrap();
         assert!(at(&mut a, 10.0).is_some());
-        assert_eq!(a.keep_session_at(10.1, true), None);
+        assert_eq!(a.keep_session_at(10.1, true, false), None);
         let mut b = studio_in(&dir);
         assert!(b.restore_session());
         assert_eq!(b.doc.shapes.len(), a.doc.shapes.len());
+    }
+
+    #[test]
+    fn a_write_waits_for_the_gesture_to_end() {
+        let dir = temp_dir("quiet");
+        let file = dir.join("cap.svg");
+        std::fs::write(&file, SVG).unwrap();
+        let mut a = studio_in(&dir);
+        a.load(&file);
+        a.keep_session_at(0.0, false, false);
+        a.keep_session_at(2.0, false, false);
+        a.structural(|d| d.delete(0)).unwrap();
+        let rec = dir.join("recovery.svg");
+        // Dragging on past the time the write was due: it waits.
+        assert!(a.keep_session_at(3.0, false, true).is_some());
+        assert!(a.keep_session_at(4.6, false, true).is_some());
+        assert!(a.keep_session_at(6.0, false, true).is_some());
+        assert!(!rec.exists(), "not in the middle of a drag");
+        // The button's up: a moment later it's written.
+        assert!(a.keep_session_at(6.1, false, false).is_some());
+        assert!(!rec.exists());
+        assert_eq!(a.keep_session_at(6.0 + QUIET_S, false, false), None);
+        assert!(rec.exists());
+        // A gesture that never ends doesn't keep a change waiting for ever.
+        assert!(a.apply_history(crate::app::History::Undo));
+        let before = std::fs::read_to_string(&rec).unwrap();
+        let mut t = 10.0;
+        while t < 10.0 + LONGEST_S + 1.0 {
+            a.keep_session_at(t, false, true);
+            t += 0.1;
+        }
+        assert_ne!(std::fs::read_to_string(&rec).unwrap(), before);
+        // Closing never waits.
+        assert!(a.apply_history(crate::app::History::Redo));
+        let before = std::fs::read_to_string(&rec).unwrap();
+        a.keep_session_at(30.0, false, true);
+        assert_eq!(a.keep_session_at(30.1, true, true), None);
+        assert_ne!(std::fs::read_to_string(&rec).unwrap(), before);
     }
 
     #[test]
@@ -880,7 +945,7 @@ mod tests {
         let mut b = studio_in(&dir);
         assert!(b.restore_session());
         // (A first frame: the restore got through.)
-        b.keep_session_at(0.0, false);
+        b.keep_session_at(0.0, false, false);
         let names: Vec<String> = b.tab_infos().into_iter().map(|t| t.name).collect();
         assert_eq!(names, ["one", "two", "three"]);
         assert_eq!(b.active_tab(), 1, "two in front, as it was");

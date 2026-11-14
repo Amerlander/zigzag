@@ -244,6 +244,72 @@ impl Typing {
     }
 }
 
+/// What a font menu lists: a search field (the keyboard's when the menu
+/// opens, so typing narrows the list straight away) and the fonts. ↑ and
+/// ↓ step through the fonts listed, the text taking each as it's reached
+/// and the list scrolling to it; Enter closes the menu (as Escape and a
+/// click on a font do). True when the font changed.
+pub(crate) fn font_list(
+    ui: &mut egui::Ui,
+    font: &mut String,
+    fonts: &[String],
+    filter: &mut String,
+) -> bool {
+    // (Before the search field sees them: there they'd move its caret.)
+    let (up, down, enter) = ui.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+        )
+    });
+    let field = ui.add(egui::TextEdit::singleline(filter).hint_text("Search fonts"));
+    // Just opened (it wasn't shown last frame)?
+    let seen = ui.scope_id().with("font-list-seen");
+    let frame = ui.ctx().cumulative_frame_nr();
+    let opened = ui
+        .data(|d| d.get_temp::<u64>(seen))
+        .is_none_or(|last| last + 1 < frame);
+    ui.data_mut(|d| d.insert_temp(seen, frame));
+    if opened {
+        field.request_focus();
+    }
+    let f = filter.to_lowercase();
+    let listed: Vec<&String> = fonts
+        .iter()
+        .filter(|n| f.is_empty() || n.to_lowercase().contains(&f))
+        .collect();
+    let mut changed = false;
+    // The font to bring into view: the one in use as the menu opens, the
+    // one stepped to.
+    let mut reveal = opened;
+    if (up || down) && !listed.is_empty() {
+        let last = listed.len() - 1;
+        let k = match (listed.iter().position(|n| *n == font), down) {
+            (Some(k), true) => (k + 1).min(last),
+            (Some(k), false) => k.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => last,
+        };
+        if listed[k] != font {
+            *font = listed[k].clone();
+            changed = true;
+        }
+        reveal = true;
+    }
+    for name in listed {
+        let r = ui.selectable_value(font, name.clone(), name);
+        changed |= r.changed();
+        if reveal && name == font {
+            r.scroll_to_me(Some(egui::Align::Center));
+        }
+    }
+    if enter {
+        ui.close();
+    }
+    changed
+}
+
 impl Studio {
     pub(crate) fn fonts(&mut self) -> Vec<String> {
         if self.lettering.fonts.is_empty() {
@@ -350,18 +416,9 @@ impl Studio {
                     .selected_text(&spec.font)
                     .width(170.0)
                     .height(320.0)
-                    .show_ui(ui, |ui| {
-                        ui.add(egui::TextEdit::singleline(filter).hint_text("Search fonts"));
-                        let f = filter.to_lowercase();
-                        for name in fonts
-                            .iter()
-                            .filter(|n| f.is_empty() || n.to_lowercase().contains(&f))
-                        {
-                            ui.selectable_value(&mut spec.font, name.clone(), name);
-                        }
-                    })
-                    .response
-                    .labelled_by(lid);
+                    .show_ui(ui, |ui| font_list(ui, &mut spec.font, fonts, filter));
+                committed |= r.inner == Some(true);
+                let r = r.response.labelled_by(lid);
                 committed |= r.changed();
             });
             fm.row("Style", |ui, _| {
@@ -918,6 +975,20 @@ impl Studio {
         self.doc.shapes.iter().position(|s| s.uid == t.uid)
     }
 
+    /// A plan just made still has the hidden text's stitches (its letters
+    /// stay in the document): out of the plan on show they go, wherever
+    /// they are in it (in a block of their own, or sewn in one thread
+    /// with their neighbours).
+    pub(crate) fn hide_planned_text(&mut self) {
+        if let Some(i) = self.hidden_text()
+            && self.doc.shapes.len() == self.design.per_shape.len()
+        {
+            self.drop_planned(&[i]);
+            // (Planned again before it's sewn, or shown once there are
+            // letters: see `plan_now`, and typing re-plans.)
+        }
+    }
+
     /// Is `p` on text object `i`: within its box (with a little margin),
     /// gaps between the letters included.
     fn text_box_hit(&self, i: usize, p: P, tol: f64) -> bool {
@@ -1169,6 +1240,8 @@ impl Studio {
                 let _ = self.doc.set_lettering(i, &new);
                 self.dirty = true;
                 self.modified = true;
+            } else {
+                self.drop_planned(&[i]);
             }
         }
         // The caret: after the last glyph of the last line, as tall as the
@@ -1280,6 +1353,9 @@ impl Studio {
             return;
         };
         if t.text.trim().is_empty() {
+            // Gone from the canvas now, not when the next plan is made
+            // (till then the old plan would show its letters again).
+            self.drop_planned(&[i]);
             if t.fresh {
                 // Back to before it was placed.
                 if let Some(doc) = self.undo.pop() {
@@ -2000,6 +2076,279 @@ mod editing_tests {
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::Z);
         h.run_steps(2);
         assert_eq!(texts(&h), ["Hello"]);
+    }
+
+    #[test]
+    fn text_is_sewn_the_same_wherever_its_moved() {
+        let (mut h, _) = with_hello();
+        // A filled shape too: what holds for text holds for any fill.
+        let square = zigzag::bezier::rect(P::new(-100.0, 300.0), P::new(100.0, 450.0), 0.0);
+        h.state_mut()
+            .structural(|d| {
+                d.add_drawing_path(&square, [200, 30, 30], Kind::Fill)
+                    .map(|_| ())
+            })
+            .unwrap();
+        h.state_mut().doc.settings.connect_mm = 3.6;
+        // Filled letters: rows of stitches, which is where a grid that
+        // stays put shows. (Satin letters are columns, and a column can
+        // still begin on its other side after a move, the two being as
+        // good as each other.)
+        let spec = TextSpec {
+            kind: Kind::Fill,
+            ..h.state().doc.lettering(0).unwrap()
+        };
+        h.state_mut().update_lettering(0, &spec).unwrap();
+        h.run_steps(2);
+        // Each object's stitches, from its own corner.
+        let sewn = |h: &Harness<'_, Studio>, i: usize| -> Vec<Vec<(i64, i64)>> {
+            let s = h.state();
+            let o = crate::app::shape_bounds(&s.doc.shapes[i]).min;
+            let mut runs = Vec::new();
+            for (b, blk) in s.design.blocks.iter().enumerate() {
+                for (r, run) in blk.runs.iter().enumerate() {
+                    let spans = &s.design.stitch_shapes[b][r];
+                    for (k, &(from, of)) in spans.iter().enumerate() {
+                        let to = spans.get(k + 1).map_or(run.pts.len(), |x| x.0);
+                        if of == i {
+                            runs.push(
+                                run.pts[from..to]
+                                    .iter()
+                                    .map(|p| {
+                                        (
+                                            ((p.x - o.x) * 100.0).round() as i64,
+                                            ((p.y - o.y) * 100.0).round() as i64,
+                                        )
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+            }
+            runs
+        };
+        // (To a hundredth of a millimetre: where it's put is kept to a
+        // few decimals.)
+        let alike = |a: &[Vec<(i64, i64)>], b: &[Vec<(i64, i64)>]| -> Result<(), String> {
+            if a.len() != b.len() {
+                return Err(format!("{} runs for {}", a.len(), b.len()));
+            }
+            for (k, (x, y)) in a.iter().zip(b).enumerate() {
+                if x.len() != y.len() {
+                    return Err(format!("run {k}: {} stitches for {}", x.len(), y.len()));
+                }
+                let off: Vec<usize> = (0..x.len())
+                    .filter(|&i| (x[i].0 - y[i].0).abs() > 10 || (x[i].1 - y[i].1).abs() > 10)
+                    .collect();
+                if let Some(&i) = off.first() {
+                    return Err(format!(
+                        "run {k}: {} of {} stitches differ, {:?}; the first: {:?} for {:?}",
+                        off.len(),
+                        x.len(),
+                        &off[..off.len().min(12)],
+                        x[i],
+                        y[i]
+                    ));
+                }
+            }
+            Ok(())
+        };
+        let (text, shape) = (sewn(&h, 0), sewn(&h, 1));
+        assert!(text.iter().map(Vec::len).sum::<usize>() > 100);
+        let joins = h.state().design.bridges.len();
+        // Dragged about, by amounts that are no multiple of anything.
+        for d in [
+            P::new(3.3, 0.0),
+            P::new(0.0, 1.7),
+            P::new(-71.3, 13.9),
+            P::new(128.6, -44.1),
+        ] {
+            h.state_mut().set_selection(&[0, 1]);
+            h.state_mut()
+                .transform_selected(zigzag::geom::translation(d), "Moved");
+            h.run_steps(2);
+            assert_eq!(
+                alike(&sewn(&h, 0), &text),
+                Ok(()),
+                "the text, moved by {d:?}"
+            );
+            assert_eq!(
+                alike(&sewn(&h, 1), &shape),
+                Ok(()),
+                "the square, moved by {d:?}"
+            );
+            assert_eq!(h.state().design.bridges.len(), joins, "joined as it was");
+        }
+        // The text alone, away from the square: its letters as they were.
+        h.state_mut().set_selection(&[0]);
+        h.state_mut()
+            .transform_selected(zigzag::geom::translation(P::new(40.7, -160.3)), "Moved");
+        h.run_steps(2);
+        assert_eq!(
+            alike(&sewn(&h, 0)[1..], &text[1..]),
+            Ok(()),
+            "all but how it's reached"
+        );
+        // And after a save and reopening.
+        let svg = h.state().doc.to_svg().unwrap();
+        let again = zigzag::document::Document::from_svg(&svg, "t", None).unwrap();
+        h.state_mut().set_document(again);
+        h.run_steps(3);
+        assert_eq!(alike(&sewn(&h, 0)[1..], &text[1..]), Ok(()));
+        assert_eq!(alike(&sewn(&h, 1), &shape), Ok(()));
+    }
+
+    #[test]
+    fn arrow_keys_step_through_a_font_list() {
+        let fonts: Vec<String> = ["Alpha", "Beta", "Bravo", "Gamma"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // (font, what's typed in the search field, times it changed)
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(300.0, 400.0))
+            .build_ui_state(
+                {
+                    let fonts = fonts.clone();
+                    move |ui, s: &mut (String, String, usize)| {
+                        if font_list(ui, &mut s.0, &fonts, &mut s.1) {
+                            s.2 += 1;
+                        }
+                    }
+                },
+                ("Beta".to_string(), String::new(), 0),
+            );
+        h.run_steps(2);
+        let press = |h: &mut Harness<'_, (String, String, usize)>, k: Key| {
+            h.key_press(k);
+            h.run_steps(2);
+        };
+        press(&mut h, Key::ArrowDown);
+        assert_eq!(h.state().0, "Bravo");
+        press(&mut h, Key::ArrowDown);
+        press(&mut h, Key::ArrowDown);
+        assert_eq!(h.state().0, "Gamma", "stops at the last");
+        assert_eq!(h.state().2, 2, "each step is a change, the stop isn't");
+        press(&mut h, Key::ArrowUp);
+        press(&mut h, Key::ArrowUp);
+        press(&mut h, Key::ArrowUp);
+        press(&mut h, Key::ArrowUp);
+        assert_eq!(h.state().0, "Alpha", "and at the first");
+        // The search field has the keyboard from the start: typing
+        // narrows the list, and the arrows step through what's listed.
+        // (No click needed: it took the keyboard as the list opened.)
+        h.event(egui::Event::Text("b".into()));
+        h.run_steps(2);
+        assert_eq!(h.state().1, "b");
+        press(&mut h, Key::ArrowDown);
+        assert_eq!(h.state().0, "Beta", "into the list from a font not in it");
+        press(&mut h, Key::ArrowDown);
+        assert_eq!(h.state().0, "Bravo");
+        press(&mut h, Key::ArrowDown);
+        assert_eq!(h.state().0, "Bravo");
+        assert_eq!(h.state().1, "b", "the arrows aren't the field's");
+    }
+
+    /// How many stitches of the plan on show are inside `b`.
+    fn stitches_in(h: &Harness<'_, Studio>, b: zigzag::geom::Bounds) -> usize {
+        h.state()
+            .design
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.runs)
+            .flat_map(|r| &r.pts)
+            .filter(|p| p.x >= b.min.x && p.x <= b.max.x && p.y >= b.min.y && p.y <= b.max.y)
+            .count()
+    }
+
+    #[test]
+    fn text_typed_away_or_deleted_is_off_the_canvas_at_once() {
+        let (mut h, c) = with_hello();
+        // A square in the text's thread, sewn right after it: one block
+        // of stitches for the two.
+        let color = h.state().doc.shapes[0].color;
+        let square = zigzag::bezier::rect(P::new(-100.0, 300.0), P::new(100.0, 450.0), 0.0);
+        h.state_mut()
+            .structural(|d| d.add_drawing_path(&square, color, Kind::Fill).map(|_| ()))
+            .unwrap();
+        h.run_steps(2);
+        assert_eq!(h.state().design.blocks.len(), 1, "one thread, one block");
+        let text = crate::app::shape_bounds(&h.state().doc.shapes[0]);
+        let below = crate::app::shape_bounds(&h.state().doc.shapes[1]);
+        assert!(text.max.y < below.min.y);
+        let (letters, rest) = (stitches_in(&h, text), stitches_in(&h, below));
+        assert!(letters > 50 && rest > 50);
+
+        // Every letter typed away: the text's stitches are hidden, those
+        // sharing its block aren't.
+        click(&mut h, c);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+        h.run_steps(1);
+        h.key_press(Key::Backspace);
+        h.run_steps(2);
+        assert_eq!(h.state().hidden_text(), Some(0));
+        assert_eq!(stitches_in(&h, text), 0, "hidden, shared block or not");
+        assert_eq!(stitches_in(&h, below), rest);
+        // A plan made meanwhile doesn't bring them back.
+        h.state_mut().dirty = true;
+        h.run_steps(2);
+        assert_eq!(stitches_in(&h, text), 0);
+        assert_eq!(texts(&h), ["Hello"], "the letters are still the document's");
+        // What's sewn or exported is planned afresh, as what's shown.
+        h.state_mut().plan_now();
+        assert_eq!(stitches_in(&h, text), 0);
+        // Something typed: there are stitches again.
+        type_text(&mut h, "Hi");
+        h.run_steps(2);
+        assert!(stitches_in(&h, text) > 20);
+        // Replacing Hello with Hi can change the route into the square.
+        // Deletion must preserve this new plan, not the one before typing.
+        let rest = stitches_in(&h, below);
+        assert!(rest > 50);
+
+        // Typed away again and the edit ended, while planning is the
+        // worker's (a big design, or a busy computer): the old plan stays
+        // on show until the new one arrives, without the letters.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+        h.run_steps(1);
+        h.key_press(Key::Backspace);
+        h.run_steps(2);
+        h.state_mut().planner.slow = true;
+        h.state_mut().finish_typing();
+        assert_eq!(texts(&h), [] as [&str; 0], "the text is deleted");
+        assert_eq!(stitches_in(&h, text), 0, "and doesn't flash back");
+        assert_eq!(stitches_in(&h, below), rest);
+        h.step();
+        assert_eq!(stitches_in(&h, text), 0);
+        for _ in 0..200 {
+            if !h.state().planner.pending && !h.state().dirty {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            h.step();
+        }
+        // (The square alone now: begun and ended where suits it.)
+        assert!(stitches_in(&h, below) > 50, "the new plan");
+        assert_eq!(stitches_in(&h, text), 0);
+        assert!(!h.state().plan_cut);
+
+        // Undo brings the text back; deleted with the Selection tool (the
+        // worker planning again), it's off the canvas in that frame too.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::Z);
+        h.run_steps(3);
+        assert_eq!(texts(&h).len(), 1);
+        assert!(stitches_in(&h, text) > 20);
+        h.state_mut().set_tool(crate::app::Tool::Select);
+        let t = (0..h.state().doc.shapes.len())
+            .find(|&i| h.state().doc.lettering(i).is_some())
+            .unwrap();
+        h.state_mut().set_selection(&[t]);
+        h.state_mut().planner.slow = true;
+        h.state_mut().delete_selection();
+        assert!(h.state().dirty, "not planned yet");
+        assert_eq!(stitches_in(&h, text), 0);
+        assert!(stitches_in(&h, below) > 50);
     }
 
     #[test]

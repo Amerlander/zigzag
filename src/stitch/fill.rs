@@ -30,6 +30,11 @@ pub struct FillParams {
     /// row one way and the rows between on the way back: the same needle
     /// points, with turns two (or three…) rows long.
     pub min_stitch: f64,
+    /// The point the rows, and the needle points along them, are laid out
+    /// from (see [`crate::svg::Shape::origin`]): shapes with one origin
+    /// and the same settings line up; a shape moved with its origin is
+    /// sewn as it was.
+    pub origin: P,
 }
 
 struct Edge {
@@ -61,8 +66,8 @@ pub fn tatami(rings: &[Polyline], rule: FillRule, p: &FillParams) -> Vec<Polylin
             continue;
         }
         for i in 0..n {
-            let a = ring[i].rotate(c, s);
-            let b = ring[(i + 1) % n].rotate(c, s);
+            let a = (ring[i] - p.origin).rotate(c, s);
+            let b = (ring[(i + 1) % n] - p.origin).rotate(c, s);
             if (a.y - b.y).abs() < 1e-9 {
                 continue;
             }
@@ -83,7 +88,8 @@ pub fn tatami(rings: &[Polyline], rule: FillRule, p: &FillParams) -> Vec<Polylin
     let ymin = edges[0].y0;
     let ymax = edges.iter().map(|e| e.y1).fold(f64::NEG_INFINITY, f64::max);
 
-    // Rows sit on a global grid so neighbouring shapes with the same settings line up.
+    // Rows sit on a grid laid out from the origin, so neighbouring shapes
+    // with the same settings (and origin) line up.
     let k_lo = (ymin / p.spacing - 0.5).ceil() as i64;
     let k_hi = (ymax / p.spacing - 0.5).floor() as i64;
     let shrink = p.inset - p.pull;
@@ -183,7 +189,7 @@ pub fn tatami(rings: &[Polyline], rule: FillRule, p: &FillParams) -> Vec<Polylin
                     }
                     rule.inside(w)
                 }
-                None => crate::geom::point_inside(rings, rule, q.rotate(cb0, sb0)),
+                None => crate::geom::point_inside(rings, rule, q.rotate(cb0, sb0) + p.origin),
             }
         })
     };
@@ -375,7 +381,7 @@ pub fn tatami(rings: &[Polyline], rule: FillRule, p: &FillParams) -> Vec<Polylin
                 push(P::new(xe, r.y));
             }
             for q in pts.iter_mut() {
-                *q = q.rotate(cb, sb);
+                *q = q.rotate(cb, sb) + p.origin;
             }
             pts
         })
@@ -405,7 +411,54 @@ mod tests {
             stagger: 4,
             bottom_up: false,
             min_stitch: 0.0,
+            origin: P::default(),
         }
+    }
+
+    #[test]
+    fn a_fill_laid_out_from_its_origin_moves_with_it() {
+        // An L, awkward enough to come out in more than one section.
+        let ring = |d: P| -> Polyline {
+            [
+                (0.0, 0.0),
+                (100.0, 0.0),
+                (100.0, 37.0),
+                (41.0, 37.0),
+                (41.0, 113.0),
+                (0.0, 113.0),
+            ]
+            .iter()
+            .map(|&(x, y)| P::new(x, y) + d)
+            .collect()
+        };
+        let at = |d: P, origin: P| {
+            let p = FillParams {
+                angle: 0.4,
+                origin,
+                ..params()
+            };
+            tatami(&[ring(d)], FillRule::NonZero, &p)
+        };
+        let here = at(P::default(), P::default());
+        for d in [P::new(1.3, 0.0), P::new(0.0, 1.1), P::new(-37.7, 212.9)] {
+            // Moved with its origin: the same stitches, moved.
+            let there = at(d, d);
+            assert_eq!(there.len(), here.len());
+            for (a, b) in there.iter().zip(&here) {
+                assert_eq!(a.len(), b.len());
+                assert!(a.iter().zip(b).all(|(p, q)| (*p - d).dist(*q) < 1e-6));
+            }
+        }
+        // Moved under an origin that stays put, the rows fall elsewhere.
+        let slid = at(P::new(0.0, 1.1), P::default());
+        let same = slid.len() == here.len()
+            && slid.iter().zip(&here).all(|(a, b)| {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(p, q)| (*p - P::new(0.0, 1.1)).dist(*q) < 1e-6)
+            });
+        assert!(!same);
     }
 
     #[test]
@@ -629,6 +682,7 @@ mod circle_tests {
             stagger: 4,
             bottom_up: false,
             min_stitch: 0.0,
+            origin: P::default(),
         };
         let secs = tatami(&[ring], FillRule::NonZero, &p);
         assert_eq!(secs.len(), 1);

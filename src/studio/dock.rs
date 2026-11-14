@@ -110,6 +110,9 @@ pub struct DockUi {
     /// The next panel header drawn is the first in this dock's column: it
     /// carries the dock's « / » (collapse to icons), at its right end.
     collapse_btn: Option<Place>,
+    /// Layers being dragged to another place in the sewing order: the
+    /// objects (by uid), and what the copy at the pointer says.
+    pub(crate) layer_drag: Option<(Vec<usize>, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1600,11 +1603,12 @@ impl Studio {
         let mut rows = Vec::new();
         let mut stack: Vec<String> = Vec::new();
         for i in 0..n {
-            // A group of one is shown as just its object.
+            // A group of one (a shape and its outline are one) is shown as
+            // just its object.
             let gs: Vec<&String> = self.doc.shapes[i]
                 .groups
                 .iter()
-                .filter(|g| members[g.as_str()].len() > 1)
+                .filter(|g| !crate::layout::one_thing(&self.doc.shapes, &members[g.as_str()]))
                 .collect();
             let mut k = 0;
             while k < stack.len() && k < gs.len() && stack[k] == *gs[k] {
@@ -1679,11 +1683,26 @@ impl Studio {
         // (then it's everything else's).
         let mut flag_click: Option<(Vec<usize>, Flag, bool)> = None;
         let others = ui.input(|i| i.modifiers.alt);
+        // Layers dragged to another place in the sewing order: where the
+        // pointer is while some are (the rows under it say where they'd
+        // go: before which layer, and the line that shows it, its height
+        // and its left end); and a drag begun this frame.
+        let over = self
+            .dock_ui
+            .layer_drag
+            .as_ref()
+            .and_then(|_| ui.input(|i| i.pointer.interact_pos()));
+        let mut drop: Option<(usize, f32, f32)> = None;
+        let mut drag_start: Option<(Vec<usize>, String)> = None;
         egui::ScrollArea::vertical()
             .id_salt("objects")
             .max_height(list_h)
             .auto_shrink([false, false])
             .show_rows(ui, ROW, rows.len(), |ui, range| {
+                // The last layer's row laid out, for a drop below them all.
+                let mut last_row: Option<(Rect, f32)> = None;
+                let list = ui.clip_rect();
+                let shown_to_the_end = range.end == rows.len();
                 if self.doc.shapes.is_empty() {
                     ui.add_space(8.0);
                     caption(
@@ -1697,10 +1716,37 @@ impl Studio {
                             let indent = *depth as f32 * 14.0 + GUTTER;
                             let (rect, resp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), ROW),
-                                Sense::click(),
+                                Sense::click_and_drag(),
                             );
                             let body = row_body(rect);
                             let gutter = gutter_flag(rect, resp.interact_pointer_pos());
+                            // Dragged: the group's layers go (with the rest
+                            // of the selection, when they're all in it).
+                            if resp.drag_started_by(egui::PointerButton::Primary)
+                                && gutter.is_none()
+                            {
+                                let mut moving = members.clone();
+                                if members.iter().all(|m| all_sel.contains(m)) {
+                                    moving.extend(all_sel.iter().filter(|m| !members.contains(m)));
+                                }
+                                drag_start = Some((moving, Studio::group_label(id)));
+                            }
+                            // Dragged over: before the group, or after it
+                            // (at the top of it, while it's open).
+                            if let Some(q) = over.filter(|q| rect.contains(*q)) {
+                                let open = self.layout.expanded.contains(id);
+                                let (first, last) = (
+                                    members.iter().copied().min().unwrap_or(0),
+                                    members.iter().copied().max().unwrap_or(0),
+                                );
+                                drop = Some(if q.y < rect.center().y {
+                                    (first, rect.top(), rect.left() + indent)
+                                } else if open {
+                                    (first, rect.bottom(), rect.left() + indent + 14.0)
+                                } else {
+                                    (last + 1, rect.bottom(), rect.left() + indent)
+                                });
+                            }
                             eye_and_lock(
                                 ui.painter(),
                                 rect,
@@ -1826,10 +1872,21 @@ impl Studio {
                         )
                     };
                     let count = self.design.per_shape.get(i).copied().unwrap_or(0);
-                    let (rect, resp) = ui
-                        .allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), ROW),
+                        Sense::click_and_drag(),
+                    );
                     let label = self.names.get(i).cloned().unwrap_or_default();
                     let selected = all_sel.contains(&i);
+                    // Dragged over: before this layer, or after it.
+                    if let Some(q) = over.filter(|q| rect.contains(*q)) {
+                        drop = Some(if q.y < rect.center().y {
+                            (i, rect.top(), rect.left() + indent)
+                        } else {
+                            (i + 1, rect.bottom(), rect.left() + indent)
+                        });
+                    }
+                    last_row = Some((rect, indent));
                     resp.widget_info(|| {
                         egui::WidgetInfo::selected(egui::Role::ListItem, true, selected, &label)
                     });
@@ -1969,6 +2026,22 @@ impl Studio {
                     // What's locked or hidden can't be selected, here
                     // either (as in Illustrator's Layers): its eye and
                     // lock are what a click on its row is for.
+                    // Dragged: this layer, or the selected ones when it's
+                    // one of several (as VectorCraft's Layers, and
+                    // Illustrator's): to another place in the sewing order.
+                    if resp.drag_started_by(egui::PointerButton::Primary)
+                        && gutter.is_none()
+                        && !editing
+                    {
+                        drag_start = Some(if selected && all_sel.len() > 1 {
+                            (
+                                all_sel.iter().copied().collect(),
+                                format!("{} layers", all_sel.len()),
+                            )
+                        } else {
+                            (vec![i], label.clone())
+                        });
+                    }
                     if let Some(flag) = gutter {
                         if resp.clicked() {
                             flag_click = Some((vec![i], flag, others));
@@ -1983,7 +2056,40 @@ impl Studio {
                     }
                     resp.context_menu(|ui| self.object_menu_items(ui));
                 }
+                // (A little below the list counts: one as tall as its rows
+                // has nowhere under the last of them to drop on.)
+                if let Some(q) = over.filter(|q| {
+                    list.x_range().contains(q.x) && q.y >= list.top() && q.y <= list.bottom() + 28.0
+                }) {
+                    // Below the last layer: to the end.
+                    if drop.is_none()
+                        && shown_to_the_end
+                        && let Some((rect, indent)) = last_row.filter(|(r, _)| q.y >= r.bottom())
+                    {
+                        drop = Some((self.doc.shapes.len(), rect.bottom(), rect.left() + indent));
+                    }
+                    if let Some((_, y, x)) = drop {
+                        ui.painter().line_segment(
+                            [Pos2::new(x, y), Pos2::new(list.right() - 4.0, y)],
+                            Stroke::new(2.0, p.accent),
+                        );
+                    }
+                    // Near the top or bottom of the list, it scrolls.
+                    let edge = 22.0;
+                    let by = if q.y < list.top() + edge {
+                        6.0
+                    } else if q.y > list.bottom() - edge {
+                        -6.0
+                    } else {
+                        0.0
+                    };
+                    if by != 0.0 {
+                        ui.scroll_with_delta(Vec2::new(0.0, by));
+                        ui.ctx().request_repaint();
+                    }
+                }
             });
+        self.layer_drag(ui, drag_start, drop);
         if let Some(i) = clicked {
             if toggle {
                 self.toggle_selected(i);
@@ -2063,6 +2169,69 @@ impl Studio {
         });
     }
 
+    /// Layers dragged in the Layers list (after VectorCraft's): `start`
+    /// begins a drag of those objects, called `label`; while one's under
+    /// way a dimmed copy of the row follows the pointer; and when the
+    /// button's let go they move to `drop` (before the object numbered so;
+    /// the line in the list shows where), as one undo step. Escape, or
+    /// letting go anywhere else, leaves them where they were.
+    fn layer_drag(
+        &mut self,
+        ui: &egui::Ui,
+        start: Option<(Vec<usize>, String)>,
+        drop: Option<(usize, f32, f32)>,
+    ) {
+        if let Some((moving, label)) = start {
+            let uids = moving
+                .iter()
+                .filter_map(|&i| self.doc.shapes.get(i))
+                .map(|s| s.uid)
+                .collect();
+            self.dock_ui.layer_drag = Some((uids, label));
+        }
+        let Some((uids, label)) = self.dock_ui.layer_drag.clone() else {
+            return;
+        };
+        let (down, released, escape, at) = ui.input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+                i.key_pressed(egui::Key::Escape),
+                i.pointer.interact_pos(),
+            )
+        });
+        if escape || (!down && !released) {
+            self.dock_ui.layer_drag = None;
+            return;
+        }
+        if released {
+            self.dock_ui.layer_drag = None;
+            if let Some((before, ..)) = drop {
+                let moving = self.uid_indices(&uids);
+                self.move_layers(&moving, before);
+            }
+            return;
+        }
+        // The copy at the pointer.
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(at) = at {
+            let p = pal_ui(ui);
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::unique("layer-drag-ghost"),
+            ));
+            let galley =
+                painter.layout_no_wrap(label, egui::FontId::proportional(13.0), Color32::WHITE);
+            let r = Rect::from_min_size(
+                at + Vec2::new(12.0, -11.0),
+                galley.size() + Vec2::new(16.0, 8.0),
+            );
+            painter.rect_filled(r, 5.0, p.accent.gamma_multiply(0.75));
+            painter.galley(r.min + Vec2::new(8.0, 4.0), galley, Color32::WHITE);
+        }
+        ui.ctx().request_repaint();
+    }
+
     /// Stitch type and editing commands for the selection (context menus).
     /// Give the object with this uid the name typed for it in the Objects
     /// list (one undo step). Nothing typed, or the name it has: no change.
@@ -2137,6 +2306,24 @@ impl Studio {
                 A::ReleaseCompound,
                 "Release Compound Path",
                 RowIcon::None,
+            );
+        }
+        // A filled shape with no outline yet: offer one.
+        if self.can_outline(i) {
+            menu_separator(ui);
+            self.action_row(
+                ui,
+                A::AddOutline,
+                "Add Outline",
+                RowIcon::Icon(Icon::AddOutline),
+            );
+        } else if self.outline_index(i).is_some() {
+            menu_separator(ui);
+            self.action_row(
+                ui,
+                A::RemoveOutline,
+                "Remove Outline",
+                RowIcon::Icon(Icon::NoOutline),
             );
         }
         menu_separator(ui);
@@ -2219,6 +2406,11 @@ impl Studio {
         } else {
             self.names.get(i).cloned().unwrap_or_default()
         };
+        // (A shape selected with its own outline is the shape.)
+        let what = match self.subjects()[..] {
+            [only] if count > 1 => self.names.get(only).cloned().unwrap_or_default(),
+            _ => what,
+        };
         let stitches: usize = sel
             .iter()
             .map(|&j| self.design.per_shape.get(j).copied().unwrap_or(0))
@@ -2229,11 +2421,13 @@ impl Studio {
     fn stitch_body(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.y = theme::space::S;
         let p = pal_ui(ui);
-        let Some(i) = self.sel_index() else {
+        // (A shape selected with its own outline is the shape.)
+        let subjects = self.subjects();
+        let Some(&i) = subjects.first() else {
             stitch_type_guide(ui);
             return;
         };
-        let count = self.sel_indices().len();
+        let count = subjects.len();
         let name = self.names.get(i).cloned().unwrap_or_default();
         if count > 1 {
             caption(
@@ -3025,7 +3219,7 @@ impl Studio {
             self.set_selection(&v);
         }
         if let Some(at) = picker {
-            self.picker = Some(at);
+            self.open_picker(at, None);
         }
     }
 
@@ -3264,6 +3458,207 @@ mod tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn layers_are_dragged_to_another_place_in_the_sewing_order() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="40mm" viewBox="0 0 100 40">
+            <rect id="one" x="5" y="5" width="15" height="15" fill="#c00000"/>
+            <rect id="two" x="25" y="5" width="15" height="15" fill="#00a000"/>
+            <rect id="three" x="45" y="5" width="15" height="15" fill="#0000c0"/>
+            <rect id="four" x="65" y="5" width="15" height="15" fill="#c0a000"/>
+        </svg>"##;
+        let doc = zigzag::document::Document::from_svg(svg, "t", None).unwrap();
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        h.state_mut().set_document(doc);
+        h.run_steps(4);
+        let order = |h: &Harness<'_, Studio>| h.state().names.clone();
+        let row = |h: &Harness<'_, Studio>, name: &str| {
+            h.query_all_by_label(name)
+                .find(|n| n.accesskit_node().role() == egui::accesskit::Role::ListItem)
+                .unwrap()
+                .rect()
+        };
+        use egui_kittest::kittest::NodeT;
+        let drag = |h: &mut Harness<'_, Studio>, from: Pos2, to: Pos2| {
+            h.hover_at(from);
+            h.run_steps(1);
+            h.drag_at(from);
+            h.run_steps(1);
+            for k in 1..=4 {
+                h.hover_at(from + (to - from) * (k as f32 / 4.0));
+                h.run_steps(1);
+            }
+            h.drop_at(to);
+            h.run_steps(3);
+        };
+        assert_eq!(order(&h), ["one", "two", "three", "four"]);
+
+        // "four" onto the top half of "two": it's sewn before it.
+        let (from, onto) = (row(&h, "four"), row(&h, "two"));
+        h.hover_at(from.center());
+        h.run_steps(1);
+        h.drag_at(from.center());
+        h.run_steps(1);
+        h.hover_at(onto.center() - Vec2::new(0.0, 6.0));
+        h.run_steps(2);
+        // Under way: nothing moved yet, a copy of the row at the pointer.
+        assert!(h.state().dock_ui.layer_drag.is_some());
+        assert_eq!(order(&h), ["one", "two", "three", "four"]);
+        h.drop_at(onto.center() - Vec2::new(0.0, 6.0));
+        h.run_steps(3);
+        assert!(h.state().dock_ui.layer_drag.is_none());
+        assert_eq!(order(&h), ["one", "four", "two", "three"]);
+        assert_eq!(h.state().undo.len(), 1, "one undo step");
+        // The order is the file's: it comes back from it.
+        let saved = h.state().doc.to_svg().unwrap();
+        let again = zigzag::document::Document::from_svg(&saved, "t", None).unwrap();
+        assert_eq!(
+            zigzag::svg::display_names(&again.shapes),
+            ["one", "four", "two", "three"]
+        );
+
+        // Onto the bottom half of a row: after it. Below them all: last.
+        let (from, onto) = (row(&h, "one"), row(&h, "two"));
+        drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["four", "two", "one", "three"]);
+        let (from, last) = (row(&h, "four"), row(&h, "three"));
+        drag(&mut h, from.center(), last.center() + Vec2::new(0.0, 40.0));
+        assert_eq!(order(&h), ["two", "one", "three", "four"]);
+        assert_eq!(h.state().undo.len(), 3);
+
+        // Dropped where it is already, or outside the list: nothing, and
+        // nothing to undo. A click still just selects.
+        let at = row(&h, "one");
+        drag(&mut h, at.center(), at.center() + Vec2::new(0.0, 6.0));
+        drag(&mut h, at.center(), at.center() - Vec2::new(400.0, 0.0));
+        assert_eq!(order(&h), ["two", "one", "three", "four"]);
+        assert_eq!(h.state().undo.len(), 3);
+        h.get_by_label("three").click();
+        h.run_steps(2);
+        assert_eq!(h.state().sel_index(), Some(2));
+
+        // Several selected, one of them dragged: they all go, in their
+        // own order, and stay selected.
+        h.state_mut().set_selection(&[0, 2]);
+        h.run_steps(2);
+        let (from, onto) = (row(&h, "three"), row(&h, "four"));
+        drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["one", "four", "two", "three"]);
+        let mut sel = h.state().sel_indices();
+        sel.sort_unstable();
+        assert_eq!(sel, [2, 3]);
+        // Undo puts them back.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        h.run_steps(3);
+        assert_eq!(order(&h), ["two", "one", "three", "four"]);
+
+        // Escape while dragging calls it off.
+        let (from, onto) = (row(&h, "four"), row(&h, "two"));
+        h.hover_at(from.center());
+        h.run_steps(1);
+        h.drag_at(from.center());
+        h.run_steps(1);
+        h.hover_at(onto.center());
+        h.run_steps(2);
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        h.drop_at(onto.center());
+        h.run_steps(3);
+        assert_eq!(order(&h), ["two", "one", "three", "four"]);
+    }
+
+    #[test]
+    fn a_group_is_dragged_whole_and_dropped_on_as_one() {
+        use egui_kittest::kittest::NodeT;
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="40mm" viewBox="0 0 100 40">
+            <g id="pair">
+              <rect id="left" x="5" y="5" width="15" height="15" fill="#c00000"/>
+              <rect id="right" x="25" y="5" width="15" height="15" fill="#00a000"/>
+            </g>
+            <rect id="solo" x="45" y="5" width="15" height="15" fill="#0000c0"/>
+            <rect id="other" x="65" y="5" width="15" height="15" fill="#c0a000"/>
+        </svg>"##;
+        let doc = zigzag::document::Document::from_svg(svg, "t", None).unwrap();
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        h.state_mut().set_document(doc);
+        h.run_steps(4);
+        let order = |h: &Harness<'_, Studio>| h.state().names.clone();
+        let row = |h: &Harness<'_, Studio>, name: &str| {
+            h.query_all_by_label(name)
+                .find(|n| n.accesskit_node().role() == egui::accesskit::Role::ListItem)
+                .unwrap()
+                .rect()
+        };
+        let drag = |h: &mut Harness<'_, Studio>, from: Pos2, to: Pos2| {
+            h.hover_at(from);
+            h.run_steps(1);
+            h.drag_at(from);
+            h.run_steps(1);
+            for k in 1..=4 {
+                h.hover_at(from + (to - from) * (k as f32 / 4.0));
+                h.run_steps(1);
+            }
+            h.drop_at(to);
+            h.run_steps(3);
+        };
+        assert_eq!(order(&h), ["left", "right", "solo", "other"]);
+        // The group's row (closed) dragged below "solo": both its layers go.
+        let (from, onto) = (row(&h, "pair"), row(&h, "solo"));
+        drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["solo", "left", "right", "other"]);
+        // A layer dropped on the group's top half goes before all of it;
+        // on its bottom half, after all of it.
+        let (from, onto) = (row(&h, "other"), row(&h, "pair"));
+        drag(&mut h, from.center(), onto.center() - Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["solo", "other", "left", "right"]);
+        let (from, onto) = (row(&h, "solo"), row(&h, "pair"));
+        drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["other", "left", "right", "solo"]);
+        assert_eq!(h.state().undo.len(), 3);
+    }
+
+    #[test]
+    fn moving_layers_keeps_their_own_order() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="40mm" viewBox="0 0 100 40">
+            <rect id="a" x="5" y="5" width="10" height="10" fill="#c00000"/>
+            <rect id="b" x="20" y="5" width="10" height="10" fill="#00a000"/>
+            <rect id="c" x="35" y="5" width="10" height="10" fill="#0000c0"/>
+            <rect id="d" x="50" y="5" width="10" height="10" fill="#c0a000"/>
+            <rect id="e" x="65" y="5" width="10" height="10" fill="#00a0c0"/>
+        </svg>"##;
+        let mut s = Studio::with_file(None, None);
+        s.set_document(zigzag::document::Document::from_svg(svg, "t", None).unwrap());
+        s.replan();
+        let order = |s: &Studio| {
+            s.doc
+                .shapes
+                .iter()
+                .map(|x| x.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(s.move_layers(&[3, 1], 0));
+        assert_eq!(order(&s), ["b", "d", "a", "c", "e"]);
+        assert!(s.move_layers(&[0, 1], 5));
+        assert_eq!(order(&s), ["a", "c", "e", "b", "d"]);
+        assert!(s.move_layers(&[0, 4], 2));
+        assert_eq!(order(&s), ["c", "a", "d", "e", "b"]);
+        // Where they are already (before themselves, or just after).
+        assert!(!s.move_layers(&[1, 2], 1));
+        assert!(!s.move_layers(&[1, 2], 3));
+        assert!(!s.move_layers(&[], 0));
+        assert!(!s.move_layers(&[9], 0));
+        assert_eq!(s.undo.len(), 3);
+    }
 
     #[test]
     fn a_line_shows_every_stitch_type_with_the_ones_for_areas_dimmed() {

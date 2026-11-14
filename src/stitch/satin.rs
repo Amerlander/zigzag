@@ -217,6 +217,49 @@ pub fn pairs(r: &Rails, step: f64) -> Vec<(P, P)> {
     out
 }
 
+/// How far columns' stitches are from square across them, on average,
+/// degrees: 0 when each crosses its column at right angles. (A column
+/// runs, at a stitch, the way the middles of the stitches either side of
+/// it do.) Rails followed in proportion to their lengths drift out of step
+/// where one turns a corner the other doesn't, and every stitch between
+/// the corners leans.
+pub fn lean(columns: &[Rails]) -> f64 {
+    let (mut sum, mut count) = (0.0, 0usize);
+    for r in columns {
+        let ps = pairs(r, 8.0);
+        let n = ps.len();
+        if n < 3 {
+            continue;
+        }
+        let mid = |k: usize| ps[k].0.lerp(ps[k].1, 0.5);
+        for (k, &(a, b)) in ps.iter().enumerate() {
+            let (before, after) = if r.closed {
+                ((k + n - 1) % n, (k + 1) % n)
+            } else if k == 0 || k == n - 1 {
+                // (An open column's end stitches lie along its ends.)
+                continue;
+            } else {
+                (k - 1, k + 1)
+            };
+            let along = mid(after) - mid(before);
+            let across = b - a;
+            if along.len() < 1e-6 || across.len() < 1.0 {
+                continue;
+            }
+            let cos = (along.x * across.x + along.y * across.y) / (along.len() * across.len());
+            sum += cos.abs().min(1.0).asin().to_degrees();
+            count += 1;
+        }
+    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+/// A ring (a shape and its hole, sewn round between the two outlines)
+/// whose stitches lean more than this on average, degrees, is cut into
+/// columns instead, if those are squarer: a triangle with a triangle cut
+/// out of it, a D. (An O's lean a few degrees where its stroke thickens.)
+pub const RING_LEAN: f64 = 15.0;
+
 /// [`pairs`] with each stitch leaning `lean` radians from square across:
 /// its end on rail b is further along the column than its end on rail a by
 /// the column's width there times tan(lean). At an open column's ends the

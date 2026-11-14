@@ -253,6 +253,12 @@ impl Document {
             })
             .map(|s| (s.uid, s.params.fill_angle()))
             .collect();
+        // A path with live corners that's stretched (scaled unevenly) keeps
+        // its corners round, as a rounded rectangle does in Illustrator and
+        // VectorCraft: once its element is stretched like any other, its
+        // outline's corners are cut again (below), rather than left as the
+        // squashed rounds the stretch made of them.
+        let stretched = self.stretched_corners(&idx, m);
         let u = self.px_to_units();
         let doc = roxmltree::Document::parse(&self.xml).context("parsing document")?;
         let by_id = super::elements_by_id(&doc);
@@ -294,6 +300,11 @@ impl Document {
                 if (b - a).abs() > 0.05 {
                     s.params.angle = Some(b);
                 }
+            }
+        }
+        for (uid, live) in stretched {
+            if let Some(i) = self.shapes.iter().position(|s| s.uid == uid) {
+                self.set_live_corners(i, &live)?;
             }
         }
         Ok(())

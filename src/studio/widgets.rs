@@ -250,7 +250,9 @@ pub fn kind_tile(
 }
 
 pub fn draw_kind_icon(p: &egui::Painter, r: Rect, k: Kind, c: Color32) {
-    let s = Stroke::new(1.3, c);
+    // (Whole pixels wide, like the other icons' lines.)
+    let ppp = p.pixels_per_point();
+    let s = Stroke::new((1.3 * ppp).round().max(1.0) / ppp, c);
     let at = |x: f32, y: f32| Pos2::new(r.left() + x * r.width(), r.top() + y * r.height());
     match k {
         Kind::Fill => {

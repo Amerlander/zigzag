@@ -632,4 +632,97 @@ mod tests {
         assert_eq!(d.shapes[3].color, [10, 20, 180]);
         assert_eq!(d.shapes[4].color, [200, 0, 0]);
     }
+    #[test]
+    fn outlines_go_through_simplify_with_their_shapes() {
+        let outlined = || {
+            let mut d = design();
+            let fills: Vec<usize> = (0..d.shapes.len()).collect();
+            let new = d.add_outline(&fills, Kind::Run, 2.0, None).unwrap();
+            assert_eq!(new.len(), fills.len());
+            d
+        };
+        let part =
+            |d: &Document, outline: bool| d.shapes.iter().filter(|s| s.outline == outline).count();
+        // The default still changes nothing.
+        let mut d = outlined();
+        let before = d.to_svg().unwrap();
+        assert!(
+            !d.simplify_design(&SimplifyDesign::default())
+                .unwrap()
+                .changed()
+        );
+        assert_eq!(d.to_svg().unwrap(), before);
+        // Too small to sew: a shape and its outline are one piece of the
+        // artwork, and go together (never an outline left round nothing).
+        let (shapes, outlines) = (part(&d, false), part(&d, true));
+        let r = d
+            .simplify_design(&SimplifyDesign {
+                min_size_mm: 2.0,
+                ..SimplifyDesign::default()
+            })
+            .unwrap();
+        assert!(r.removed > 0);
+        assert_eq!(part(&d, false), shapes - r.removed);
+        assert_eq!(part(&d, true), outlines - r.removed);
+        for s in d.shapes.iter().filter(|s| s.outline) {
+            assert!(
+                d.shapes.iter().any(|f| f.id == s.id && !f.outline),
+                "{}",
+                s.id
+            );
+        }
+        // Fewer threads merges the threads most alike, whatever they sew.
+        // An outline's own shade is close to its shape's thread, so with
+        // threads as different as these two, each outline ends up in its
+        // shape's: still sewn, one thread fewer. One that's switched off
+        // isn't counted or recolored.
+        let mut d = Document::empty();
+        square(&mut d, 0.0, 200.0, [200, 0, 0]);
+        square(&mut d, 300.0, 200.0, [0, 0, 200]);
+        square(&mut d, 600.0, 200.0, [0, 160, 0]);
+        d.add_outline(&[0, 1, 2], Kind::Run, 2.0, None).unwrap();
+        let off = 5;
+        assert!(d.shapes[off].outline);
+        let shade = d.shapes[off].color;
+        d.shapes[off].params.hide = Some(true);
+        assert_eq!(d.threads().len(), 5, "three shapes, two outlines sewn");
+        let r = d
+            .simplify_design(&SimplifyDesign {
+                threads: Some(3),
+                ..SimplifyDesign::default()
+            })
+            .unwrap();
+        assert_eq!(r.threads, (5, 3));
+        assert_eq!(d.shapes[off].color, shade, "off, as it was");
+        for o in [1, 3] {
+            let s = &d.shapes[o];
+            assert!(s.outline && !s.params.hidden());
+            assert_eq!(s.color, d.shapes[o - 1].color, "in its shape's thread");
+            assert!(d.plan().per_shape[o] > 0, "still sewn");
+        }
+        // Each thread in one pass, and neighbors made one shape: an outline
+        // is never sewn before the shape it's on, and a shape with an
+        // outline is left as its own layer (not merged into a neighbor,
+        // leaving its outline round a shape that's gone).
+        let mut d = outlined();
+        d.simplify_design(&SimplifyDesign {
+            group: true,
+            unite: Unite::All,
+            ..SimplifyDesign::default()
+        })
+        .unwrap();
+        assert_eq!(part(&d, true), part(&outlined(), true));
+        for (o, s) in d.shapes.iter().enumerate().filter(|(_, s)| s.outline) {
+            let f = d
+                .shapes
+                .iter()
+                .position(|f| f.id == s.id && !f.outline)
+                .unwrap();
+            assert!(f < o, "{}: outline sewn at {o}, its shape at {f}", s.id);
+        }
+        // And it's all still there after a save.
+        let again = Document::from_svg(&d.to_svg().unwrap(), "t", None).unwrap();
+        assert_eq!(again.shapes.len(), d.shapes.len());
+        assert_eq!(part(&again, true), part(&d, true));
+    }
 }

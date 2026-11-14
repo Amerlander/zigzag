@@ -39,6 +39,13 @@ pub struct Drag {
     /// The document before the gesture.
     pub base: Document,
     pub indices: Vec<usize>,
+    /// Every object the gesture carries: those, and the other half of
+    /// each one's element (a shape's outline goes where the shape goes,
+    /// selected with it or not).
+    pub carried: Vec<usize>,
+    /// The plan on show has been split so that what's carried is in
+    /// blocks of its own (see `update_drag`).
+    pub split: bool,
     pub m: Affine,
     /// The selection's bounds when the gesture started.
     pub bounds: Bounds,
@@ -82,6 +89,9 @@ pub const HOOP_MARGIN_MM: f64 = 2.0;
 #[derive(Default, Clone)]
 pub struct LayoutState {
     pub multi: Vec<usize>,
+    /// The task bar's outline row is tucked away (the outline itself is
+    /// as it was: the bar's outline button shows its thread).
+    pub outline_row_closed: bool,
     pub clipboard: Vec<Fragment>,
     /// A copy's SVG, waiting to go on the system clipboard (it needs the
     /// egui context, so it's written at the next frame).
@@ -249,6 +259,19 @@ pub fn panel_transform(b: &Bounds, r: (i8, i8), at: P, w: f64, h: f64) -> Affine
     affine_mul(translation(at - rp), scale_about(rp, sx, sy))
 }
 
+/// Whether the objects at `members` are one thing drawn: a single object,
+/// or a shape and its outline (one element of the artwork, sewn as two).
+/// A group holding only that is "a group of one".
+pub fn one_thing(shapes: &[zigzag::svg::Shape], members: &[usize]) -> bool {
+    match members {
+        [] | [_] => true,
+        [first, rest @ ..] => {
+            let id = &shapes[*first].id;
+            !id.is_empty() && rest.iter().all(|&i| shapes[i].id == *id)
+        }
+    }
+}
+
 impl Studio {
     /// Objects in group `g`, in sewing order.
     pub fn group_members(&self, g: &str) -> Vec<usize> {
@@ -286,8 +309,34 @@ impl Studio {
         // with stitch settings) is just the object.
         groups[start..]
             .iter()
-            .find(|g| self.group_members(g).len() > 1)
+            .find(|g| !one_thing(&self.doc.shapes, &self.group_members(g)))
             .cloned()
+    }
+
+    /// The selection as what its settings are for: every selected object
+    /// but an outline whose own shape is selected too (clicked as one
+    /// group, or caught in one selection box). Such an outline goes where
+    /// its shape goes, but the stitch type and thread shown and set are the
+    /// shape's; the outline's are its own, in the task bar's second row.
+    pub fn subjects(&self) -> Vec<usize> {
+        let sel = self.sel_indices();
+        if sel.len() < 2 {
+            return sel;
+        }
+        // (One pass, whatever is selected: a Select All is hundreds.)
+        let shapes = &self.doc.shapes;
+        let filled: std::collections::HashSet<&str> = sel
+            .iter()
+            .filter(|&&i| self.takes_outline(i))
+            .map(|&i| shapes[i].id.as_str())
+            .collect();
+        sel.iter()
+            .copied()
+            .filter(|&i| {
+                !(shapes[i].part == zigzag::svg::Part::Stroke
+                    && filled.contains(shapes[i].id.as_str()))
+            })
+            .collect()
     }
 
     /// Select object `i` the way a click does: its whole group, unless
@@ -596,7 +645,9 @@ impl Studio {
 
     /// Combine the selection with a Pathfinder operation.
     pub fn pathfinder_selected(&mut self, op: zigzag::boolean::PathOp) {
-        let idx = self.sel_indices();
+        // (The shapes: an outline selected along with its shape isn't one
+        // of the things combined, and goes with the shape.)
+        let idx = self.subjects();
         let n = idx.len();
         let mut new = 0;
         match self.structural(|d| {
@@ -612,7 +663,8 @@ impl Studio {
     }
 
     pub fn offset_selected(&mut self, mm: f64) {
-        let idx = self.sel_indices();
+        // (Each shape once: not its outline as well, selected with it.)
+        let idx = self.subjects();
         let mut new = Vec::new();
         match self.structural(|d| {
             new = d.offset_path(&idx, mm * 10.0)?;
@@ -665,6 +717,164 @@ impl Studio {
         }
     }
 
+    /// Whether object `i` is a shape that can have an outline: a filled
+    /// shape, not a line (one already) and not text.
+    pub fn takes_outline(&self, i: usize) -> bool {
+        use zigzag::svg::{Geometry, Part};
+        self.doc.shapes.get(i).is_some_and(|s| {
+            s.part == Part::Fill && !s.id.is_empty() && matches!(s.geometry, Geometry::Fill { .. })
+        }) && self.doc.lettering(i).is_none()
+    }
+
+    /// Shape `i`'s outline (its index among the objects), if it has one:
+    /// sewn, or switched off for now (hidden, keeping its settings).
+    pub fn outline_index(&self, i: usize) -> Option<usize> {
+        if !self.takes_outline(i) {
+            return None;
+        }
+        let id = &self.doc.shapes[i].id;
+        self.doc.shapes.iter().position(|o| {
+            o.id == *id
+                && o.part == zigzag::svg::Part::Stroke
+                && o.params.kind != Some(zigzag::params::Kind::Skip)
+        })
+    }
+
+    /// Whether shape `i` has an outline that's sewn.
+    pub fn outline_on(&self, i: usize) -> bool {
+        self.outline_index(i)
+            .is_some_and(|o| !self.doc.shapes[o].params.hidden())
+    }
+
+    /// Of the objects at `indices`, whether any is a shape that can have an
+    /// outline, and whether all of those have one that's sewn (in one pass
+    /// over the design, for the task bar's button on a big selection).
+    pub fn outline_state(&self, indices: &[usize]) -> (bool, bool) {
+        let shapes: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| self.takes_outline(i))
+            .collect();
+        if shapes.is_empty() {
+            return (false, false);
+        }
+        let sewn: std::collections::HashSet<&str> = self
+            .doc
+            .shapes
+            .iter()
+            .filter(|o| {
+                o.part == zigzag::svg::Part::Stroke
+                    && o.params.kind != Some(zigzag::params::Kind::Skip)
+                    && !o.params.hidden()
+            })
+            .map(|o| o.id.as_str())
+            .collect();
+        let all = shapes
+            .iter()
+            .all(|&i| sewn.contains(self.doc.shapes[i].id.as_str()));
+        (true, all)
+    }
+
+    /// Whether Add Outline has something to add to object `i`: a shape
+    /// that can have an outline and isn't sewn with one.
+    pub fn can_outline(&self, i: usize) -> bool {
+        self.takes_outline(i) && !self.outline_on(i)
+    }
+
+    /// Give the shapes among `indices` an outline (`on`), or take theirs
+    /// away, as one undo step. On: a running stitch round the edge, or the
+    /// outline a shape has that's hidden, shown again as it was. Off: the
+    /// outline is removed (undo brings it back). The selection stays on
+    /// the shapes: an outline is set up in their task bar's second row.
+    /// Returns how many changed.
+    pub fn set_outline(&mut self, indices: &[usize], on: bool) -> anyhow::Result<usize> {
+        let selected: Vec<usize> = self
+            .sel_indices()
+            .iter()
+            .filter_map(|&i| self.doc.shapes.get(i).map(|s| s.uid))
+            .collect();
+        let (mut show, mut gone, mut add) = (Vec::new(), Vec::new(), Vec::new());
+        for &i in indices.iter().filter(|&&i| self.takes_outline(i)) {
+            match (on, self.outline_index(i)) {
+                (true, None) => add.push(i),
+                (true, Some(o)) if self.doc.shapes[o].params.hidden() => show.push(o),
+                (false, Some(o)) => gone.push(o),
+                _ => {}
+            }
+        }
+        let changed = show.len() + gone.len() + add.len();
+        if changed == 0 && !on {
+            return Ok(0);
+        }
+        // (Nothing to add: the document says why, for the status bar.)
+        let add = if changed == 0 { indices.to_vec() } else { add };
+        let width = zigzag::params::defaults::OUTLINE_SATIN_WIDTH;
+        self.structural(|d| {
+            for &o in &show {
+                d.shapes[o].params.hide = None;
+            }
+            if !gone.is_empty() {
+                d.delete_many(&gone)?;
+            }
+            if !add.is_empty() {
+                d.add_outline(&add, zigzag::params::Kind::Run, width, None)?;
+            }
+            Ok(())
+        })?;
+        let back: Vec<usize> = self
+            .doc
+            .shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| selected.contains(&s.uid))
+            .map(|(i, _)| i)
+            .collect();
+        self.set_selection(&back);
+        if on {
+            // (Its row is there to set it up in.)
+            self.layout.outline_row_closed = false;
+        }
+        Ok(changed)
+    }
+
+    /// Object › Path › Remove Outline (and the struck-through outline in
+    /// the outline's row of the task bar).
+    pub fn remove_outline_selected(&mut self) {
+        let idx = self.subjects();
+        match self.set_outline(&idx, false) {
+            Ok(0) => self.status = "No outline to remove.".into(),
+            Ok(n) => {
+                self.status = format!(
+                    "Removed {}.",
+                    if n == 1 {
+                        "the outline".to_string()
+                    } else {
+                        format!("{n} outlines")
+                    }
+                );
+            }
+            Err(e) => self.status = format!("Couldn't remove the outline: {e:#}"),
+        }
+    }
+
+    /// Object › Path › Add Outline.
+    pub fn add_outline_selected(&mut self) {
+        let idx = self.sel_indices();
+        match self.set_outline(&idx, true) {
+            Ok(n) => {
+                self.status = format!(
+                    "Added {}: a running stitch round the edge. Its stitch, thread and width are in the task bar's second row.",
+                    if n == 1 {
+                        "an outline".to_string()
+                    } else {
+                        format!("{n} outlines")
+                    }
+                );
+            }
+            Err(e) => self.status = format!("Couldn't add an outline: {e:#}"),
+        }
+    }
+
     /// Open Round Corners for the selection (or, in Direct Selection, the
     /// selected points of the object).
     pub fn open_corner_dialog(&mut self) {
@@ -677,14 +887,33 @@ impl Studio {
         } else {
             Vec::new()
         };
+        // The radius the corners have (from their handles, or from here
+        // last time), to a tenth of a millimetre; 2 mm for sharp ones.
+        let has = self.doc.corner_radius(&indices);
+        let radius = has.map_or(2.0, |r| (r / 10.0 * 100.0).round() / 100.0);
+        // Corners rounded already are shown as they are until the radius
+        // (or the kind) is changed: opening the window and OK is no edit.
+        // (How many there are, from a trial on a copy.)
+        let (shown, cut) = match has {
+            Some(_) => {
+                let kind = zigzag::bezier::CornerKind::default();
+                let n = self
+                    .doc
+                    .clone()
+                    .round_corners(&indices, radius * 10.0, kind, &only)
+                    .unwrap_or(0);
+                (Some((radius, kind)), n)
+            }
+            None => (None, 0),
+        };
         self.layout.corner_dialog = Some(CornerDialog {
-            radius: 2.0,
+            radius,
             kind: Default::default(),
             base: self.doc.clone(),
             indices,
             only,
-            shown: None,
-            cut: 0,
+            shown,
+            cut,
         });
     }
 
@@ -724,7 +953,7 @@ impl Studio {
             crate::theme::caption(
                 ui,
                 match (d.cut, d.only.is_empty()) {
-                    (0, _) => "No sharp corners to round here.".to_string(),
+                    (0, _) => "No corners to round here.".to_string(),
                     (n, true) => format!("{n} corners. Each rounds as far as its sides allow."),
                     (n, false) => {
                         format!("{n} selected corners. Each rounds as far as its sides allow.")
@@ -756,12 +985,18 @@ impl Studio {
             .collect();
         if ok {
             let after = std::mem::replace(&mut self.doc, d.base.clone());
-            if d.cut > 0 && d.radius > 0.0 {
+            // (Nothing changed, the radius the corners had: no undo step.)
+            let changed = d.cut > 0 && after.to_svg().ok() != d.base.to_svg().ok();
+            if changed {
                 let _ = self.structural(|doc| {
                     *doc = after;
                     Ok(())
                 });
-                self.status = format!("Rounded {} corners.", d.cut);
+                self.status = if d.radius > 0.0 {
+                    format!("Rounded {} corners.", d.cut)
+                } else {
+                    format!("Made {} corners sharp.", d.cut)
+                };
             }
             self.path_edit.selected.clear();
             self.restore_selection(&uids);
@@ -900,7 +1135,9 @@ impl Studio {
         if idx.is_empty() {
             return;
         }
-        let label = self.selection_label(idx.len());
+        // (A shape's outline goes with it: named for the shapes alone.)
+        let label = self.selection_label(self.subjects().len());
+        let idx = self.doc.with_outlines(&idx);
         match self.structural(|d| d.delete_many(&idx)) {
             Ok(()) => self.status = format!("Deleted {label}."),
             Err(e) => self.status = format!("Couldn't delete: {e:#}"),
@@ -1085,11 +1322,25 @@ impl Studio {
                 .map(|i| self.art_bounds(&[i]))
                 .filter(|t| !t.is_empty()),
         );
+        let mut carried = indices.clone();
+        for &i in &indices {
+            let id = &self.doc.shapes[i].id;
+            if id.is_empty() {
+                continue;
+            }
+            for (j, s) in self.doc.shapes.iter().enumerate() {
+                if s.id == *id && !carried.contains(&j) {
+                    carried.push(j);
+                }
+            }
+        }
         self.drag = Some(Drag {
             mode,
             start: p,
             base: self.doc.clone(),
             indices,
+            carried,
+            split: false,
             m: IDENTITY,
             bounds: b,
             targets,
@@ -1269,16 +1520,48 @@ impl Studio {
         // `DrawOptions::moving`) and planned once, when the gesture ends.
         self.doc
             .preview_transform_from(&drag.base, &drag.indices, m);
+        // The stitches of what's carried are drawn through the transform a
+        // block at a time: any that share a block with stitches staying
+        // put (one thread, sewn one after another) get blocks of their own
+        // on show, or they'd stay where they were until the drop.
+        if !drag.split && m != IDENTITY {
+            drag.split = true;
+            if self.design.per_shape.len() == self.doc.shapes.len()
+                && self.design.split_shapes(&drag.carried)
+            {
+                self.replans += 1;
+                self.plan_cut = true;
+            }
+        }
+    }
+
+    /// The blocks of the plan on show that the gesture under way carries
+    /// (a flag for each), and its transform so far: their stitches are
+    /// drawn through it.
+    pub(crate) fn moving_blocks(&self) -> Option<(Vec<bool>, Affine)> {
+        let d = self.drag.as_ref()?;
+        let on = self
+            .design
+            .block_shapes
+            .iter()
+            .map(|v| !v.is_empty() && v.iter().all(|i| d.carried.contains(i)))
+            .collect();
+        Some((on, d.m))
     }
 
     /// Finish the gesture: one undo step with the transform written to the SVG.
     pub fn end_drag(&mut self) {
         let Some(drag) = self.drag.take() else { return };
+        // (A plan split for show is planned again, whatever comes of this.)
+        if drag.split {
+            self.dirty = true;
+        }
         if drag.copy {
             // Option-drag: the original stays, a copy lands where you let go.
             self.doc = drag.base;
             if drag.m[4].abs() + drag.m[5].abs() >= 0.5 {
                 self.copy_selection_by(P::new(drag.m[4], drag.m[5]), "Copied");
+                self.plan_after_gesture();
             }
             return;
         }
@@ -1296,11 +1579,27 @@ impl Studio {
             DragMode::Scale { .. } => "Resized",
             DragMode::Rotate { .. } => "Rotated",
         };
-        if self.transform_selected(drag.m, what) && self.planner.slow {
-            // A big design's new plan comes from the worker a moment
-            // later: until then the stitches as planned follow the
-            // objects, rather than jumping back to where they were.
-            self.shift_planned(&drag.indices, drag.m);
+        if self.transform_selected(drag.m, what) {
+            if self.planner.slow {
+                // A big design's new plan comes from the worker a moment
+                // later: until then the stitches as planned follow the
+                // objects, rather than jumping back to where they were.
+                self.shift_planned(&drag.carried, drag.m);
+            } else {
+                self.plan_after_gesture();
+            }
+        }
+    }
+
+    /// The stitches for the document as a gesture left it, planned before
+    /// the frame it ended in is drawn. While the gesture lasted the
+    /// stitches were drawn through its transform; left to the next frame's
+    /// plan, the one frame between would draw them back where they
+    /// started (a flicker each time something is let go of). Only where
+    /// planning is quick: a big design's plan is the worker's to make.
+    pub(crate) fn plan_after_gesture(&mut self) {
+        if self.dirty && !self.planner.slow {
+            self.replan();
         }
     }
 
@@ -1451,7 +1750,7 @@ impl Studio {
                     self.duplicate_selected();
                 }
             });
-            if self.sel_indices().len() >= 2 {
+            if self.subjects().len() >= 2 {
                 fm.row("Pathfinder", |ui, _| {
                     use zigzag::boolean::PathOp;
                     for (op, icon, label) in [
@@ -1672,6 +1971,53 @@ mod tests {
         h.state_mut().set_selection(&[i]);
         h.run_steps(1);
         h.state().selection_bounds()
+    }
+
+    /// Where the planned stitches are: their bounds.
+    fn stitched(h: &Harness<'_, Studio>) -> Bounds {
+        let mut b = Bounds::empty();
+        for blk in &h.state().design.blocks {
+            for r in &blk.runs {
+                r.pts.iter().for_each(|&p| b.add(p));
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn the_stitches_are_where_the_object_is_the_moment_its_let_go() {
+        // The frame a drag ends in is drawn straight after `end_drag`,
+        // with no gesture left to draw the stitches through: the plan
+        // must already be the moved object's, not the one from before
+        // (which showed for a frame, back where the object started).
+        for alt in [false, true] {
+            let mut h = studio();
+            let all: Vec<usize> = (0..h.state().doc.shapes.len()).collect();
+            h.state_mut().set_selection(&all);
+            h.run_steps(2);
+            let was = stitched(&h);
+            let from = h.state().selection_bounds().center();
+            h.state_mut().begin_drag(None, from);
+            h.state_mut()
+                .update_drag(from + P::new(150.0, 0.0), mods(false, alt, false));
+            h.state_mut().end_drag();
+            // (No frame has run since.)
+            assert!(!h.state().dirty, "planned already (alt: {alt})");
+            let now = stitched(&h);
+            assert!(
+                (now.max.x - was.max.x - 150.0).abs() < 1.0,
+                "the stitches moved 15 mm with it: {} → {} (alt: {alt})",
+                was.max.x,
+                now.max.x
+            );
+            if alt {
+                // (A copy: the original's are still where they were.)
+                assert!((now.min.x - was.min.x).abs() < 1.0);
+            } else {
+                assert!((now.min.x - was.min.x - 150.0).abs() < 1.0);
+            }
+            assert_eq!(h.state().design.per_shape.len(), h.state().doc.shapes.len());
+        }
     }
 
     #[test]
@@ -1972,6 +2318,91 @@ mod tests {
             (b2.min.x - b.min.x).abs() < 1.0,
             "top-left corner stays put"
         );
+    }
+
+    #[test]
+    fn a_drag_carries_the_outline_and_stitches_that_share_a_thread() {
+        // A shape with an outline in another thread, and two more shapes
+        // in one thread, sewn one after the other: one block for the two.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" viewBox="0 0 100 100">
+          <rect id="a" x="10" y="10" width="20" height="20" fill="#c00" stroke="#024" stroke-width="2"/>
+          <rect id="b" x="40" y="10" width="20" height="20" fill="#080"/>
+          <rect id="c" x="70" y="10" width="20" height="20" fill="#080"/>
+        </svg>"##;
+        let mut h = studio();
+        h.state_mut()
+            .set_document(zigzag::document::Document::from_svg(svg, "t", None).unwrap());
+        h.run_steps(3);
+        let s = h.state_mut();
+        let find = |s: &Studio, id: &str, outline: bool| {
+            s.doc
+                .shapes
+                .iter()
+                .position(|x| x.id == id && x.outline == outline)
+                .unwrap()
+        };
+        let (a, edge, b, c) = (
+            find(s, "a", false),
+            find(s, "a", true),
+            find(s, "b", false),
+            find(s, "c", false),
+        );
+        assert!(
+            s.design
+                .block_shapes
+                .iter()
+                .any(|v| v.contains(&b) && v.contains(&c)),
+            "{:?}",
+            s.design.block_shapes
+        );
+        let (blocks, stitches) = (s.design.blocks.len(), s.design.stitch_count());
+
+        // The shape alone is selected (a click on it selects just that):
+        // its outline's stitches are drawn moving with its own.
+        s.set_selection(&[a]);
+        let at = shape_bounds(&s.doc.shapes[a]).center();
+        s.begin_drag(None, at);
+        s.update_drag(at + P::new(40.0, 25.0), DragMods::default());
+        let (on, m) = s.moving_blocks().unwrap();
+        assert_eq!((m[4], m[5]), (40.0, 25.0));
+        for (k, shapes) in s.design.block_shapes.iter().enumerate() {
+            let carried = shapes.contains(&a) || shapes.contains(&edge);
+            assert_eq!(on[k], carried, "block {k}: {shapes:?}");
+        }
+        assert_eq!(
+            on.iter().filter(|x| **x).count(),
+            2,
+            "the shape, its outline"
+        );
+        s.end_drag();
+        assert!(!s.dirty && !s.plan_cut);
+        assert_eq!(s.undo.len(), 1);
+
+        // One of the two that share a block: its stitches are apart from
+        // the other's while it's dragged, and the only ones moving.
+        s.set_selection(&[b]);
+        let at = shape_bounds(&s.doc.shapes[b]).center();
+        s.begin_drag(None, at);
+        assert_eq!(s.design.blocks.len(), blocks, "a press changes nothing");
+        s.update_drag(at + P::new(0.0, 60.0), DragMods::default());
+        assert_eq!(s.design.blocks.len(), blocks + 1);
+        assert_eq!(s.design.stitch_count(), stitches);
+        let (on, _) = s.moving_blocks().unwrap();
+        for (k, shapes) in s.design.block_shapes.iter().enumerate() {
+            assert_eq!(on[k], shapes.as_slice() == [b], "block {k}: {shapes:?}");
+        }
+        assert_eq!(on.iter().filter(|x| **x).count(), 1);
+        assert!(s.plan_cut, "a plan for show");
+        // Dropped: planned afresh.
+        s.end_drag();
+        assert!(!s.dirty && !s.plan_cut);
+        assert_eq!(s.undo.len(), 2);
+        // A press and release without a move leaves the plan as it is.
+        let plans = s.replans;
+        s.begin_drag(None, at);
+        s.end_drag();
+        assert_eq!(s.replans, plans);
+        let _ = c;
     }
 
     #[test]

@@ -62,6 +62,11 @@ pub enum Action {
     Pathfinder(zigzag::boolean::PathOp),
     OffsetPath,
     OutlineStroke,
+    /// Object › Path › Add Outline: a stroke along a filled shape's edge,
+    /// an object of its own to sew.
+    AddOutline,
+    /// Object › Path › Remove Outline: a shape's outline, taken off.
+    RemoveOutline,
     /// Object › Path › Release Compound Path: one object per separate shape.
     ReleaseCompound,
     SimplifyPath,
@@ -117,6 +122,9 @@ pub enum Action {
     CrashLogs,
     /// About ZigZag (the app menu's on a Mac, Help's elsewhere).
     About,
+    /// Quit ZigZag (the app menu's on a Mac, File's elsewhere): asks
+    /// about unsaved changes first.
+    Quit,
     ZoomIn,
     ZoomOut,
     ZoomFit,
@@ -217,7 +225,15 @@ pub fn menus() -> Vec<(&'static str, Vec<Entry>)> {
                 Sep,
                 Sub("Export", export),
                 Item(Action::SendToSkitch, "Send to Skitch…", None),
-            ],
+            ]
+            .into_iter()
+            // (On a Mac, Quit is in the ZigZag menu: see `native_menu`.)
+            .chain(if cfg!(target_os = "macos") {
+                vec![]
+            } else {
+                vec![Sep, QUIT_ITEM]
+            })
+            .collect(),
         ),
         (
             "Edit",
@@ -268,6 +284,8 @@ pub fn menus() -> Vec<(&'static str, Vec<Entry>)> {
                     "Path",
                     vec![
                         Item(Action::OffsetPath, "Offset Path…", None),
+                        Item(Action::AddOutline, "Add Outline", None),
+                        Item(Action::RemoveOutline, "Remove Outline", None),
                         Item(Action::OutlineStroke, "Outline Stroke", None),
                         Item(Action::ReleaseCompound, "Release Compound Path", None),
                         Item(Action::SimplifyPath, "Simplify…", None),
@@ -495,7 +513,10 @@ pub fn all_actions() -> Vec<(Action, &'static str, Option<Sc>)> {
     }
     // (In the app menu on a Mac, not in the menus above.)
     if cfg!(target_os = "macos") {
-        walk(&[ABOUT_ITEM, UPDATES_ITEM, SETTINGS_ITEM], &mut out);
+        walk(
+            &[ABOUT_ITEM, UPDATES_ITEM, SETTINGS_ITEM, QUIT_ITEM],
+            &mut out,
+        );
     }
     out
 }
@@ -508,6 +529,9 @@ pub const UPDATES_ITEM: Entry = Item(Action::CheckForUpdates, "Check for Updates
 
 /// Settings…, ⌘, : the app menu's on a Mac, at the foot of Edit elsewhere.
 pub const SETTINGS_ITEM: Entry = Item(Action::Settings, "Settings…", cmd(Key::Comma));
+
+/// Quit ZigZag, ⌘Q: the app menu's on a Mac, at the foot of File elsewhere.
+pub const QUIT_ITEM: Entry = Item(Action::Quit, "Quit ZigZag", cmd(Key::Q));
 
 /// Locked, or hidden: the Layers list's two columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -596,6 +620,7 @@ impl Studio {
             | Action::TransformAgain
             | Action::OffsetPath
             | Action::OutlineStroke
+            | Action::AddOutline
             | Action::ReleaseCompound
             | Action::SimplifyPath
             | Action::RoundCorners
@@ -603,7 +628,11 @@ impl Studio {
             | Action::BringForward
             | Action::SendBackward
             | Action::SendToBack => has_sel,
-            Action::Pathfinder(_) => self.sel_indices().len() >= 2,
+            Action::Pathfinder(_) => self.subjects().len() >= 2,
+            Action::RemoveOutline => self
+                .subjects()
+                .iter()
+                .any(|&i| self.outline_index(i).is_some()),
             Action::NextTab | Action::PreviousTab => self.tab_count() > 1,
             Action::Kind(k) => self
                 .sel_indices()
@@ -770,6 +799,8 @@ impl Studio {
             Action::Pathfinder(op) => self.pathfinder_selected(op),
             Action::OffsetPath => self.layout.offset_dialog = Some(1.0),
             Action::OutlineStroke => self.outline_stroke_selected(),
+            Action::AddOutline => self.add_outline_selected(),
+            Action::RemoveOutline => self.remove_outline_selected(),
             Action::ReleaseCompound => self.release_compound_selected(),
             Action::SimplifyPath => self.open_simplify_dialog(),
             Action::CleanUp => self.open_cleanup_dialog(),
@@ -807,6 +838,7 @@ impl Studio {
             Action::GitHub => crate::sew::open_url(crate::about::GITHUB_URL),
             Action::CrashLogs => self.show_crash_logs(),
             Action::About => self.about = true,
+            Action::Quit => self.request_quit(),
             Action::Lock => {
                 let sel = self.sel_indices();
                 self.set_flag(&sel, Flag::Lock, true);
@@ -871,7 +903,7 @@ impl Studio {
         self.tool = t;
         self.view_tools.pen.clear();
         self.path_edit.selected.clear();
-        self.path_edit.drag = None;
+        self.cancel_point_drag();
         self.path_edit.show_all = false;
     }
 

@@ -234,11 +234,48 @@ pub enum SelThread {
 }
 
 impl Studio {
+    /// The one object the thread picker was opened for, if it wasn't
+    /// opened for the selection (see `picker_for`): a shape's outline.
+    pub fn picker_outline(&self) -> Option<usize> {
+        self.picker?;
+        let uid = self.picker_for?;
+        let o = self.doc.shapes.iter().position(|s| s.uid == uid)?;
+        // (Still the outline of the one shape selected: not after the
+        // selection moved on, or in another document.)
+        match self.subjects()[..] {
+            [shape] if self.outline_index(shape) == Some(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Open the thread picker at `at`: for the selection, or for the one
+    /// object `outline` names (its uid).
+    pub fn open_picker(&mut self, at: egui::Pos2, outline: Option<usize>) {
+        self.picker = Some(at);
+        self.picker_for = outline;
+    }
+
+    /// Close the thread picker.
+    pub fn close_picker(&mut self) {
+        self.picker = None;
+        self.picker_for = None;
+    }
+
+    /// The objects the thread picker colors: the outline it was opened
+    /// for, or the selection (but for an outline selected along with its
+    /// shape, whose thread is its own).
+    pub fn picker_targets(&self) -> Vec<usize> {
+        match self.picker_outline() {
+            Some(o) => vec![o],
+            None => self.subjects(),
+        }
+    }
+
     /// The selection's thread: one color only when every selected layer
     /// has it (showing the first one's would say they all do).
     pub fn selection_thread(&self) -> SelThread {
         let mut colors = self
-            .sel_indices()
+            .subjects()
             .into_iter()
             .filter_map(|i| self.doc.shapes.get(i).map(|s| s.color));
         match colors.next() {
@@ -299,7 +336,8 @@ impl Studio {
     /// color field. Edits apply to every selected object.
     pub fn thread_picker(&mut self, ui: &mut egui::Ui) {
         use crate::theme::space;
-        let sel = self.sel_indices();
+        let sel = self.picker_targets();
+        let for_outline = self.picker_outline().is_some();
         let p = pal_ui(ui);
         ui.set_width(PICKER_W);
         ui.spacing_mut().item_spacing.y = space::S;
@@ -308,17 +346,21 @@ impl Studio {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Thread Color")
-                    .size(13.0)
-                    .strong()
-                    .color(p.text),
+                egui::RichText::new(if for_outline {
+                    "Outline Thread Color"
+                } else {
+                    "Thread Color"
+                })
+                .size(13.0)
+                .strong()
+                .color(p.text),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if crate::theme::icon_button(ui, crate::icons::Icon::Close, "Close", false, 20.0)
                     .on_hover_text("Close (Esc)")
                     .clicked()
                 {
-                    self.picker = None;
+                    self.close_picker();
                 }
             });
         });
@@ -330,7 +372,7 @@ impl Studio {
         let before = c;
         // Several threads selected: there's no one color to show, and
         // whatever is picked goes to them all.
-        let mixed = self.selection_thread() == SelThread::Mixed;
+        let mixed = !for_outline && self.selection_thread() == SelThread::Mixed;
         let brand = self.view_tools.brand;
         section(ui);
         ui.horizontal(|ui| {
@@ -559,7 +601,7 @@ impl Studio {
         }
         if let Some(at) = open_picker {
             // The picker edits the selection: every object in this thread.
-            self.picker = Some(at);
+            self.open_picker(at, None);
         }
         if let Some(v) = select {
             self.set_selection(&v);

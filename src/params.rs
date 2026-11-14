@@ -31,7 +31,8 @@
 //!   trim       cut the thread after this object
 //!   stop       pause the machine after this object (add foam, trim appliqué)
 //! A `stroke.` prefix (e.g. `stroke.run`) applies a token only to the stroke of
-//! an element that has both a fill and a stroke.
+//! an element that has both a fill and a stroke; that element's unprefixed
+//! tokens are its fill's alone.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {

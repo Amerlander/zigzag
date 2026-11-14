@@ -403,6 +403,9 @@ pub fn value_row(
     f.row(label, |ui, lid| {
         let shown = value.unwrap_or((default / step).round() * step);
         let mut v = shown;
+        // (Wide enough for what the value is now: a control narrower than
+        // its value would pull the value in just by being shown.)
+        let range = range.start().min(shown)..=range.end().max(shown);
         ui.spacing_mut().slider_width = 100.0;
         let r = ui
             .add(
@@ -430,7 +433,15 @@ pub fn value_row(
                 .fixed_decimals(decimals)
                 .suffix(suffix),
         );
-        if (r.changed() || field.changed()) && v != shown {
+        // Only a change someone made counts: the slider snaps to its steps,
+        // and a value that isn't on one would be moved by being shown.
+        let touched = r.dragged()
+            || r.clicked()
+            || r.has_focus()
+            || field.dragged()
+            || field.has_focus()
+            || field.lost_focus();
+        if (r.changed() || field.changed()) && touched && v != shown {
             *value = Some(v);
         }
         r

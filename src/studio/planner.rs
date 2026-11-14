@@ -164,7 +164,8 @@ impl Studio {
     /// agent. (Otherwise an edit still with the worker, or made this
     /// frame, would be missing from them.)
     pub fn plan_now(&mut self) {
-        if self.dirty || self.planner.pending {
+        // (A plan with stitches taken out for show isn't one to sew.)
+        if self.dirty || self.planner.pending || self.plan_cut {
             self.replan();
         }
     }
@@ -197,6 +198,8 @@ impl Studio {
         self.planner.took(d.ms);
         self.planner.pending = false;
         self.replans += 1;
+        self.plan_cut = false;
+        self.hide_planned_text();
         if let Some(p) = self.player {
             self.player = Some(p.min(self.design.stitch_count()));
         }

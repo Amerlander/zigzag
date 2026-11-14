@@ -744,6 +744,8 @@ impl crate::app::Studio {
         // Installed: quit, and the new one opens (every tab comes back,
         // as after any quit).
         if status == Status::Relaunch {
+            // (Without asking about unsaved changes: they come back.)
+            self.tabs.quit = crate::tabs::Quit::Go;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // A check nobody asked for says nothing unless it finds one, and

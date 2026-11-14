@@ -553,13 +553,42 @@ impl Document {
         self.shapes = kept;
         let left: HashSet<&str> = self.shapes.iter().map(|s| s.id.as_str()).collect();
         let mut whole: HashSet<String> = HashSet::new();
+        // An outline deleted from a shape that stays: the stroke comes off
+        // the element (so it isn't there, switched off, the next time the
+        // file is opened).
+        let mut unstroke: Vec<String> = Vec::new();
         for s in gone {
             if left.contains(s.id.as_str()) {
                 // The element's other part stays.
+                if s.part == Part::Stroke {
+                    unstroke.push(s.id.clone());
+                }
                 self.removed_parts.insert((s.id, s.part));
             } else {
                 whole.insert(s.id);
             }
+        }
+        if !unstroke.is_empty() {
+            let mut writes = Vec::new();
+            {
+                let doc = roxmltree::Document::parse(&self.xml).context("parsing document")?;
+                let by_id = elements_by_id(&doc);
+                for id in &unstroke {
+                    if let Some(w) = by_id
+                        .get(id.as_str())
+                        .and_then(|n| stroke_style_write(*n, "stroke:none"))
+                    {
+                        writes.push((id.clone(), w));
+                    }
+                }
+            }
+            writes.sort_by_key(|(_, (r, _))| std::cmp::Reverse(r.start));
+            for (id, (range, text)) in writes {
+                self.xml.replace_range(range, &text);
+                // (Nothing left to remember as removed.)
+                self.removed_parts.remove(&(id, Part::Stroke));
+            }
+            self.rev = next_rev();
         }
         if whole.is_empty() {
             return Ok(());
@@ -964,6 +993,48 @@ impl Document {
 }
 
 /// Elements by id (the first with each), to look up rather than search for.
+/// The elements whose own stroke can be set: plain shapes (not text, and
+/// not a `<use>`, whose look is its original's).
+const STROKED: [&str; 6] = ["path", "rect", "circle", "ellipse", "polygon", "polyline"];
+
+/// The edit that gives element `n` the stroke `decl` says (`stroke:…`
+/// declarations, `;` between them), in place of any it has: where in the
+/// SVG to write, and what. In `style`, which wins over a stylesheet's rule
+/// and over stroke attributes on the element. None for an element whose
+/// stroke isn't its own to set.
+pub(super) fn stroke_style_write(
+    n: roxmltree::Node,
+    decl: &str,
+) -> Option<(std::ops::Range<usize>, String)> {
+    if !STROKED.contains(&n.tag_name().name()) {
+        return None;
+    }
+    match n
+        .attributes()
+        .find(|a| a.namespace().is_none() && a.name() == "style")
+    {
+        Some(a) => {
+            let mut decls: Vec<&str> = a
+                .value()
+                .split(';')
+                .map(str::trim)
+                .filter(|d| {
+                    let name = d.split(':').next().unwrap_or("").trim();
+                    !d.is_empty() && !name.to_ascii_lowercase().starts_with("stroke")
+                })
+                .collect();
+            decls.push(decl);
+            // (Escaped for whichever quotes the attribute is in.)
+            let value = xml_escape(&decls.join(";")).replace('\'', "&apos;");
+            Some((a.range_value(), value))
+        }
+        None => {
+            let at = n.attributes().find(|a| a.name() == "id")?.range().start;
+            Some((at..at, format!("style=\"{}\" ", xml_escape(decl))))
+        }
+    }
+}
+
 pub(super) fn elements_by_id<'a, 'input>(
     doc: &'a roxmltree::Document<'input>,
 ) -> HashMap<&'a str, roxmltree::Node<'a, 'input>> {
@@ -1021,6 +1092,7 @@ fn root_prefix_len(xml: &str, start: usize) -> usize {
 
 fn translate(shapes: &mut [Shape], d: P) {
     for s in shapes {
+        s.origin = s.origin + d;
         match &mut s.geometry {
             Geometry::Fill { rings, .. } => rings.iter_mut().flatten().for_each(|p| *p = *p + d),
             Geometry::Stroke { lines, .. } => lines

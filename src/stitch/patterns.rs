@@ -376,6 +376,8 @@ pub fn tartan(
                     stagger: 4,
                     bottom_up: false,
                     min_stitch,
+                    // (As the cells are: on the canvas's grid.)
+                    origin: P::default(),
                 };
                 let rows: Vec<Polyline> = tatami(&clipped, FillRule::EvenOdd, &fp)
                     .into_iter()

@@ -51,6 +51,21 @@ pub struct Shape {
     /// Ids of the groups this element sits in, outermost first (ZigZag's
     /// own wrapper groups left out).
     pub groups: Vec<String>,
+    /// The stroke of an element that's also filled: the outline of that
+    /// shape. Each of its subpaths is an edge to sew along (two of them
+    /// are never the two rails of one satin column, as a stroked path's
+    /// alone can be).
+    pub outline: bool,
+    /// Where the element's own origin is (units, as the geometry): the
+    /// artwork's, for an element nothing has moved. What repeats across
+    /// the canvas inside a shape, a fill's rows and the needle points
+    /// along them, is laid out from here: shapes drawn together line up
+    /// with each other, and a shape that's moved or turned takes its
+    /// stitches with it, as they were, instead of sliding under a grid
+    /// that stays put (which changes how its parts are sewn, and joined,
+    /// with every move; as would opening the file again, were the grid
+    /// laid out from the middle of the design, wherever that is by then).
+    pub origin: P,
 }
 
 /// ZigZag's own wrapper groups (placed artwork, pastes, lettering, pen
@@ -274,6 +289,11 @@ fn walk(group: &usvg::Group, inherited: &Inherit, out: &mut Vec<Shape>) {
     }
 }
 
+/// Where a transform takes the origin, in units.
+fn origin_of(ts: usvg::Transform) -> P {
+    P::new(ts.tx as f64 * PX_TO_UNITS, ts.ty as f64 * PX_TO_UNITS)
+}
+
 fn paint_color(paint: &usvg::Paint) -> [u8; 3] {
     match paint {
         usvg::Paint::Color(c) => [c.red, c.green, c.blue],
@@ -307,10 +327,13 @@ fn import_path(path: &usvg::Path, inherited: &Inherit, out: &mut Vec<Shape>) {
     if subpaths.is_empty() {
         return;
     }
+    let origin = origin_of(ts);
     // Uniform scale of the transform, for stroke widths.
     let scale = ((ts.sx * ts.sy - ts.kx * ts.ky).abs() as f64).sqrt();
     let fill = path.fill().filter(|f| f.opacity().get() > 0.0);
     let stroke = path.stroke().filter(|s| s.opacity().get() > 0.0);
+    // Whether the element's fill became an object.
+    let mut filled = false;
 
     if let Some(f) = fill {
         let rings: Vec<Polyline> = subpaths
@@ -323,7 +346,7 @@ fn import_path(path: &usvg::Path, inherited: &Inherit, out: &mut Vec<Shape>) {
                 kind: Some(ctx.base.kind.unwrap_or(Kind::Fill)),
                 ..ctx.base.clone()
             };
-            push(
+            filled = push(
                 out,
                 path.id(),
                 Part::Fill,
@@ -334,15 +357,23 @@ fn import_path(path: &usvg::Path, inherited: &Inherit, out: &mut Vec<Shape>) {
                     rule: fill_rule(f.rule()),
                 },
                 params,
-            );
+            )
+            .map(|made| made.origin = origin)
+            .is_some();
         }
     }
     if let Some(s) = stroke {
-        // On an element that also has a fill, unprefixed kinds belong to the fill.
-        let base = if fill.is_some() {
+        // On an element that also has a fill, its unprefixed settings are
+        // the fill's (the outline's are the `stroke.` ones, which is how
+        // they're saved): an outline keeps its own thread and density
+        // whatever its shape is given. What groups give still reaches both,
+        // but for the stitch type. (Only where a filled shape was made of
+        // the element: a line has a fill by SVG's default and nothing to
+        // fill, and its settings are the line's, as they're saved.)
+        let base = if filled {
             Params {
                 kind: None,
-                ..ctx.base.clone()
+                ..inherited.base.clone()
             }
         } else {
             ctx.base.clone()
@@ -367,7 +398,9 @@ fn import_path(path: &usvg::Path, inherited: &Inherit, out: &mut Vec<Shape>) {
             kind: Some(kind),
             ..params
         };
-        push(
+        // (With a filled shape too, it's that shape's outline.)
+        let outline = filled;
+        if let Some(made) = push(
             out,
             path.id(),
             Part::Stroke,
@@ -378,7 +411,10 @@ fn import_path(path: &usvg::Path, inherited: &Inherit, out: &mut Vec<Shape>) {
                 width,
             },
             params,
-        );
+        ) {
+            made.outline = outline;
+            made.origin = origin;
+        }
     }
 }
 
@@ -403,7 +439,7 @@ fn import_text(text: &usvg::Text, inherited: &Inherit, out: &mut Vec<Shape>) {
             rings,
             rule: FillRule::NonZero,
         };
-        push(
+        if let Some(made) = push(
             out,
             text.id(),
             Part::Fill,
@@ -411,7 +447,9 @@ fn import_text(text: &usvg::Text, inherited: &Inherit, out: &mut Vec<Shape>) {
             color.unwrap_or([0, 0, 0]),
             geometry,
             params,
-        );
+        ) {
+            made.origin = origin_of(text.abs_transform());
+        }
     }
 }
 
@@ -441,17 +479,17 @@ fn collect_glyphs(
     }
 }
 
-fn push(
-    out: &mut Vec<Shape>,
+fn push<'a>(
+    out: &'a mut Vec<Shape>,
     id: &str,
     part: Part,
     ctx: &Inherit,
     paint: [u8; 3],
     geometry: Geometry,
     params: Params,
-) {
+) -> Option<&'a mut Shape> {
     if params.kind == Some(Kind::Skip) && id.is_empty() {
-        return;
+        return None;
     }
     out.push(Shape {
         id: id.to_string(),
@@ -463,7 +501,10 @@ fn push(
         params,
         uid: 0,
         groups: ctx.groups.clone(),
+        outline: false,
+        origin: P::default(),
     });
+    out.last_mut()
 }
 
 /// Flatten a path into polylines in embroidery units. Returns (points, closed).
@@ -521,6 +562,35 @@ pub fn flatten_path(
     out
 }
 
+/// An editable path (design units) flattened the way [`flatten_path`]
+/// flattens it once it's written into the SVG: what its shapes' geometry
+/// will be, without the round trip through the file.
+pub fn flatten_bez(path: &crate::bezier::BezPath) -> Vec<(Polyline, bool)> {
+    let mut out = Vec::new();
+    for sp in path {
+        let Some(first) = sp.anchors.first() else {
+            continue;
+        };
+        let mut cur: Polyline = vec![first.p];
+        for (a, b) in sp.segments() {
+            let c = sp.cubic(a, b);
+            if c[1] == c[0] && c[2] == c[3] {
+                cur.push(c[3]);
+            } else {
+                flatten_cubic(c[0], c[1], c[2], c[3], FLATTEN_TOL, &mut cur);
+            }
+        }
+        if cur.len() < 2 {
+            continue;
+        }
+        if sp.closed && cur.last().unwrap().dist(first.p) < 1e-6 {
+            cur.pop();
+        }
+        out.push((cur, sp.closed));
+    }
+    out
+}
+
 /// Bounds of all shape geometry, units.
 pub fn shapes_bounds(shapes: &[Shape]) -> crate::geom::Bounds {
     let mut b = crate::geom::Bounds::empty();
@@ -539,6 +609,7 @@ pub fn shapes_bounds(shapes: &[Shape]) -> crate::geom::Bounds {
 pub fn center_shapes(shapes: &mut [Shape]) {
     let c = shapes_bounds(shapes).center();
     for s in shapes {
+        s.origin = s.origin - c;
         match &mut s.geometry {
             Geometry::Fill { rings, .. } => rings.iter_mut().flatten().for_each(|p| *p = *p - c),
             Geometry::Stroke { lines, .. } => lines

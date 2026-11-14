@@ -879,6 +879,7 @@ pub fn activity(tool: &str) -> &'static str {
         "duplicate_objects" => "Duplicating",
         "delete_object" => "Removing",
         "round_corners" => "Rounding corners",
+        "add_outline" => "Outlining",
         "simplify_design" => "Simplifying",
         "trace_image" => "Tracing",
         "render_preview" => "Looking",

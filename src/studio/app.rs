@@ -147,6 +147,10 @@ pub struct Studio {
     /// How many times the stitches were planned (tests check gestures
     /// don't re-plan every frame).
     pub(crate) replans: u64,
+    /// The plan on show has had the stitches of objects that went (or are
+    /// hidden) taken out of it (`drop_planned`): good to look at until the
+    /// next plan, not to sew.
+    pub(crate) plan_cut: bool,
     /// What the last plan can lend the next (see `PlanCache`).
     pub(crate) plan_cache: zigzag::design::PlanCache,
     /// An MCP batch is running: edits re-plan once at its end (or before a
@@ -170,6 +174,13 @@ pub struct Studio {
     pub(crate) satin_memo: std::cell::RefCell<Option<(u64, std::rc::Rc<SatinInfo>)>>,
     /// The thread color picker is open, anchored at this point.
     pub(crate) picker: Option<Pos2>,
+    /// The picker is for this object (its uid) rather than the selection:
+    /// a shape's outline, opened from the outline's row of the task bar.
+    /// Set by [`Studio::open_picker`] alone, which every way of opening
+    /// the picker goes through, so one opened for the selection is never
+    /// left pointing at an outline; and it holds only while that outline's
+    /// shape is what's selected.
+    pub(crate) picker_for: Option<usize>,
     pub(crate) lettering: crate::lettering::LetteringState,
     pub(crate) view_tools: crate::view_tools::ViewTools,
     pub(crate) dock: crate::dock::DockState,
@@ -429,10 +440,12 @@ impl Studio {
             prefs: Default::default(),
             settings_ui: Default::default(),
             picker: None,
+            picker_for: None,
             agent: Default::default(),
             hud_lift: 0.0,
             open_issues: false,
             replans: 0,
+            plan_cut: false,
             plan_cache: Default::default(),
             batching: false,
             planner: Default::default(),
@@ -536,6 +549,8 @@ impl Studio {
     /// Replace the whole document (open, new). Clears history.
     pub fn set_document(&mut self, doc: Document) {
         self.hoop_custom = false;
+        // (A point drag was on the document this replaces.)
+        self.path_edit.drag = None;
         self.doc = doc;
         self.stable = self.doc.clone();
         self.selected = None;
@@ -582,6 +597,8 @@ impl Studio {
         }
         self.plan_ms = t.elapsed().as_secs_f64() * 1000.0;
         self.replans += 1;
+        self.plan_cut = false;
+        self.hide_planned_text();
         // A slow plan sends the next ones to the worker; one made here
         // supersedes any still out.
         self.planner.took(self.plan_ms);
@@ -644,6 +661,32 @@ impl Studio {
         }
     }
 
+    /// Take the stitches of the objects at `indices` (as the plan on show
+    /// numbers them) out of it, there and then: something deleted, or text
+    /// with every letter typed away, is gone from the canvas in the frame
+    /// it goes, not when the next plan arrives (a frame later; longer
+    /// when planning is the worker's, or the computer is busy).
+    pub(crate) fn drop_planned(&mut self, indices: &[usize]) {
+        if self.design.drop_shapes(indices) {
+            self.replans += 1;
+            self.plan_cut = true;
+        }
+    }
+
+    /// [`Studio::drop_planned`] for the objects of `before` (the document
+    /// the plan on show was made of) that the document no longer has.
+    pub(crate) fn drop_planned_gone(&mut self, before: &Document) {
+        if before.shapes.len() != self.design.per_shape.len() {
+            return;
+        }
+        let still: std::collections::HashSet<usize> =
+            self.doc.shapes.iter().map(|s| s.uid).collect();
+        let gone: Vec<usize> = (0..before.shapes.len())
+            .filter(|&i| !still.contains(&before.shapes[i].uid))
+            .collect();
+        self.drop_planned(&gone);
+    }
+
     /// Move the planned stitches of the blocks made only of `indices` by
     /// `m`, as a stand-in until they're planned again (a drop while the
     /// worker is still planning: the stitches stay with their objects).
@@ -700,9 +743,13 @@ impl Studio {
         &mut self,
         f: impl FnOnce(&mut Document) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        // (An edit made under a corner drag ends the drag: the undo step
+        // keeps the shapes as they are in the file, not as the drag shows.)
+        self.cancel_point_drag();
         let before = self.doc.clone();
         match f(&mut self.doc) {
             Ok(()) => {
+                self.drop_planned_gone(&before);
                 self.push_undo(before);
                 self.redo.clear();
                 self.stable = self.doc.clone();
@@ -718,12 +765,21 @@ impl Studio {
     }
 
     pub fn apply_history(&mut self, h: History) -> bool {
-        let (from, to) = match h {
-            History::Undo => (&mut self.undo, &mut self.redo),
-            History::Redo => (&mut self.redo, &mut self.undo),
+        // (A corner being rounded shows in the shapes; the document kept
+        // for the way back is the one without that.)
+        self.cancel_point_drag();
+        let from = match h {
+            History::Undo => &mut self.undo,
+            History::Redo => &mut self.redo,
         };
         let Some(doc) = from.pop() else { return false };
-        to.push(std::mem::replace(&mut self.doc, doc));
+        let before = std::mem::replace(&mut self.doc, doc);
+        // (What the step takes away is off the canvas at once.)
+        self.drop_planned_gone(&before);
+        match h {
+            History::Undo => self.redo.push(before),
+            History::Redo => self.undo.push(before),
+        }
         self.stable = self.doc.clone();
         if self.sel_index().is_none() {
             self.selected = None;
@@ -826,6 +882,8 @@ impl Studio {
     }
 
     pub fn save(&mut self, path: Option<&Path>) {
+        // (What's kept as saved is the document, not a corner drag's preview.)
+        self.cancel_point_drag();
         match self.doc.save(path) {
             Ok(p) => {
                 self.stable = self.doc.clone();
@@ -901,8 +959,10 @@ impl Studio {
 
     /// Set the stitch type of every selected object that can take it.
     pub fn set_kind_selected(&mut self, kind: Kind) {
+        // (Not an outline selected along with its shape: its stitch type is
+        // its own.)
         let idx: Vec<usize> = self
-            .sel_indices()
+            .subjects()
             .into_iter()
             .filter(|&i| {
                 let s = &self.doc.shapes[i];
@@ -930,7 +990,9 @@ impl Studio {
         let Some(src) = self.layout.settings_clip.clone() else {
             return;
         };
-        let idx = self.sel_indices();
+        // (Not onto an outline selected along with its shape: its settings
+        // are its own.)
+        let idx = self.subjects();
         if idx.is_empty() {
             return;
         }
@@ -991,6 +1053,51 @@ impl Studio {
             Ok(()) => "Reversed: it sews from the other end now.".into(),
             Err(e) => format!("Couldn't reverse: {e:#}"),
         };
+    }
+
+    /// Where the objects with these uids are among the objects now.
+    pub(crate) fn uid_indices(&self, uids: &[usize]) -> Vec<usize> {
+        (0..self.doc.shapes.len())
+            .filter(|&i| uids.contains(&self.doc.shapes[i].uid))
+            .collect()
+    }
+
+    /// Move the objects at `moving` to just before the one at `before`
+    /// (as they're numbered now; past the last: to the end) in the sewing
+    /// order, keeping their own order among themselves. One undo step;
+    /// nothing, and false, when that's where they are already.
+    pub(crate) fn move_layers(&mut self, moving: &[usize], before: usize) -> bool {
+        let n = self.doc.shapes.len();
+        let mut moving: Vec<usize> = moving.iter().copied().filter(|i| *i < n).collect();
+        moving.sort_unstable();
+        moving.dedup();
+        if moving.is_empty() {
+            return false;
+        }
+        let before = before.min(n);
+        let stays = |i: &usize| !moving.contains(i);
+        let mut order: Vec<usize> = (0..before).filter(stays).collect();
+        order.extend(&moving);
+        order.extend((before..n).filter(stays));
+        if order.iter().enumerate().all(|(k, i)| k == *i) {
+            return false;
+        }
+        let label = match moving.as_slice() {
+            [i] => self.names.get(*i).cloned().unwrap_or_default(),
+            many => format!("{} layers", many.len()),
+        };
+        let done = self.structural(|d| {
+            let mut old: Vec<Option<zigzag::svg::Shape>> = std::mem::take(&mut d.shapes)
+                .into_iter()
+                .map(Some)
+                .collect();
+            d.shapes = order.iter().filter_map(|&i| old[i].take()).collect();
+            Ok(())
+        });
+        if done.is_ok() {
+            self.status = format!("Moved {label} in the sewing order.");
+        }
+        done.is_ok()
     }
 
     pub(crate) fn move_selected(&mut self, delta: isize) {
@@ -1108,7 +1215,7 @@ impl Studio {
         // Calls wait while a dialog previews into the document, and while
         // something is dragged: the drag works from the document as it was
         // when it began, and would drop an edit made under it.
-        if self.previewing() || self.drag.is_some() {
+        if self.previewing() || self.drag.is_some() || self.path_edit.drag.is_some() {
             return false;
         }
         let calls: Vec<crate::mcp::Call> = match &self.mcp {
@@ -1257,6 +1364,7 @@ impl Studio {
         self.shape_window(&ctx);
         self.trace_window(&ctx);
         self.close_prompt(&ctx);
+        self.quit_prompt(&ctx);
         self.settings_window(&ctx);
         self.update_tick(&ctx);
         self.update_window(&ctx);
@@ -1319,7 +1427,7 @@ impl Studio {
             || self.dock_ui.flyout.is_some())
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
         {
-            self.picker = None;
+            self.close_picker();
             self.layout.offset_dialog = None;
             // Cancel any preview.
             self.cancel_previews();
@@ -1346,6 +1454,11 @@ impl Studio {
         self.action_shortcuts(ctx);
         self.layout_shortcuts(ctx);
         if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            // A point or corner being dragged: Escape calls it off.
+            if self.path_edit.drag.is_some() {
+                self.cancel_point_drag();
+                return;
+            }
             if self.tool == Tool::Select && self.exit_group() {
                 return;
             }
@@ -1396,15 +1509,35 @@ impl Studio {
     /// The object under `p`: inside the entered group first, then anywhere.
     /// (Not a locked or hidden one: the pointer goes through those to what's
     /// under them.)
+    ///
+    /// A shape's outline is part of the shape: over it, the object is the
+    /// shape (whose task bar has the outline's row), so there's one way to
+    /// pick the two on the canvas. The outline by itself is picked from
+    /// its row in Layers.
     pub(crate) fn pick(&self, p: P, tol: f64) -> Option<usize> {
         if self.scope().is_some()
             && let Some(i) = canvas::hit_test_where(&self.doc.shapes, p, tol, |i| {
                 self.in_scope(i) && self.free(i)
             })
         {
-            return Some(i);
+            return Some(self.shape_of(i));
         }
-        canvas::hit_test_where(&self.doc.shapes, p, tol, |i| self.free(i))
+        canvas::hit_test_where(&self.doc.shapes, p, tol, |i| self.free(i)).map(|i| self.shape_of(i))
+    }
+
+    /// The shape that object `i` is the outline of, or `i` itself: for
+    /// anything else, and for an outline whose shape can't be picked
+    /// (locked or hidden), which is then all there is to pick.
+    pub(crate) fn shape_of(&self, i: usize) -> usize {
+        let Some(s) = self.doc.shapes.get(i).filter(|s| s.outline) else {
+            return i;
+        };
+        self.doc
+            .shapes
+            .iter()
+            .position(|f| f.id == s.id && f.part == zigzag::svg::Part::Fill)
+            .filter(|&f| self.free(f) && self.in_scope(f) == self.in_scope(i))
+            .unwrap_or(i)
     }
 
     /// The objects a selection box from `a` to `b` touches: any part of
@@ -1641,6 +1774,7 @@ impl Studio {
         if space_down
             && self.space_pan.is_none()
             && self.drag.is_none()
+            && self.path_edit.drag.is_none()
             && self.view_tools.pen_press.is_none()
         {
             self.space_pan = Some(false);
@@ -1687,7 +1821,18 @@ impl Studio {
             self.point_tool_canvas(&ctx, &resp, rect, tol, alt);
         }
         let marker_busy = !space && self.markers_canvas(&ctx, &resp, rect);
-        if self.tool == Tool::Select && !space && !marker_busy {
+        // A corner's widget takes the pointer before the selection box's
+        // handles and the shape under it.
+        let corner_busy = !space && !marker_busy && {
+            let mods = crate::layout::DragMods {
+                shift,
+                alt,
+                snap: false,
+                tol,
+            };
+            self.corners_canvas(&ctx, &resp, rect, mods)
+        };
+        if self.tool == Tool::Select && !space && !marker_busy && !corner_busy {
             if self.drag.is_none()
                 && let Some(hp) = resp.hover_pos()
                 && let Some(h) = self.handle_at(rect, hp)
@@ -1908,15 +2053,7 @@ impl Studio {
             // (Text being typed needs nothing special: its block's mesh is
             // keyed by its stitches, so a keystroke re-tessellates just
             // that block, once, and the frames between keystrokes reuse it.)
-            moving: self.drag.as_ref().map(|d| {
-                let on = self
-                    .design
-                    .block_shapes
-                    .iter()
-                    .map(|v| !v.is_empty() && v.iter().all(|i| d.indices.contains(i)))
-                    .collect();
-                (on, d.m)
-            }),
+            moving: self.moving_blocks(),
         };
         // While the Skitch sews: the design as sent, faded, and what's
         // sewn so far over it.
@@ -2022,7 +2159,7 @@ impl Studio {
         // The Selection tool shows the selected paths' points too (filled,
         // like Illustrator's and VectorCraft's), not while they're moving.
         crate::profile::mark("c:overlays");
-        if self.tool == Tool::Select && self.drag.is_none() {
+        if self.tool == Tool::Select && self.drag.is_none() && self.path_edit.drag.is_none() {
             self.draw_selected_points(&painter, rect, pal.accent);
         }
         crate::profile::mark("c:sel_points");
@@ -2052,6 +2189,8 @@ impl Studio {
         ) || (self.tool == Tool::Pen && self.view_tools.pen.is_empty())
         {
             self.draw_path_edit(&painter, rect);
+        } else if self.tool == Tool::Select {
+            self.draw_select_corners(&painter, rect);
         }
         if matches!(self.tool, Tool::AddAnchor | Tool::DeleteAnchor) {
             let add = (self.tool == Tool::AddAnchor) != ctx.input(|i| i.modifiers.alt);
