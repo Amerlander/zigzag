@@ -108,6 +108,7 @@ impl Studio {
         self.layout.corner_dialog.is_some()
             || self.layout.simplify_dialog.is_some()
             || self.layout.design_dialog.is_some()
+            || self.view_tools.rotate.dialog.is_some()
     }
 
     /// Canvas input and drawing for Smooth, Path Eraser and Join.
@@ -532,6 +533,7 @@ impl Studio {
             self.doc = d.base;
             self.dirty = true;
         }
+        self.close_rotate_dialog();
     }
 
     /// Open Object › Path › Clean Up….

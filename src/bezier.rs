@@ -1668,6 +1668,143 @@ pub fn bounds(path: &BezPath) -> crate::geom::Bounds {
     b
 }
 
+// The Curvature tool's curve, ported from VectorCraft's
+// `tools/src/draw2.rs` (MIT OR Apache-2.0).
+
+/// A handle's length as a fraction of its segment's chord, where the handle
+/// runs along the chord. It grows as the handle turns away from the chord
+/// ([`arc_handle_len`]).
+const HANDLE_K: f64 = 1.0 / 3.0;
+
+/// The sine of half the angle between a smooth point's chords (sin 15°)
+/// below which its handles shorten: a turn tighter than 30° is cut back
+/// toward a corner instead of swinging round the circle through the three
+/// points, which for a narrow V is nearly a whole circle.
+const TIGHT_TURN: f64 = 0.258_819_045_102_520_8;
+
+/// How long a handle leaving along `dir` should be for its segment,
+/// `chord`, to follow a circular arc: `|chord| / (3 cos²(α/2))`, α the
+/// angle between the handle and the chord. A third of the chord along it,
+/// up to two thirds at 90° (a handle turned further counts as at 90°).
+fn arc_handle_len(chord: P, dir: P) -> f64 {
+    let (l, ld) = (chord.len(), dir.len());
+    if !(l > 1e-9 && ld > 1e-12) {
+        return 0.0;
+    }
+    // cos²(α/2) = (1 + cos α) / 2.
+    let cos = (dir.dot(chord) / (ld * l)).clamp(0.0, 1.0);
+    2.0 * HANDLE_K * l / (1.0 + cos)
+}
+
+/// The handles (in, out) of a smooth point `p` between `prev` and `next`,
+/// so that the curve through the three follows the circle through them:
+/// both along that circle's tangent at `p`, each as long as [`arc_handle_len`]
+/// says for its own segment; in a turn tighter than 30° shorter, by the
+/// square of how far it is under, so a narrow V comes to a point. None
+/// when there's no direction (a chord of no length, or a fold straight
+/// back on itself): the point is then a corner.
+pub fn smooth_handles(prev: P, p: P, next: P) -> Option<(P, P)> {
+    let (a, b) = (prev - p, next - p);
+    let (la2, lb2) = (a.dot(a), b.dot(b));
+    if !(la2.is_finite() && lb2.is_finite()) || la2 <= 1e-18 || lb2 <= 1e-18 {
+        return None;
+    }
+    // In a line with `p` not between its neighbours, the path folds back.
+    if cross(a, b).abs() <= 1e-9 * la2.sqrt() * lb2.sqrt() && a.dot(b) > 0.0 {
+        return None;
+    }
+    let t = b * (1.0 / lb2) - a * (1.0 / la2);
+    let lt = t.len();
+    if !lt.is_finite() || lt * la2.sqrt().min(lb2.sqrt()) <= 1e-9 {
+        return None;
+    }
+    let u = t * (1.0 / lt);
+    // sin(φ/2) = √((1 − cos φ) / 2), φ the angle at `p` between the chords.
+    let cos = (a.dot(b) / (la2.sqrt() * lb2.sqrt())).clamp(-1.0, 1.0);
+    let k = (((1.0 - cos) / 2.0).sqrt() / TIGHT_TURN).min(1.0).powi(2);
+    let (h_in, h_out) = (
+        p - u * (k * arc_handle_len(a, -u)),
+        p + u * (k * arc_handle_len(b, u)),
+    );
+    [h_in.x, h_in.y, h_out.x, h_out.y]
+        .iter()
+        .all(|v| v.is_finite())
+        .then_some((h_in, h_out))
+}
+
+/// The one handle an end `p` of an open path gets so that its segment, to
+/// the neighbour `q`, follows the same circle as the curve at `q`: `q`'s
+/// tangent mirrored in the chord, as long as [`arc_handle_len`] says. Where
+/// `q`'s own handle on their segment falls short of the circle's (a tight
+/// turn at `q`), the end's handle turns toward the chord and shortens in
+/// that share, so the end segment straightens too. `forward` when `p`
+/// comes before `q` on the path (its first anchor). None when `q` has no
+/// handle to take a tangent from (a corner): the segment stays straight.
+pub fn end_handle(p: P, q: &Anchor, forward: bool) -> Option<P> {
+    let t = if q.h_out != q.p {
+        q.h_out - q.p
+    } else if q.h_in != q.p {
+        q.p - q.h_in
+    } else {
+        return None;
+    };
+    let (t, chord) = (if forward { t } else { -t }, q.p - p);
+    let (lt, lc) = (t.len(), chord.len());
+    if !(lt > 1e-12 && lc > 1e-9) {
+        return None;
+    }
+    let (t, c) = (t * (1.0 / lt), chord * (1.0 / lc));
+    let d = c * (2.0 * t.dot(c)) - t;
+    let back = (if forward { q.h_in } else { q.h_out }) - q.p;
+    let full = arc_handle_len(p - q.p, back);
+    let share = if back.len() > 1e-9 && full > 1e-9 {
+        (back.len() / full).min(1.0)
+    } else {
+        1.0
+    };
+    // Short of the circle, the end also turns toward its chord in that share.
+    let d = c * (1.0 - share) + d * share;
+    let d = d * (1.0 / d.len().max(1e-12));
+    let h = p + d * (share * arc_handle_len(chord, d));
+    (h.x.is_finite() && h.y.is_finite()).then_some(h)
+}
+
+/// The Curvature tool's curve through `points` (each with whether it's a
+/// corner): every stretch of three points follows the circle through them.
+/// Each smooth point takes [`smooth_handles`] from its neighbours (a
+/// corner, or one with no direction, gets none); with three or more
+/// points, the ends of an open path get [`end_handle`] into the curve
+/// unless they're corners. Two points are a straight line.
+pub fn curvature_spline(points: &[(P, bool)], closed: bool) -> SubPath {
+    let n = points.len();
+    let closed = closed && n > 2;
+    let mut anchors: Vec<Anchor> = Vec::with_capacity(n);
+    for (i, &(p, corner)) in points.iter().enumerate() {
+        let open_end = !closed && (i == 0 || i + 1 == n);
+        let handles = (n >= 3 && !corner && !open_end)
+            .then(|| smooth_handles(points[(i + n - 1) % n].0, p, points[(i + 1) % n].0))
+            .flatten();
+        anchors.push(match handles {
+            Some((h_in, h_out)) => Anchor { p, h_in, h_out },
+            None => Anchor::corner(p),
+        });
+    }
+    if n >= 3 && !closed {
+        // The ends mirror their neighbours' tangents, which are in place.
+        if !points[0].1
+            && let Some(h) = end_handle(anchors[0].p, &anchors[1], true)
+        {
+            anchors[0].h_out = h;
+        }
+        if !points[n - 1].1
+            && let Some(h) = end_handle(anchors[n - 1].p, &anchors[n - 2], false)
+        {
+            anchors[n - 1].h_in = h;
+        }
+    }
+    SubPath { anchors, closed }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2179,5 +2316,84 @@ mod tests {
         assert!((t - 0.5).abs() < 0.03);
         let (_, a, _) = hit_segment(&p, P::new(49.0, 51.0), 3.0).unwrap();
         assert_eq!(a, 2, "the closing segment");
+    }
+
+    #[test]
+    fn curvature_runs_through_three_points_on_their_circle() {
+        // Three points on a circle of radius 100, unevenly spaced: the
+        // curve through them stays on it, ends included.
+        for (a0, a1, a2) in [(200.0f64, 270.0, 340.0), (190.0, 230.0, 330.0)] {
+            let on = |deg: f64| {
+                let r = deg.to_radians();
+                P::new(100.0 * r.cos(), 100.0 * r.sin())
+            };
+            let pts = [(on(a0), false), (on(a1), false), (on(a2), false)];
+            let sp = curvature_spline(&pts, false);
+            assert!(!sp.closed && sp.anchors.len() == 3);
+            // The middle point is smooth; each end has its one handle,
+            // into the curve.
+            assert!(sp.anchors[1].is_smooth());
+            assert!(
+                sp.anchors[0].h_in == sp.anchors[0].p && sp.anchors[0].h_out != sp.anchors[0].p
+            );
+            assert!(
+                sp.anchors[2].h_out == sp.anchors[2].p && sp.anchors[2].h_in != sp.anchors[2].p
+            );
+            for (a, b) in sp.segments() {
+                for q in sample(&sp.cubic(a, b), 16) {
+                    assert!((q.len() - 100.0).abs() < 1.0, "off the circle: {}", q.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn curvature_corners_lines_loops_and_points_with_no_direction() {
+        let (a, b, c) = (P::new(0.0, 0.0), P::new(100.0, 80.0), P::new(200.0, 0.0));
+        // Two points: a line.
+        let line = curvature_spline(&[(a, false), (c, false)], false);
+        assert!(line.anchors.iter().all(|x| !x.has_handles()));
+        // A corner in the middle: two lines (the ends have no tangent to
+        // take up).
+        let v = curvature_spline(&[(a, false), (b, true), (c, false)], false);
+        assert!(v.anchors.iter().all(|x| !x.has_handles()));
+        // A corner at one end: no handle there, and the other end curves.
+        let e = curvature_spline(&[(a, true), (b, false), (c, false)], false);
+        assert!(!e.anchors[0].has_handles());
+        assert!(e.anchors[1].is_smooth() && e.anchors[2].h_in != e.anchors[2].p);
+        // Closed: smooth all round, and only with three points or more.
+        let ring = curvature_spline(&[(a, false), (b, false), (c, false)], true);
+        assert!(ring.closed && ring.anchors.iter().all(|x| x.is_smooth()));
+        assert!(!curvature_spline(&[(a, false), (c, false)], true).closed);
+        // Handles between a third and two thirds of their chord.
+        let h = (ring.anchors[1].h_out - b).len() / (c - b).len();
+        assert!((1.0 / 3.0 - 1e-9..=2.0 / 3.0 + 1e-9).contains(&h), "{h}");
+        // A narrow V comes to a point: no swinging round a huge circle.
+        let narrow = curvature_spline(
+            &[
+                (a, false),
+                (P::new(5.0, 300.0), false),
+                (P::new(10.0, 0.0), false),
+            ],
+            false,
+        );
+        let tip = narrow.anchors[1];
+        assert!((tip.h_out - tip.p).len() < 30.0, "{:?}", tip);
+        // The same point twice, or a fold straight back: corners, no NaN.
+        for pts in [
+            vec![(a, false), (a, false), (c, false)],
+            vec![(a, false), (c, false), (P::new(100.0, 0.0), false)],
+            vec![(a, false), (a, false), (a, false)],
+        ] {
+            for closed in [false, true] {
+                let sp = curvature_spline(&pts, closed);
+                for x in &sp.anchors {
+                    for v in [x.p, x.h_in, x.h_out] {
+                        assert!(v.x.is_finite() && v.y.is_finite());
+                    }
+                }
+            }
+        }
+        assert!(smooth_handles(a, a, c).is_none());
     }
 }

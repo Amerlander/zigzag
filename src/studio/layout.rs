@@ -53,8 +53,13 @@ pub struct Drag {
     pub targets: Vec<Bounds>,
     /// Smart guide lines to draw (design units).
     pub guides: Vec<(P, P)>,
-    /// Option is held during a move: release drops a copy.
+    /// Option is held during a move (or the Rotate tool's turn): release
+    /// drops a copy.
     pub copy: bool,
+    /// The Rotate tool's gesture, not the selection box's rotate corner:
+    /// Option leaves a turned copy, and Transform Again repeats it about
+    /// the same point.
+    pub tool: bool,
 }
 
 /// Modifier keys during a canvas gesture.
@@ -78,6 +83,10 @@ pub struct LastTransform {
     pub from: Bounds,
     /// It made a copy (Option-drag, Duplicate).
     pub copy: bool,
+    /// A turn about the Rotate tool's reference point: replays keep that
+    /// point (as VectorCraft's Transform Again repeats the matrix) rather
+    /// than following the selection, so copies go round it.
+    pub fixed: bool,
 }
 
 /// Paste offset so a duplicate doesn't land exactly on its original (units).
@@ -92,6 +101,8 @@ pub struct LayoutState {
     /// The task bar's outline row is tucked away (the outline itself is
     /// as it was: the bar's outline button shows its thread).
     pub outline_row_closed: bool,
+    /// Where the task bar's grip moved it.
+    pub task_bar_place: crate::taskbar::TaskBarPlace,
     pub clipboard: Vec<Fragment>,
     /// A copy's SVG, waiting to go on the system clipboard (it needs the
     /// egui context, so it's written at the next frame).
@@ -273,6 +284,52 @@ pub fn one_thing(shapes: &[zigzag::svg::Shape], members: &[usize]) -> bool {
 }
 
 impl Studio {
+    /// Open the groups that a document just opened would show in Layers as
+    /// one closed row: a level's only group starts open, and so on down
+    /// while a group holds nothing but another. (A design that is one group
+    /// is otherwise a list of one row, with every layer a click away.)
+    pub fn open_lone_groups(&mut self) {
+        let shapes = &self.doc.shapes;
+        let mut members: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, s) in shapes.iter().enumerate() {
+            for g in &s.groups {
+                members.entry(g.as_str()).or_default().push(i);
+            }
+        }
+        // The groups each object is listed under, outermost first (a group
+        // of one isn't listed: see `object_rows`).
+        let listed: Vec<Vec<&String>> = shapes
+            .iter()
+            .map(|s| {
+                s.groups
+                    .iter()
+                    .filter(|g| !one_thing(shapes, &members[g.as_str()]))
+                    .collect()
+            })
+            .collect();
+        let mut open = Vec::new();
+        'levels: for depth in 0.. {
+            let mut only: Option<&String> = None;
+            let mut loose = false;
+            for gs in &listed {
+                match (gs.get(depth), only) {
+                    (None, _) => loose = true,
+                    (Some(g), None) => only = Some(g),
+                    (Some(g), Some(o)) if *g == o => {}
+                    _ => break 'levels,
+                }
+            }
+            let Some(g) = only else { break };
+            open.push(g.clone());
+            // Something beside it: what's in it isn't the only thing here.
+            if loose {
+                break;
+            }
+        }
+        self.layout.expanded.extend(open);
+    }
+
     /// Objects in group `g`, in sewing order.
     pub fn group_members(&self, g: &str) -> Vec<usize> {
         (0..self.doc.shapes.len())
@@ -580,6 +637,7 @@ impl Studio {
                     m,
                     from,
                     copy: false,
+                    fixed: false,
                 });
                 true
             }
@@ -633,6 +691,7 @@ impl Studio {
                     m: translation(d),
                     from,
                     copy: true,
+                    fixed: false,
                 });
                 true
             }
@@ -640,6 +699,55 @@ impl Studio {
                 self.status = format!("Couldn't duplicate: {e:#}");
                 false
             }
+        }
+    }
+
+    /// Leave the selection where it is and add a copy of it transformed by
+    /// `m` (design units), selected: one undo step. (A rotated copy; a
+    /// copy that only moves is [`Self::copy_selection_by`].)
+    pub fn copy_selection_with(&mut self, m: Affine, what: &str) -> bool {
+        let idx = self.sel_indices();
+        if idx.is_empty() {
+            return false;
+        }
+        let from = self.selection_bounds();
+        let label = self.selection_label(idx.len());
+        let mut new = Vec::new();
+        match self.structural(|doc| {
+            let made = doc.duplicate(&idx, P::default())?;
+            let uids: Vec<usize> = made.iter().map(|&i| doc.shapes[i].uid).collect();
+            // (Lettering, live corners and fill angles turn as they do
+            // for any transform.)
+            doc.transform(&made, m)?;
+            new = uids
+                .iter()
+                .filter_map(|u| doc.shapes.iter().position(|s| s.uid == *u))
+                .collect();
+            Ok(())
+        }) {
+            Ok(()) => {
+                self.status = format!("{what} {label}.");
+                self.set_selection(&new);
+                self.layout.last = Some(LastTransform {
+                    m,
+                    from,
+                    copy: true,
+                    fixed: false,
+                });
+                true
+            }
+            Err(e) => {
+                self.status = format!("Couldn't copy: {e:#}");
+                false
+            }
+        }
+    }
+
+    /// The transform just made was a turn about the Rotate tool's
+    /// reference point: Transform Again repeats it about that point.
+    pub(crate) fn keep_last_fixed(&mut self) {
+        if let Some(l) = &mut self.layout.last {
+            l.fixed = true;
         }
     }
 
@@ -1073,16 +1181,29 @@ impl Studio {
             self.duplicate_selected();
             return;
         };
-        // Follow the selection: the same transform, relative to where it is now.
-        let d = self.selection_bounds().center() - last.from.center();
-        let m = affine_mul(
-            translation(d),
-            affine_mul(last.m, translation(P::default() - d)),
-        );
-        if last.copy {
-            self.copy_selection_by(P::new(m[4], m[5]), "Copied");
+        // Follow the selection: the same transform, relative to where it is
+        // now. (Not a turn about the Rotate tool's point: that goes round
+        // the same point again, each copy a step further on.)
+        let m = if last.fixed {
+            last.m
         } else {
-            self.transform_selected(m, "Transformed again:");
+            let d = self.selection_bounds().center() - last.from.center();
+            affine_mul(
+                translation(d),
+                affine_mul(last.m, translation(P::default() - d)),
+            )
+        };
+        let moves_only = (m[0] - 1.0).abs() < 1e-9
+            && (m[3] - 1.0).abs() < 1e-9
+            && m[1].abs() < 1e-9
+            && m[2].abs() < 1e-9;
+        let done = match (last.copy, moves_only) {
+            (true, true) => self.copy_selection_by(P::new(m[4], m[5]), "Copied"),
+            (true, false) => self.copy_selection_with(m, "Copied"),
+            (false, _) => self.transform_selected(m, "Transformed again:"),
+        };
+        if done && last.fixed {
+            self.keep_last_fixed();
         }
     }
 
@@ -1346,7 +1467,18 @@ impl Studio {
             targets,
             guides: Vec::new(),
             copy: false,
+            tool: false,
         });
+    }
+
+    /// Start the Rotate tool's gesture at design point `p`: a turn about
+    /// `center` (the selection's center, or a point placed by hand).
+    pub fn begin_rotate(&mut self, center: P, p: P) {
+        self.begin_drag(Some(Handle::Rotate), p);
+        if let Some(d) = &mut self.drag {
+            d.mode = DragMode::Rotate { center };
+            d.tool = true;
+        }
     }
 
     /// Update the live preview for pointer at `p`.
@@ -1513,7 +1645,7 @@ impl Studio {
         }
         drag.m = m;
         drag.guides = guides;
-        drag.copy = mods.alt && matches!(drag.mode, DragMode::Move);
+        drag.copy = mods.alt && (matches!(drag.mode, DragMode::Move) || drag.tool);
         // The outlines follow the pointer (only the moved shapes' points
         // are rewritten, from the document as it was when the gesture
         // began); the stitches are drawn through the transform (see
@@ -1556,6 +1688,23 @@ impl Studio {
         if drag.split {
             self.dirty = true;
         }
+        let tiny = (drag.m[4].abs() + drag.m[5].abs()) < 0.5
+            && (drag.m[0] - 1.0).abs() < 1e-3
+            && (drag.m[3] - 1.0).abs() < 1e-3
+            && drag.m[1].abs() < 1e-3
+            && drag.m[2].abs() < 1e-3;
+        if drag.copy && drag.tool {
+            // The Rotate tool with Option held: the original stays, a
+            // turned copy lands.
+            self.doc = drag.base;
+            if !tiny {
+                if self.copy_selection_with(drag.m, "Copied") {
+                    self.keep_last_fixed();
+                }
+                self.plan_after_gesture();
+            }
+            return;
+        }
         if drag.copy {
             // Option-drag: the original stays, a copy lands where you let go.
             self.doc = drag.base;
@@ -1566,11 +1715,6 @@ impl Studio {
             return;
         }
         self.doc = drag.base;
-        let tiny = (drag.m[4].abs() + drag.m[5].abs()) < 0.5
-            && (drag.m[0] - 1.0).abs() < 1e-3
-            && (drag.m[3] - 1.0).abs() < 1e-3
-            && drag.m[1].abs() < 1e-3
-            && drag.m[2].abs() < 1e-3;
         if tiny {
             return;
         }
@@ -1580,6 +1724,9 @@ impl Studio {
             DragMode::Rotate { .. } => "Rotated",
         };
         if self.transform_selected(drag.m, what) {
+            if drag.tool {
+                self.keep_last_fixed();
+            }
             if self.planner.slow {
                 // A big design's new plan comes from the worker a moment
                 // later: until then the stitches as planned follow the
@@ -1622,7 +1769,11 @@ impl Studio {
                 bounds.width() * d.m[0].abs(),
                 bounds.height() * d.m[3].abs(),
             ),
-            DragMode::Rotate { .. } => format!("{:.0}°", d.m[1].atan2(d.m[0]).to_degrees()),
+            DragMode::Rotate { .. } => format!(
+                "{:.0}°{}",
+                d.m[1].atan2(d.m[0]).to_degrees(),
+                if d.copy { " copy" } else { "" }
+            ),
         })
     }
 
@@ -2428,6 +2579,48 @@ mod tests {
         h.state_mut().paste();
         h.run_steps(3);
         assert_eq!(h.state().doc.shapes.len(), n + 2);
+    }
+
+    #[test]
+    fn stitches_added_after_a_stitch_out_show() {
+        let mut h = studio();
+        let planned = |h: &mut Harness<'_, Studio>| {
+            for _ in 0..400 {
+                h.run_steps(1);
+                if !h.state().dirty && !h.state().planner.pending {
+                    return;
+                }
+            }
+            panic!("the plan never came in");
+        };
+        // Played through to the end: the whole design, not a stitch count.
+        h.state_mut().speed = 1e7;
+        h.state_mut().toggle_play();
+        h.run_steps(3);
+        assert!(!h.state().playing);
+        assert_eq!(h.state().player, None);
+        let before = h.state().design.stitch_count();
+        // A duplicate's stitches are past the old end, and show.
+        let sun = index_of(&h, "sun");
+        h.state_mut().select_index(Some(sun));
+        h.state_mut().duplicate_selected();
+        planned(&mut h);
+        let after = h.state().design.stitch_count();
+        assert!(after > before);
+        assert_eq!(h.state().player, None);
+        // Left at the end of the old plan (as playing to the end used to):
+        // still the end once a paste adds more.
+        h.state_mut().player = Some(after);
+        h.state_mut().copy_selected();
+        h.state_mut().paste();
+        planned(&mut h);
+        assert!(h.state().design.stitch_count() > after);
+        assert_eq!(h.state().player, None);
+        // Scrubbed part way: it stays there.
+        h.state_mut().player = Some(100);
+        h.state_mut().duplicate_selected();
+        planned(&mut h);
+        assert_eq!(h.state().player, Some(100));
     }
 
     #[test]

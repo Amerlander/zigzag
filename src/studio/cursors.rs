@@ -6,9 +6,11 @@
 //!
 //! - Pen: a nib, with what a click would do (* new, + add, − delete, o close,
 //!   / continue, ^ convert, & join).
-//! - Shape, Measure and Fill Angle tools: a precise crosshair (with the shape).
+//! - Shape, Measure and Fill Angle tools: a precise crosshair (with the
+//!   shape, or the tool); the Rotate tool: the crosshair alone.
 //! - Direct Selection: the hollow arrow (a square beside it over a point).
-//! - Rotate handles: a curved double arrow facing out from the corner.
+//! - Rotate handles, and the Rotate tool turning: a curved double arrow
+//!   facing out from the corner (or from the point it turns about).
 
 use crate::app::Studio;
 use crate::icons::Icon;
@@ -29,6 +31,9 @@ pub enum Glyph {
     Convert,
     /// Reshaping a segment: the caret with a small curve beside it.
     Reshape,
+    /// Illustrator's cursor for dragging a copy (Option with the Selection
+    /// tool): the black arrow, and a white one behind it.
+    Copy,
 }
 
 #[derive(Default)]
@@ -111,6 +116,41 @@ pub fn paint(p: &egui::Painter, at: Pos2, g: Glyph) {
                 p.rect_filled(r.expand(1.5), 2.0, Color32::from_white_alpha(220));
                 crate::icons::paint(p, r, icon, INK);
             }
+        }
+        Glyph::Copy => {
+            // Illustrator's: two arrowheads (no tails), the black one in
+            // front with its tip on the hotspot, a white one edged in
+            // black behind it, down and to the right.
+            let head = |d: Vec2| -> Vec<Pos2> {
+                [(0.0, 0.0), (0.0, 14.0), (3.8, 10.4), (10.4, 10.4)]
+                    .iter()
+                    .map(|&(x, y)| at + d + Vec2::new(x, y))
+                    .collect()
+            };
+            // (Notched at its base, so not convex: filled as two halves.)
+            let fill = |a: &[Pos2], c: Color32| {
+                p.add(Shape::convex_polygon(
+                    vec![a[0], a[1], a[2]],
+                    c,
+                    Stroke::NONE,
+                ));
+                p.add(Shape::convex_polygon(
+                    vec![a[0], a[2], a[3]],
+                    c,
+                    Stroke::NONE,
+                ));
+                // (Over the seam between the halves, which each fade out
+                // at their edge.)
+                p.line_segment([a[0], a[2]], Stroke::new(1.5, c));
+            };
+            let behind = head(Vec2::new(5.0, 5.0));
+            p.add(Shape::closed_line(behind.clone(), Stroke::new(3.0, HALO)));
+            fill(&behind, HALO);
+            p.add(Shape::closed_line(behind, Stroke::new(1.0, INK)));
+            let front = head(Vec2::ZERO);
+            p.add(Shape::closed_line(front.clone(), Stroke::new(3.0, HALO)));
+            fill(&front, INK);
+            p.add(Shape::closed_line(front, Stroke::new(1.0, INK)));
         }
         Glyph::Hollow(on_point) => {
             let arrow: Vec<Pos2> = [

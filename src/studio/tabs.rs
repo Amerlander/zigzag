@@ -234,14 +234,21 @@ impl Studio {
     /// it (typing, a preview, a drag) so nothing carries over to the next.
     fn leave_tab(&mut self) {
         self.finish_typing();
+        // (A path the Curvature tool is part way through is kept, in the
+        // document it was drawn in; a loop or a drag in hand is let go.)
+        self.finish_curvature(false);
+        self.view_tools.lasso.clear();
+        self.view_tools.build.cancel();
         self.cancel_previews();
         self.layout.offset_dialog = None;
         self.layout.cleanup_dialog = None;
         self.layout.swatch_dialog = None;
         self.shapes.dialog = None;
+        self.view_tools.rotate = Default::default();
         self.lettering.edit = None;
         self.close_picker();
         self.drag = None;
+        self.backing = None;
         self.panning = false;
         self.gesture = Default::default();
         // (A corner being rounded shows in the shapes: put them back.)

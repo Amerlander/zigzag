@@ -594,6 +594,7 @@ impl Studio {
             view: self.view_tools.stitch_view,
             background: self.doc.settings.cloth,
             moving: None,
+            copy: false,
             hidden: None,
         };
         let generation = sent

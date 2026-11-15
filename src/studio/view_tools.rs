@@ -61,6 +61,21 @@ pub struct ViewTools {
     pub pen_slot: Tool,
     /// Which tool of the Brush's group the tool strip shows.
     pub brush_slot: Tool,
+    /// And of the others: Direct Selection's (with the Lasso), the Shape
+    /// Builder's (with the Knife), the Eyedropper's (with Measure).
+    pub direct_slot: Tool,
+    pub build_slot: Tool,
+    pub sample_slot: Tool,
+    /// The Knife, the Blob Brush and the Shape Builder.
+    pub build: crate::build_tools::BuildTools,
+    /// The path the Curvature tool is drawing.
+    pub curve: crate::curvature::CurveDraw,
+    /// The Lasso's loop as drawn so far (design units).
+    pub lasso: Vec<P>,
+    /// The look the Eyedropper last read.
+    pub sample: Option<crate::eyedropper::Look>,
+    /// The Rotate tool: its reference point, and its window.
+    pub rotate: crate::rotate::RotateState,
     pub stitch_view: crate::canvas::StitchView,
     /// Thread chart shown in the Threads panel.
     pub brand: crate::threads::Brand,
@@ -91,6 +106,14 @@ impl Default for ViewTools {
             pen_mode: PenMode::default(),
             pen_slot: Tool::Pen,
             brush_slot: Tool::Brush,
+            direct_slot: Tool::Direct,
+            build_slot: Tool::ShapeBuilder,
+            sample_slot: Tool::Eyedropper,
+            build: Default::default(),
+            curve: Default::default(),
+            lasso: Vec::new(),
+            sample: None,
+            rotate: Default::default(),
             stitch_view: Default::default(),
             brand: Default::default(),
             thread_order: true,
@@ -448,10 +471,38 @@ impl Studio {
         painter: &egui::Painter,
         rect: Rect,
     ) {
+        // Space and a drag pans the view, whatever the tool: the tools that
+        // act on a press or a drag sit that out. (The Pen moves the point
+        // it's placing by Space; the Curvature tool goes on showing its
+        // path, and takes no presses.)
+        let panning =
+            !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_down(egui::Key::Space));
+        if panning
+            && matches!(
+                self.tool,
+                Tool::Brush
+                    | Tool::Blob
+                    | Tool::Knife
+                    | Tool::ShapeBuilder
+                    | Tool::Lasso
+                    | Tool::Eyedropper
+            )
+        {
+            self.view_tools.lasso.clear();
+            self.view_tools.build.cancel();
+            return;
+        }
         match self.tool {
             Tool::Measure => self.measure_canvas(ui, resp, painter, rect),
+            Tool::Eyedropper => self.eyedropper_canvas(ui, resp, painter, rect),
+            Tool::Lasso => self.lasso_canvas(ui, resp, painter, rect),
+            Tool::Curvature => self.curvature_canvas(ui, resp, painter, rect),
+            Tool::Knife => self.knife_canvas(ui, resp, painter, rect),
+            Tool::Blob => self.blob_canvas(ui, resp, painter, rect),
+            Tool::ShapeBuilder => self.builder_canvas(ui, resp, painter, rect),
             Tool::Text => self.type_canvas(ui, resp, rect),
             Tool::Shape => self.shape_canvas(ui, resp, painter, rect),
+            Tool::Rotate => self.draw_rotate(painter, rect, resp.interact_pointer_pos()),
             Tool::Brush => self.brush_canvas(ui, resp, painter, rect),
             Tool::Smooth | Tool::PathEraser | Tool::Join => {
                 self.cleanup_canvas(ui, resp, painter, rect)

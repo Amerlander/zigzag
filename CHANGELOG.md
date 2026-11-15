@@ -1,24 +1,24 @@
 # Changelog
 
-## 0.1.4 — 2026-11-14
+## 0.1.5 — 2026-11-14
 
-- Round corners with handles on the shape: drag one for every corner, or
-  click one first for just that corner. Rounded corners stay adjustable,
-  and Round Corners… shows and sets the same radius.
-- Add Outline: an outline on a filled shape as an object of its own, with
-  its own thread and stitch type.
-- Simplify Design: fewer threads, small details and trims for a whole
-  design, previewed with before and after.
-- Drag layers into order in the Layers panel (the Objects panel's new name).
-- Fills and filled text are sewn the same wherever they're moved, and a
-  shape's outline follows it as you drag.
-- Quitting asks about unsaved changes; deleted text no longer lingers;
-  arrow keys step through the font list; crash logs you can report.
+- New tools: Rotate about a point you place (with an exact-angle dialog
+  and ⌘D to repeat), Curvature, Blob Brush, Lasso, Shape Builder, Knife
+  and Eyedropper.
+- Layers lists what's on top at the top, with arrows to move layers and
+  List in Sewing Order for the other way up.
+- Drag the task bar off the art, or pin it in place.
+- Interface size in Settings › General, from 90% to 150%.
+- Mac file panels are sheets on the window, fixing a crash in Save As;
+  dragged objects no longer leave a hole in the fill under them.
 
-[Full release notes](packaging/releases/0.1.4.md)
-· [Downloads](https://github.com/simpsoka/zigzag/releases/tag/v0.1.4)
+[Full release notes](packaging/releases/0.1.5.md)
+· [Downloads](https://github.com/simpsoka/zigzag/releases/tag/v0.1.5)
 
 ## Previous releases
+
+- [0.1.4](packaging/releases/0.1.4.md): live corner handles, Add Outline,
+  Simplify Design, draggable layers, unsaved-changes prompt on quit.
 
 - [0.1.3](packaging/releases/0.1.3.md): machine profiles, in-app updates,
   satin lettering from filled letters, locking and hiding, more hoops.

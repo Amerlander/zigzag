@@ -341,7 +341,9 @@ impl StitchGpu {
         let w = (opt.thread_mm * view.scale).max(1.0);
         let lines = opt.view == StitchView::Lines;
         let ppp = painter.ctx().pixels_per_point();
-        let point_r = (lines && view.scale > 10.0).then(|| (view.scale * 0.06).clamp(1.2, 2.2));
+        let detail = crate::canvas::detail(painter.ctx());
+        let point_r = (lines && crate::canvas::needle_points(detail, view))
+            .then(|| (view.scale * 0.06).clamp(1.2, 2.2));
         let mut remaining = opt.limit;
         let mut cmds = Vec::with_capacity(d.blocks.len());
         let mut last: Option<Pos2> = None;
@@ -360,9 +362,9 @@ impl StitchGpu {
                 continue;
             }
             // The gesture's transform, when this block is being moved.
-            let m = match &opt.moving {
-                Some((on, m)) if on.get(k).copied().unwrap_or(false) => *m,
-                _ => zigzag::geom::IDENTITY,
+            let (m, moved) = match &opt.moving {
+                Some((on, m)) if on.get(k).copied().unwrap_or(false) => (*m, true),
+                _ => (zigzag::geom::IDENTITY, false),
             };
             let at = |p: P| view.to_screen(rect, zigzag::geom::affine_apply(m, p));
             let key = keys.get(k).copied().unwrap_or(0);
@@ -407,8 +409,8 @@ impl StitchGpu {
             // Design p → canvas point: C + s·(A·p + t − c), relative to rect.min.
             let cx = (rect.center().x - rect.min.x) as f64;
             let cy = (rect.center().y - rect.min.y) as f64;
-            let (vc, t) = (view.center, (m[4], m[5]));
-            cmds.push(Cmd {
+            let vc = view.center;
+            let through = |m: zigzag::geom::Affine| Cmd {
                 key,
                 segs: n_segs,
                 pts: n_pts,
@@ -420,10 +422,15 @@ impl StitchGpu {
                     (s * m[3]) as f32,
                 ],
                 origin: [
-                    (cx + s * (t.0 - vc.x)) as f32,
-                    (cy + s * (t.1 - vc.y)) as f32,
+                    (cx + s * (m[4] - vc.x)) as f32,
+                    (cy + s * (m[5] - vc.y)) as f32,
                 ],
-            });
+            };
+            // (A copy being dragged off: where it was as well, under it.)
+            if moved && opt.copy {
+                cmds.push(through(zigzag::geom::IDENTITY));
+            }
+            cmds.push(through(m));
         }
         drop(state);
 
@@ -438,7 +445,7 @@ impl StitchGpu {
             } else {
                 w / 2.0 + 0.5 / ppp.max(0.5)
             },
-            shade: !lines && w >= 2.2,
+            shade: !lines && crate::canvas::shaded(detail, w),
             point_r,
         };
         let state = self.state.clone();

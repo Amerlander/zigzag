@@ -13,12 +13,14 @@ use crate::params::{Fabric, Kind, Params};
 use crate::svg::{self, Geometry, PX_TO_UNITS, Part, Shape};
 use anyhow::{Context, Result, anyhow, bail};
 
+mod build;
 mod cleanup;
 mod edit;
 mod glyphs;
 mod lettering;
 mod paths;
 mod simplify;
+pub use build::Face;
 pub use cleanup::{CleanUp, CleanUpReport};
 pub use edit::Fragment;
 pub use glyphs::{Carets, GlyphBox};

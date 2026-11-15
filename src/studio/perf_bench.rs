@@ -309,6 +309,9 @@ fn gestures_on_designs_of_your_own() {
         step(&mut h, "a stitch setting, step by step", 10, &mut |h, k| {
             if let Some(i) = h.state().sel_index() {
                 h.state_mut().doc.shapes[i].params.spacing = Some(0.3 + k as f64 * 0.01);
+                // (Changed between frames, where no frame sees it change:
+                // say so, as the frame that changed it would have.)
+                h.state_mut().dirty = true;
             }
         });
         // Everything selected, and moved.
@@ -413,5 +416,454 @@ fn planning_a_design_of_your_own() {
         "checks: {:.2} ms, {} issues",
         t.elapsed().as_secs_f64() * 1000.0,
         issues.len()
+    );
+}
+
+/// Frame times of making things and of lining them up: drawing a shape
+/// with a Shape tool, drawing a path with the Pen, and dragging an object
+/// with smart guides on and off; on the bench grid (36 objects, 213,000
+/// stitches), a traced logo (hundreds of objects) and, with
+/// `ZIGZAG_DESIGNS` naming a folder, every `.svg` in it.
+///
+/// Each line is the UI pass of a frame (mean and slowest); then, with
+/// `TL_PROFILE=quiet`, that less the painter's drawing of the stitches
+/// (the app draws those on the GPU); then egui's tessellation of
+/// everything painted but the stitches; then the slowest frame's sections.
+///
+/// `TL_PROFILE=quiet cargo test --release --features gui --bin zigzag-studio perf_bench::making -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn making_and_aligning() {
+    let example = |f: &str| {
+        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples")).join(f)
+    };
+    let mut files = vec![
+        example("badge.svg"),
+        example("bench-grid.svg"),
+        example("agent-badge-preview.png"),
+    ];
+    if let Ok(dir) = std::env::var("ZIGZAG_DESIGNS") {
+        let mut more: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "svg"))
+            .collect();
+        more.sort();
+        files.extend(more);
+    }
+    for file in files {
+        let name = file.file_stem().unwrap().to_string_lossy().into_owned();
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1600.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        h.state_mut().planner.timed = true;
+        let doc = zigzag::document::Document::open(&file).unwrap();
+        h.state_mut().set_document(doc);
+        h.run_steps(5);
+        settle(&mut h);
+        println!(
+            "{name}: {} objects, {} stitches, {} KB of SVG; a plan takes {:.1} ms{}",
+            h.state().doc.shapes.len(),
+            h.state().design.stitch_count(),
+            h.state().doc.xml.len() / 1024,
+            h.state().plan_ms,
+            if h.state().planner.slow {
+                " (in the background)"
+            } else {
+                ""
+            },
+        );
+        let rect = h.state().canvas_rect;
+        let c = rect.center();
+
+        // A rectangle, drawn across the middle of the design.
+        h.key_press(egui::Key::M);
+        h.run_steps(2);
+        let (from, to) = (c - Vec2::new(90.0, 60.0), c + Vec2::new(90.0, 60.0));
+        times(&mut h, "shape tool: hovering", 20, &mut |h, k| {
+            h.hover_at(from + Vec2::new(k as f32 * 3.0 - 60.0, k as f32 - 20.0))
+        });
+        times(&mut h, "shape tool: pressing", 1, &mut |h, _| {
+            h.drag_at(from)
+        });
+        times(&mut h, "shape tool: drawing", 20, &mut |h, k| {
+            h.hover_at(from + (to - from) * ((k + 1) as f32 / 20.0))
+        });
+        times(&mut h, "shape tool: letting go (added)", 1, &mut |h, _| {
+            h.drop_at(to)
+        });
+        times(&mut h, "shape tool: the frames after", 4, &mut |_, _| {});
+        settle(&mut h);
+        // And a second one, beside it (the first is there to snap to).
+        let (from, to) = (c + Vec2::new(120.0, -40.0), c + Vec2::new(200.0, 40.0));
+        h.hover_at(from);
+        h.run_steps(1);
+        h.drag_at(from);
+        h.run_steps(1);
+        for k in 1..=4 {
+            h.hover_at(from + (to - from) * (k as f32 / 4.0));
+            h.run_steps(1);
+        }
+        times(&mut h, "a second shape: letting go", 1, &mut |h, _| {
+            h.drop_at(to)
+        });
+        times(
+            &mut h,
+            "a second shape: the frames after",
+            4,
+            &mut |_, _| {},
+        );
+        settle(&mut h);
+
+        // A triangle with the Pen.
+        h.key_press(egui::Key::P);
+        h.run_steps(2);
+        let pts = [
+            c + Vec2::new(-200.0, 120.0),
+            c + Vec2::new(-120.0, 120.0),
+            c + Vec2::new(-160.0, 60.0),
+        ];
+        times(&mut h, "pen: hovering", 20, &mut |h, k| {
+            h.hover_at(pts[0] + Vec2::new(k as f32 * 2.0 - 40.0, 0.0))
+        });
+        let mut clicks = Vec::new();
+        for p in pts {
+            h.hover_at(p);
+            clicks.push(step_ms(&mut h));
+            h.drag_at(p);
+            clicks.push(step_ms(&mut h));
+            h.drop_at(p);
+            clicks.push(step_ms(&mut h));
+        }
+        report_both("pen: placing three points", &clicks);
+        times(&mut h, "pen: Enter (the path is added)", 1, &mut |h, _| {
+            h.key_press(egui::Key::Enter)
+        });
+        times(&mut h, "pen: the frames after", 4, &mut |_, _| {});
+        settle(&mut h);
+
+        // The Selection tool: the first rectangle picked and moved, with
+        // smart guides and without.
+        h.key_press(egui::Key::V);
+        h.run_steps(2);
+        let n = h.state().doc.shapes.len();
+        let i = n - 3;
+        for guides in [true, false] {
+            h.state_mut().view_tools.smart_guides = guides;
+            let at = h.state().view.to_screen(
+                rect,
+                crate::app::shape_bounds(&h.state().doc.shapes[i]).center(),
+            );
+            let with = if guides { "guides on" } else { "guides off" };
+            h.state_mut().set_selection(&[]);
+            h.run_steps(2);
+            h.hover_at(at);
+            h.run_steps(1);
+            times(
+                &mut h,
+                &format!("move, {with}: pressing"),
+                1,
+                &mut |h, _| h.drag_at(at),
+            );
+            times(
+                &mut h,
+                &format!("move, {with}: the first frame"),
+                1,
+                &mut |h, _| h.hover_at(at + Vec2::new(6.0, 2.0)),
+            );
+            times(
+                &mut h,
+                &format!("move, {with}: dragging"),
+                30,
+                &mut |h, k| h.hover_at(at + Vec2::new(k as f32 * 4.0 + 10.0, k as f32 * 1.5 + 3.0)),
+            );
+            times(
+                &mut h,
+                &format!("move, {with}: letting go"),
+                1,
+                &mut |h, _| h.drop_at(at + Vec2::new(126.0, 46.5)),
+            );
+            times(
+                &mut h,
+                &format!("move, {with}: the frames after"),
+                4,
+                &mut |_, _| {},
+            );
+            settle(&mut h);
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+            h.run_steps(3);
+            settle(&mut h);
+        }
+        // An object of the design itself, the same way (guides on).
+        h.state_mut().view_tools.smart_guides = true;
+        let at = h.state().view.to_screen(
+            rect,
+            crate::app::shape_bounds(&h.state().doc.shapes[0]).center(),
+        );
+        h.state_mut().set_selection(&[0]);
+        h.run_steps(2);
+        h.hover_at(at);
+        h.run_steps(1);
+        times(&mut h, "move one of its own: pressing", 1, &mut |h, _| {
+            h.drag_at(at)
+        });
+        times(&mut h, "move one of its own: dragging", 30, &mut |h, k| {
+            h.hover_at(at + Vec2::new(k as f32 * 4.0 + 10.0, k as f32 * 1.5 + 3.0))
+        });
+        times(&mut h, "move one of its own: letting go", 1, &mut |h, _| {
+            h.drop_at(at + Vec2::new(126.0, 46.5))
+        });
+        times(
+            &mut h,
+            "move one of its own: the frames after",
+            4,
+            &mut |_, _| {},
+        );
+        settle(&mut h);
+        // Idle with the new shape selected, and the pointer over it.
+        h.state_mut().set_selection(&[i]);
+        h.run_steps(2);
+        times(&mut h, "idle, the new shape selected", 10, &mut |_, _| {});
+        // Undo and redo of the last thing.
+        times(&mut h, "undo", 1, &mut |h, _| {
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z)
+        });
+        times(&mut h, "undo: the frames after", 3, &mut |_, _| {});
+    }
+}
+
+/// Wait for a plan the worker is making.
+fn settle(h: &mut Harness<'static, Studio>) {
+    for _ in 0..2000 {
+        if !h.state().planner.pending && !h.state().dirty {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+}
+
+/// One frame: its UI pass (ms), that less the painter's drawing of the
+/// stitches (with `TL_PROFILE`), the tessellation of what it painted
+/// apart from the stitches, and its sections.
+fn step_ms(h: &mut Harness<'static, Studio>) -> (f64, f64, f64, String) {
+    crate::profile::clear();
+    let t = std::time::Instant::now();
+    h.step();
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let shapes: Vec<_> = h
+        .output()
+        .shapes
+        .iter()
+        .filter(|s| !matches!(s.shape, egui::Shape::Mesh(_)))
+        .cloned()
+        .collect();
+    let t = std::time::Instant::now();
+    let _ = h.ctx.tessellate(shapes, 2.0);
+    let paint = t.elapsed().as_secs_f64() * 1000.0;
+    let sections = [
+        "input",
+        "plan",
+        "snapshot",
+        "d:stitch",
+        "d:transform",
+        "d:lettering",
+        "d:threads",
+        "d:document",
+        "d:objects",
+        "d:agent",
+        "chrome+docks",
+        "c:pick",
+        "c:tools",
+        "c:stitches",
+        "c:overlays",
+        "c:sel_points",
+        "c:selected",
+        "canvas",
+        "typing_box",
+        "undo+session",
+    ]
+    .iter()
+    .map(|s| (s, crate::profile::last(s)))
+    .filter(|(_, ms)| *ms >= 0.3)
+    .map(|(s, ms)| format!("{s} {ms:.1}"))
+    .collect::<Vec<_>>()
+    .join(", ");
+    (ms, ms - crate::profile::last("c:stitches"), paint, sections)
+}
+
+fn report_both(what: &str, ms: &[(f64, f64, f64, String)]) {
+    let n = ms.len() as f64;
+    let mean = ms.iter().map(|m| m.0).sum::<f64>() / n;
+    let worst = ms
+        .iter()
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .cloned()
+        .unwrap_or_default();
+    let ui_mean = ms.iter().map(|m| m.1).sum::<f64>() / n;
+    let ui_max = ms.iter().map(|m| m.1).fold(0.0, f64::max);
+    let paint_mean = ms.iter().map(|m| m.2).sum::<f64>() / n;
+    let paint_max = ms.iter().map(|m| m.2).fold(0.0, f64::max);
+    println!(
+        "  {what:<38} ui {mean:6.2} / {:6.2}   less stitches {ui_mean:6.2} / {ui_max:6.2}   tessellation {paint_mean:5.2} / {paint_max:5.2}   [{}]",
+        worst.0, worst.3
+    );
+}
+
+fn times(
+    h: &mut Harness<'static, Studio>,
+    what: &str,
+    n: usize,
+    f: &mut dyn FnMut(&mut Harness<'static, Studio>, usize),
+) {
+    let ms: Vec<_> = (0..n)
+        .map(|k| {
+            f(h, k);
+            step_ms(h)
+        })
+        .collect();
+    report_both(what, &ms);
+}
+
+/// Stepping through the font menu with the arrow keys: what each step
+/// costs. First the menu by itself (every installed font listed, one
+/// step a frame); then the text taking each font in turn, on an empty
+/// canvas or (with `ZIGZAG_DESIGN`) on a design of your own: the switch
+/// (the SVG rewritten and read back), the frame after it (the plan, when
+/// it's made there), and how long until the stitches are the new font's.
+///
+/// `cargo test --release --features gui --bin zigzag-studio perf_bench::stepping -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn stepping_through_fonts() {
+    let fonts = zigzag::document::font_families();
+    println!("{} font families", fonts.len());
+    // The menu alone.
+    {
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(300.0, 400.0))
+            .build_ui_state(
+                {
+                    let fonts = fonts.clone();
+                    move |ui, s: &mut (String, String)| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            crate::lettering::font_list(ui, &mut s.0, &fonts, &mut s.1);
+                        });
+                    }
+                },
+                (fonts[fonts.len() / 3].clone(), String::new()),
+            );
+        h.run_steps(3);
+        let idle: Vec<f64> = (0..10)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                h.step();
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        report("the menu, idle", &idle);
+        let step: Vec<f64> = (0..20)
+            .map(|_| {
+                h.key_press(egui::Key::ArrowDown);
+                let t = std::time::Instant::now();
+                h.step();
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        report("the menu, a step down", &step);
+    }
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(1600.0, 1000.0))
+        .build_ui_state(
+            |ui, s: &mut Studio| s.frame(ui),
+            Studio::with_file(None, None),
+        );
+    h.state_mut().planner.timed = true;
+    if let Ok(file) = std::env::var("ZIGZAG_DESIGN") {
+        let doc = zigzag::document::Document::open(std::path::Path::new(&file)).unwrap();
+        h.state_mut().set_document(doc);
+    }
+    h.run_steps(5);
+    settle(&mut h);
+    let text = std::env::var("ZIGZAG_TEXT").unwrap_or_else(|_| "Campfire Club".into());
+    let spec = zigzag::document::TextSpec {
+        text,
+        ..Default::default()
+    };
+    let i = h.state_mut().add_lettering(&spec, (0.0, 0.0)).unwrap();
+    h.run_steps(3);
+    settle(&mut h);
+    println!(
+        "{} objects, {} stitches; the text is {} stitches",
+        h.state().doc.shapes.len(),
+        h.state().design.stitch_count(),
+        h.state().design.per_shape[i],
+    );
+    let from = fonts.iter().position(|f| *f == spec.font).unwrap_or(0);
+    let (mut switch, mut frame, mut landed, mut plans) = (vec![], vec![], vec![], vec![]);
+    let mut slowest: (f64, String) = (0.0, String::new());
+    let mut on_worker = 0;
+    let mut rows: Vec<(f64, String)> = Vec::new();
+    let n: usize = std::env::var("ZIGZAG_FONTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    for font in fonts.iter().cycle().skip(from + 1).take(n) {
+        let i = h.state().sel_index().unwrap();
+        let mut next = h.state().doc.lettering(i).unwrap();
+        next.font = font.clone();
+        let t = std::time::Instant::now();
+        h.state_mut().update_lettering(i, &next).unwrap();
+        let a = t.elapsed().as_secs_f64() * 1000.0;
+        let (b, _, _, sections) = step_ms(&mut h);
+        let worker = h.state().planner.pending;
+        if worker {
+            on_worker += 1;
+        }
+        for _ in 0..5000 {
+            if !h.state().planner.pending && !h.state().dirty {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+            h.step();
+        }
+        let whole = t.elapsed().as_secs_f64() * 1000.0;
+        switch.push(a);
+        frame.push(b);
+        landed.push(whole);
+        plans.push(h.state().plan_ms);
+        if whole > slowest.0 {
+            slowest = (whole, font.clone());
+        }
+        rows.push((
+            b,
+            format!(
+                "{font:<34} switch {a:6.1}  frame {b:8.1} [{sections}]  plan {:8.1}{}  stitches {}",
+                h.state().plan_ms,
+                if worker { " (worker)" } else { "" },
+                h.state().design.stitch_count()
+            ),
+        ));
+    }
+    rows.sort_by(|x, y| y.0.total_cmp(&x.0));
+    for (_, r) in rows.iter().take(12) {
+        println!("  {r}");
+    }
+    println!("  ...");
+    for (_, r) in rows.iter().skip(rows.len() / 2).take(3) {
+        println!("  {r}");
+    }
+    times(&mut h, "idle, the text selected", 10, &mut |_, _| {});
+    report("the switch (SVG rewritten, read back)", &switch);
+    report("the frame after", &frame);
+    report("the plan", &plans);
+    report("until the stitches are the font's", &landed);
+    println!(
+        "{on_worker} of {n} planned in the background; the slowest was {} ({:.0} ms)",
+        slowest.1, slowest.0
     );
 }

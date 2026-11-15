@@ -59,6 +59,8 @@ impl Appearance {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     pub appearance: Appearance,
+    /// How large the interface is drawn, in percent (see `ui_scale`).
+    pub ui_size: u32,
     /// Draw stitches on the GPU when there is one.
     pub gpu: bool,
     /// Run the server agents connect to (MCP), on this port. Read when the
@@ -80,6 +82,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Prefs {
             appearance: Appearance::System,
+            ui_size: crate::ui_scale::USUAL,
             gpu: true,
             agent_server: true,
             agent_port: crate::mcp::DEFAULT_PORT,
@@ -113,6 +116,13 @@ impl Prefs {
             .and_then(|s| Appearance::ALL.into_iter().find(|a| a.id() == s))
         {
             p.appearance = a;
+        }
+        if let Some(size) = v["interface_size"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| crate::ui_scale::SIZES.contains(n))
+        {
+            p.ui_size = size;
         }
         if let Some(g) = v["gpu"].as_bool() {
             p.gpu = g;
@@ -149,6 +159,7 @@ impl Prefs {
         let Some(path) = &self.path else { return };
         let v = serde_json::json!({
             "appearance": self.appearance.id(),
+            "interface_size": self.ui_size,
             "gpu": self.gpu,
             "agent_server": self.agent_server,
             "agent_port": self.agent_port,
@@ -790,6 +801,40 @@ impl Studio {
             let options = Appearance::ALL.map(|a| (a, a.label()));
             crate::theme::segmented(ui, "settings-appearance", &mut prefs.appearance, &options);
         });
+        let monitor = self.ui_scale.monitor;
+        row(ui, "Interface size", |ui, lid| {
+            egui::ComboBox::from_id_salt("settings-interface-size")
+                .selected_text(format!("{}%", prefs.ui_size))
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    for size in crate::ui_scale::SIZES {
+                        // (One that's in use stays choosable, wherever the
+                        // window has since gone.)
+                        let room = size <= crate::ui_scale::USUAL
+                            || size == prefs.ui_size
+                            || monitor.is_none_or(|m| crate::ui_scale::fits(size, m));
+                        ui.add_enabled_ui(room, |ui| {
+                            ui.selectable_value(&mut prefs.ui_size, size, format!("{size}%"))
+                        })
+                        .response
+                        .on_disabled_hover_text("This display doesn't have room for it.");
+                    }
+                })
+                .response
+                .labelled_by(lid)
+                .on_hover_text("How large everything in the window is drawn");
+        });
+        let in_use = self.ui_size_in_use();
+        note(
+            ui,
+            &if in_use < prefs.ui_size {
+                format!(
+                    "Shown at {in_use}%, the most this display has room for. Panels, text, buttons and the handles on the canvas; your design stays the size it is."
+                )
+            } else {
+                "Panels, text, buttons and the handles on the canvas. Your design stays the size it is.".to_string()
+            },
+        );
 
         group(ui, "Performance", false);
         row(ui, "Stitches", |ui, _| {
@@ -828,6 +873,8 @@ impl Studio {
             self.prefs = prefs;
             self.prefs.save();
             self.apply_prefs();
+            // (The interface size is taken up at the start of a frame.)
+            ui.ctx().request_repaint();
         }
     }
 
@@ -925,6 +972,8 @@ mod tests {
         assert!(p.gpu && p.agent_server && p.agent_log && p.auto_update);
         assert!(p.fold_open("before-you-sew", true) && !p.fold_open("machine-details", false));
         assert_eq!(p.agent_port(), Some(crate::mcp::DEFAULT_PORT));
+        assert_eq!(p.ui_size, 100);
+        p.ui_size = 125;
         p.appearance = Appearance::Dark;
         p.gpu = false;
         p.agent_port = 9000;
@@ -942,7 +991,7 @@ mod tests {
         // as it comes.
         std::fs::write(
             &file,
-            r#"{"appearance":"plaid","gpu":"yes","agent_port":80}"#,
+            r#"{"appearance":"plaid","gpu":"yes","agent_port":80,"interface_size":400}"#,
         )
         .unwrap();
         let odd = Prefs::load_from(Some(file.clone()));
@@ -956,6 +1005,7 @@ mod tests {
         assert!(!kept.fold_open("before-you-sew", true) && kept.fold_open("mcp-tools", false));
         assert_eq!(kept.folds.len(), 2);
         assert_eq!(odd.appearance, Appearance::System);
+        assert_eq!(odd.ui_size, 100, "a size that isn't offered");
         assert!(odd.gpu);
         assert_eq!(odd.agent_port, crate::mcp::DEFAULT_PORT);
         let _ = std::fs::remove_file(&file);

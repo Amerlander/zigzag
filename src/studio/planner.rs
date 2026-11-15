@@ -116,6 +116,16 @@ impl Planner {
         self.slow = ms > SLOW_MS;
     }
 
+    /// The next plan may be slow, however quick the last one was (the
+    /// text has a new font, say): it's the worker's.
+    pub fn expect_slow(&mut self) {
+        #[cfg(test)]
+        if !self.timed {
+            return;
+        }
+        self.slow = true;
+    }
+
     /// A synchronous plan was just made: anything still out is stale.
     pub fn superseded(&mut self) {
         self.generation += 1;
@@ -192,17 +202,16 @@ impl Studio {
                 return;
             }
         };
+        let was = self.design.stitch_count();
         self.design = design;
         self.issues = issues;
+        self.follow_plan(was);
         self.plan_ms = d.ms;
         self.planner.took(d.ms);
         self.planner.pending = false;
         self.replans += 1;
         self.plan_cut = false;
         self.hide_planned_text();
-        if let Some(p) = self.player {
-            self.player = Some(p.min(self.design.stitch_count()));
-        }
     }
 }
 

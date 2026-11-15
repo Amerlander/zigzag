@@ -59,6 +59,8 @@ pub enum Action {
     /// Open the issues list (in the status bar).
     ShowIssues,
     TransformAgain,
+    /// Object › Rotate…: the Rotate tool's window, for an exact angle.
+    RotateDialog,
     Pathfinder(zigzag::boolean::PathOp),
     OffsetPath,
     OutlineStroke,
@@ -153,6 +155,13 @@ const fn cmd_shift(key: Key) -> Option<Sc> {
     Some(Sc {
         key,
         cmd: true,
+        shift: true,
+    })
+}
+const fn shift(key: Key) -> Option<Sc> {
+    Some(Sc {
+        key,
+        cmd: false,
         shift: true,
     })
 }
@@ -268,6 +277,9 @@ pub fn menus() -> Vec<(&'static str, Vec<Entry>)> {
                 Sub("Stitch Type", kinds),
                 Sep,
                 Item(Action::TransformAgain, "Transform Again", cmd(Key::D)),
+                // (R alone is the Run stitch.)
+                Item(Action::Tool(Tool::Rotate), "Rotate Tool", shift(Key::R)),
+                Item(Action::RotateDialog, "Rotate…", None),
                 Item(Action::FlipH, "Flip Horizontal", None),
                 Item(Action::FlipV, "Flip Vertical", None),
                 Item(Action::RotateLeft, "Rotate Left 90°", None),
@@ -483,7 +495,7 @@ pub fn issue_url() -> String {
 }
 
 /// Tools, with their single-key shortcuts (handled with the rest).
-pub const TOOLS: [(Tool, &str, Key); 9] = [
+pub const TOOLS: [(Tool, &str, Key); 12] = [
     (Tool::Select, "Select", Key::V),
     (Tool::Direct, "Direct Selection", Key::A),
     (Tool::Hand, "Hand", Key::H),
@@ -493,6 +505,10 @@ pub const TOOLS: [(Tool, &str, Key); 9] = [
     (Tool::Angle, "Fill Angle", Key::G),
     (Tool::Measure, "Measure", Key::I),
     (Tool::Text, "Type", Key::T),
+    // (In groups: the tool strip shows them in their group's slot.)
+    (Tool::Lasso, "Lasso", Key::Q),
+    (Tool::Knife, "Knife", Key::K),
+    (Tool::Eyedropper, "Eyedropper", Key::E),
 ];
 
 fn walk(entries: &[Entry], out: &mut Vec<(Action, &'static str, Option<Sc>)>) {
@@ -618,6 +634,7 @@ impl Studio {
             | Action::RotateRight
             | Action::CenterInHoop
             | Action::TransformAgain
+            | Action::RotateDialog
             | Action::OffsetPath
             | Action::OutlineStroke
             | Action::AddOutline
@@ -676,7 +693,9 @@ impl Studio {
     }
 
     pub fn run_action(&mut self, a: Action) {
-        if !self.action_enabled(a) {
+        // An Open / Save panel is up (a sheet, on macOS, which leaves the
+        // menu bar live): the window waits for it.
+        if self.file_dialog_open() || !self.action_enabled(a) {
             return;
         }
         let c = self.selection_bounds().center();
@@ -708,25 +727,18 @@ impl Studio {
                 let mut exts = vec!["svg"];
                 exts.extend(zigzag::formats::READABLE_FORMATS);
                 exts.extend(zigzag::trace::IMAGE_FORMATS);
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Designs", &exts)
-                    .add_filter("SVG artwork", &["svg"])
-                    .add_filter("Images to trace", &zigzag::trace::IMAGE_FORMATS)
-                    .add_filter("Machine files", &zigzag::formats::READABLE_FORMATS)
-                    .pick_file()
-                {
-                    self.load(&p);
-                }
+                let req = crate::file_dialog::Request::open()
+                    .filter("Designs", &exts)
+                    .filter("SVG artwork", &["svg"])
+                    .filter("Images to trace", &zigzag::trace::IMAGE_FORMATS)
+                    .filter("Machine files", &zigzag::formats::READABLE_FORMATS);
+                self.file_dialog(req, crate::file_dialog::Then::Open);
             }
             Action::Place => {
                 let mut exts = vec!["svg"];
                 exts.extend(zigzag::trace::IMAGE_FORMATS);
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Artwork", &exts)
-                    .pick_file()
-                {
-                    self.place_svg(&p);
-                }
+                let req = crate::file_dialog::Request::open().filter("Artwork", &exts);
+                self.file_dialog(req, crate::file_dialog::Then::Place);
             }
             Action::Save => {
                 if self.doc.path.is_some() {
@@ -785,6 +797,7 @@ impl Studio {
                 self.view_tools.smart_guides = !self.view_tools.smart_guides
             }
             Action::TransformAgain => self.transform_again(),
+            Action::RotateDialog => self.open_rotate_dialog(None),
             Action::ToggleTaskBar => self.dock.task_bar = !self.dock.task_bar,
             Action::IconicPanels => {
                 self.dock.iconic[1] = !self.dock.iconic[1];
@@ -894,15 +907,23 @@ impl Studio {
         if self.tool == Tool::Pen && t != Tool::Pen && !self.view_tools.pen.is_empty() {
             self.finish_pen(false);
         }
-        if crate::flyout::PEN_GROUP.iter().any(|g| g.0 == t) {
-            self.view_tools.pen_slot = t;
+        if self.tool == Tool::Curvature && t != Tool::Curvature {
+            self.finish_curvature(false);
         }
-        if crate::flyout::BRUSH_GROUP.iter().any(|g| g.0 == t) {
-            self.view_tools.brush_slot = t;
+        if let Some(slot) = crate::flyout::Group::of(t).and_then(|g| self.view_tools.slot(g)) {
+            *slot = t;
         }
+        // (The points the Lasso selected are Direct Selection's to move,
+        // and the other way round.)
+        let keep_points = matches!(
+            (self.tool, t),
+            (Tool::Lasso, Tool::Direct) | (Tool::Direct, Tool::Lasso)
+        );
         self.tool = t;
         self.view_tools.pen.clear();
-        self.path_edit.selected.clear();
+        if !keep_points {
+            self.path_edit.selected.clear();
+        }
         self.cancel_point_drag();
         self.path_edit.show_all = false;
     }
@@ -925,6 +946,24 @@ impl Studio {
         {
             self.set_tool(Tool::Anchor);
             return;
+        }
+        // Shift+M, Shift+B and Shift+` are the Shape Builder, the Blob Brush
+        // and Curvature, as in Illustrator: taken before M and B alone.
+        if !ctx.egui_wants_keyboard_input() {
+            let t = ctx.input_mut(|i| {
+                [
+                    (Key::M, Tool::ShapeBuilder),
+                    (Key::B, Tool::Blob),
+                    (Key::Backtick, Tool::Curvature),
+                ]
+                .into_iter()
+                .find(|(k, _)| i.consume_key(Modifiers::SHIFT, *k))
+                .map(|(_, t)| t)
+            });
+            if let Some(t) = t {
+                self.set_tool(t);
+                return;
+            }
         }
         // + (or =) and - : Add and Delete Anchor Point, as in Illustrator.
         if !ctx.egui_wants_keyboard_input() {

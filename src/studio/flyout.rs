@@ -1,6 +1,9 @@
 //! Tool groups, Illustrator-style. A slot in the tool strip holds a group
-//! (the Pen's: Pen, Add Anchor Point, Delete Anchor Point, Anchor Point; the
-//! Brush's: Brush, Smooth, Path Eraser, Join; the shapes'), showing the one last used. Press and hold it, or right-click,
+//! (Direct Selection's: with the Lasso; the Pen's: Pen, Curvature, Add
+//! Anchor Point, Delete Anchor Point, Anchor Point; the Brush's: Brush,
+//! Blob Brush, Smooth, Path Eraser, Join; the shapes'; the Shape Builder's:
+//! with the Knife; the Eyedropper's: with Measure), showing the one last
+//! used. Press and hold it, or right-click,
 //! for the flyout: each tool with its icon and key, a square beside the one
 //! in the slot; release or click on one to take it. Option-click the slot to
 //! step through the group. The strip at the flyout's right edge tears the
@@ -11,9 +14,24 @@ use crate::icons::{self, Icon};
 use crate::theme::{icon_button, pal_ui};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
-/// Illustrator's Pen group: (tool, name, key, icon).
-pub const PEN_GROUP: [(Tool, &str, &str, Icon); 4] = [
+/// One tool of a group: (tool, name, key, icon).
+type Entry = (Tool, &'static str, &'static str, Icon);
+
+/// The tools that select parts of things: points, by hand or by a loop.
+pub const DIRECT_GROUP: [Entry; 2] = [
+    (Tool::Direct, "Direct Selection Tool", "A", Icon::Direct),
+    (Tool::Lasso, "Lasso Tool", "Q", Icon::Lasso),
+];
+
+/// Illustrator's Pen group, and its Curvature tool.
+pub const PEN_GROUP: [Entry; 5] = [
     (Tool::Pen, "Pen Tool", "P", Icon::Pen),
+    (
+        Tool::Curvature,
+        "Curvature Tool",
+        "Shift+`",
+        Icon::Curvature,
+    ),
     (Tool::AddAnchor, "Add Anchor Point Tool", "+", Icon::PenAdd),
     (
         Tool::DeleteAnchor,
@@ -29,27 +47,94 @@ pub const PEN_GROUP: [(Tool, &str, &str, Icon); 4] = [
     ),
 ];
 
-/// VectorCraft's Brush group: the Brush and the path clean-up tools.
-pub const BRUSH_GROUP: [(Tool, &str, &str, Icon); 4] = [
+/// VectorCraft's Brush group: the brushes and the path clean-up tools.
+pub const BRUSH_GROUP: [Entry; 5] = [
     (Tool::Brush, "Brush Tool", "B", Icon::Brush),
+    (Tool::Blob, "Blob Brush Tool", "Shift+B", Icon::BlobBrush),
     (Tool::Smooth, "Smooth Tool", "", Icon::Smooth),
     (Tool::PathEraser, "Path Eraser Tool", "", Icon::PathEraser),
     (Tool::Join, "Join Tool", "", Icon::Join),
 ];
 
+/// The tools that make shapes out of shapes: joining their parts, and
+/// cutting them.
+pub const BUILD_GROUP: [Entry; 2] = [
+    (
+        Tool::ShapeBuilder,
+        "Shape Builder Tool",
+        "Shift+M",
+        Icon::ShapeBuilder,
+    ),
+    (Tool::Knife, "Knife Tool", "K", Icon::Knife),
+];
+
+/// Illustrator's Eyedropper group: the tools that read the design.
+pub const SAMPLE_GROUP: [Entry; 2] = [
+    (Tool::Eyedropper, "Eyedropper Tool", "E", Icon::Eyedropper),
+    (Tool::Measure, "Measure Tool", "I", Icon::Measure),
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
+    Direct,
     Pen,
     Shape,
     Brush,
+    Build,
+    Sample,
 }
 
 impl Group {
+    /// The groups of tools (the shapes' is of kinds of one tool).
+    const OF_TOOLS: [Group; 5] = [
+        Group::Direct,
+        Group::Pen,
+        Group::Brush,
+        Group::Build,
+        Group::Sample,
+    ];
+
     fn title(self) -> &'static str {
         match self {
+            Group::Direct => "Direct Selection Tools",
             Group::Pen => "Pen Tools",
             Group::Shape => "Shape Tools",
             Group::Brush => "Brush Tools",
+            Group::Build => "Shape Builder Tools",
+            Group::Sample => "Eyedropper Tools",
+        }
+    }
+
+    /// Its tools, in the flyout's order.
+    fn tools(self) -> &'static [Entry] {
+        match self {
+            Group::Direct => &DIRECT_GROUP,
+            Group::Pen => &PEN_GROUP,
+            Group::Brush => &BRUSH_GROUP,
+            Group::Build => &BUILD_GROUP,
+            Group::Sample => &SAMPLE_GROUP,
+            Group::Shape => &[],
+        }
+    }
+
+    /// The group `t` is in, if it's in one.
+    pub fn of(t: Tool) -> Option<Group> {
+        Self::OF_TOOLS
+            .into_iter()
+            .find(|g| g.tools().iter().any(|e| e.0 == t))
+    }
+}
+
+impl crate::view_tools::ViewTools {
+    /// The tool of group `g` that its slot in the tool strip shows.
+    pub fn slot(&mut self, g: Group) -> Option<&mut Tool> {
+        match g {
+            Group::Direct => Some(&mut self.direct_slot),
+            Group::Pen => Some(&mut self.pen_slot),
+            Group::Brush => Some(&mut self.brush_slot),
+            Group::Build => Some(&mut self.build_slot),
+            Group::Sample => Some(&mut self.sample_slot),
+            Group::Shape => None,
         }
     }
 }
@@ -80,27 +165,15 @@ const HOLD: f64 = 0.35;
 
 impl Studio {
     fn group_items(&self, g: Group) -> Vec<Item> {
+        let in_slot = match g {
+            Group::Direct => self.view_tools.direct_slot,
+            Group::Pen => self.view_tools.pen_slot,
+            Group::Brush => self.view_tools.brush_slot,
+            Group::Build => self.view_tools.build_slot,
+            Group::Sample => self.view_tools.sample_slot,
+            Group::Shape => Tool::Shape,
+        };
         match g {
-            Group::Pen => PEN_GROUP
-                .iter()
-                .map(|&(t, name, key, icon)| Item {
-                    icon,
-                    name: name.into(),
-                    key,
-                    in_slot: self.view_tools.pen_slot == t,
-                    active: self.tool == t,
-                })
-                .collect(),
-            Group::Brush => BRUSH_GROUP
-                .iter()
-                .map(|&(t, name, key, icon)| Item {
-                    icon,
-                    name: name.into(),
-                    key,
-                    in_slot: self.view_tools.brush_slot == t,
-                    active: self.tool == t,
-                })
-                .collect(),
             Group::Shape => crate::shapes::KINDS
                 .iter()
                 .map(|&k| Item {
@@ -111,18 +184,28 @@ impl Studio {
                     active: self.tool == Tool::Shape && self.shapes.kind == k,
                 })
                 .collect(),
+            _ => g
+                .tools()
+                .iter()
+                .map(|&(t, name, key, icon)| Item {
+                    icon,
+                    name: name.into(),
+                    key,
+                    in_slot: in_slot == t,
+                    active: self.tool == t,
+                })
+                .collect(),
         }
     }
 
     /// Take tool `k` of group `g`.
     fn choose(&mut self, g: Group, k: usize) {
         match g {
-            Group::Pen => self.set_tool(PEN_GROUP[k].0),
-            Group::Brush => self.set_tool(BRUSH_GROUP[k].0),
             Group::Shape => {
                 self.shapes.kind = crate::shapes::KINDS[k];
                 self.set_tool(Tool::Shape);
             }
+            _ => self.set_tool(g.tools()[k].0),
         }
     }
 

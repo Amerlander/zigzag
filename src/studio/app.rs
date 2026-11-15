@@ -50,11 +50,17 @@ pub enum Tool {
     Select,
     /// Illustrator's Direct Selection: points, handles and segments.
     Direct,
+    /// Lasso (Q): draw a loop round points, or round objects, to select
+    /// them.
+    Lasso,
     /// Drag to pan the view.
     Hand,
     Angle,
     /// Draw shapes, lines or manual stitches point by point.
     Pen,
+    /// Curvature (Shift+`): click points and the curve runs smoothly
+    /// through them, with no handles to drag.
+    Curvature,
     /// Illustrator's Anchor Point tool (Shift+C): convert points, pull out
     /// or take in handles, bend segments.
     Anchor,
@@ -64,15 +70,28 @@ pub enum Tool {
     DeleteAnchor,
     /// Paint a smoothed line (satin or run).
     Brush,
+    /// Blob Brush (Shift+B): paint a filled shape, which joins the fills
+    /// in the same thread that it touches.
+    Blob,
     /// Smooth: drag along a selected path to take the wobble out of it.
     Smooth,
     /// Path Eraser: drag across a selected path to cut that part away.
     PathEraser,
     /// Join: scrub between two open ends to join them.
     Join,
+    /// Shape Builder (Shift+M): drag across the parts of overlapping
+    /// shapes to make one shape of them; Alt takes a part away.
+    ShapeBuilder,
+    /// Knife (K): draw a cut across filled shapes.
+    Knife,
     /// Rectangle, Ellipse, Polygon, Star and Line.
     Shape,
+    /// Rotate (Shift+R): turn the selection about a point you place.
+    Rotate,
     Measure,
+    /// Eyedropper (E): click an object to give the selection its thread
+    /// and stitch settings.
+    Eyedropper,
     /// Not a mode: opens the Add Text window.
     Text,
 }
@@ -151,6 +170,9 @@ pub struct Studio {
     /// hidden) taken out of it (`drop_planned`): good to look at until the
     /// next plan, not to sew.
     pub(crate) plan_cut: bool,
+    /// What shows under the objects a gesture carries, until their
+    /// stitches are planned again (see `backing`).
+    pub(crate) backing: Option<crate::backing::Backing>,
     /// What the last plan can lend the next (see `PlanCache`).
     pub(crate) plan_cache: zigzag::design::PlanCache,
     /// An MCP batch is running: edits re-plan once at its end (or before a
@@ -210,6 +232,8 @@ pub struct Studio {
     pub redo: Vec<Document>,
     pub(crate) editing: bool,
     pub(crate) pending_history: Option<History>,
+    /// An Open / Save As / Export panel on screen (a sheet on macOS).
+    pub(crate) file_dialog: Option<crate::file_dialog::Pending>,
 
     pub status: String,
     pub(crate) title: String,
@@ -225,6 +249,8 @@ pub struct Studio {
     pub(crate) crash: Option<std::path::PathBuf>,
     /// The About window is open.
     pub(crate) about: bool,
+    /// Keeping the interface at the size Settings says (see `ui_scale`).
+    pub(crate) ui_scale: crate::ui_scale::UiScale,
     /// The file agents' tool calls are logged to (none in tests).
     pub(crate) agent_log: crate::agent_log::AgentLog,
     /// The UI context, for waking the window from background work.
@@ -272,6 +298,7 @@ impl Studio {
         s.dock_saved = s.dock.clone();
         s.egui_ctx = Some(cc.egui_ctx.clone());
         s.prefs = crate::settings::Prefs::load();
+        crate::ui_scale::install(&cc.egui_ctx, s.prefs.ui_size);
         s.apply_prefs();
         s.apply_agent_log();
         // (Not while a script is taking pictures.)
@@ -446,6 +473,7 @@ impl Studio {
             open_issues: false,
             replans: 0,
             plan_cut: false,
+            backing: None,
             plan_cache: Default::default(),
             batching: false,
             planner: Default::default(),
@@ -473,6 +501,7 @@ impl Studio {
             redo: Vec::new(),
             editing: false,
             pending_history: None,
+            file_dialog: None,
             status: "Open an SVG (or drop one on the window).".into(),
             title: String::new(),
             mcp: None,
@@ -482,6 +511,7 @@ impl Studio {
             updates_on: false,
             crash: None,
             about: false,
+            ui_scale: Default::default(),
             egui_ctx: None,
             machine: Default::default(),
             sew_mesh: Default::default(),
@@ -555,7 +585,15 @@ impl Studio {
         self.stable = self.doc.clone();
         self.selected = None;
         self.layout.multi.clear();
+        // Which groups are open in Layers was the last document's.
+        self.layout.expanded.clear();
+        self.open_lone_groups();
         self.drag = None;
+        self.backing = None;
+        // (And what a tool was part way through was on it too.)
+        self.view_tools.curve = Default::default();
+        self.view_tools.lasso.clear();
+        self.view_tools.build.cancel();
         self.undo.clear();
         self.redo.clear();
         self.player = None;
@@ -582,8 +620,10 @@ impl Studio {
         });
         match planned {
             Ok((design, issues)) => {
+                let was = self.design.stitch_count();
                 self.design = design;
                 self.issues = issues;
+                self.follow_plan(was);
             }
             Err(e) => {
                 self.status = format!(
@@ -604,10 +644,16 @@ impl Studio {
         self.planner.took(self.plan_ms);
         self.planner.superseded();
         self.names = svg::display_names(&self.doc.shapes);
-        if let Some(p) = self.player {
-            self.player = Some(p.min(self.design.stitch_count()));
-        }
         self.dirty = false;
+    }
+
+    /// The stitch position after a new plan, whose last had `was`
+    /// stitches. Played to the end, it stays at the end, so stitches the
+    /// edit added (a paste, a duplicate) show; part way through, it stays
+    /// where it is, or goes to the end if the plan is now shorter than that.
+    pub(crate) fn follow_plan(&mut self, was: usize) {
+        let now = self.design.stitch_count();
+        self.player = self.player.filter(|&p| p < was && p < now);
     }
 
     fn snapshot(&self) -> Snap {
@@ -907,15 +953,20 @@ impl Studio {
                 &self.doc.name
             }
         );
-        let mut dialog = rfd::FileDialog::new()
-            .add_filter("SVG", &["svg"])
-            .set_file_name(&name);
-        if let Some(dir) = self.doc.path.as_ref().and_then(|p| p.parent()) {
-            dialog = dialog.set_directory(dir);
-        }
-        if let Some(p) = dialog.save_file() {
-            self.save(Some(&p));
-        }
+        let req = crate::file_dialog::Request::save()
+            .filter("SVG", &["svg"])
+            .file_name(name)
+            .directory(self.doc_dir());
+        self.file_dialog(req, crate::file_dialog::Then::SaveAs);
+    }
+
+    /// The open document's folder, where its panels start.
+    fn doc_dir(&self) -> Option<PathBuf> {
+        self.doc
+            .path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
     }
 
     pub fn export_to(&mut self, ext: &str, path: &Path) -> anyhow::Result<()> {
@@ -933,7 +984,7 @@ impl Studio {
         Ok(())
     }
 
-    pub(crate) fn export_dialog(&mut self, ext: &str) {
+    pub(crate) fn export_dialog(&mut self, ext: &'static str) {
         let default = format!(
             "{}.{ext}",
             if self.doc.name.is_empty() {
@@ -942,19 +993,11 @@ impl Studio {
                 &self.doc.name
             }
         );
-        let mut dialog = rfd::FileDialog::new()
-            .add_filter(ext.to_uppercase(), &[ext])
-            .set_file_name(&default);
-        if let Some(dir) = self.doc.path.as_ref().and_then(|p| p.parent()) {
-            dialog = dialog.set_directory(dir);
-        }
-        let Some(path) = dialog.save_file() else {
-            return;
-        };
-        self.status = match self.export_to(ext, &path) {
-            Ok(()) => format!("Exported {}", path.display()),
-            Err(e) => format!("Couldn't export {}: {e}", path.display()),
-        };
+        let req = crate::file_dialog::Request::save()
+            .filter(ext.to_uppercase(), &[ext])
+            .file_name(default)
+            .directory(self.doc_dir());
+        self.file_dialog(req, crate::file_dialog::Then::Export(ext));
     }
 
     /// Set the stitch type of every selected object that can take it.
@@ -999,21 +1042,7 @@ impl Studio {
         let mut n = 0;
         let _ = self.structural(|d| {
             for &i in &idx {
-                let own = d.shapes[i].params.clone();
-                let kind = src
-                    .kind
-                    .filter(|k| allowed_kinds(&d.shapes[i]).contains(k))
-                    .or(own.kind);
-                d.shapes[i].params = Params {
-                    kind,
-                    thread: own.thread,
-                    order: own.order,
-                    start: own.start,
-                    end: own.end,
-                    trim: own.trim,
-                    stop: own.stop,
-                    ..src.clone()
-                };
+                give_settings(&mut d.shapes[i], &src);
                 n += 1;
             }
             Ok(())
@@ -1151,6 +1180,7 @@ impl Studio {
 
 impl eframe::App for Studio {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_file_dialog();
         if let Some(c) = &mut self.capture {
             c.frame(ctx);
         }
@@ -1215,7 +1245,11 @@ impl Studio {
         // Calls wait while a dialog previews into the document, and while
         // something is dragged: the drag works from the document as it was
         // when it began, and would drop an edit made under it.
-        if self.previewing() || self.drag.is_some() || self.path_edit.drag.is_some() {
+        if self.previewing()
+            || self.file_dialog_open()
+            || self.drag.is_some()
+            || self.path_edit.drag.is_some()
+        {
             return false;
         }
         let calls: Vec<crate::mcp::Call> = match &self.mcp {
@@ -1242,6 +1276,7 @@ impl Studio {
         let ctx = ui.ctx().clone();
         crate::units::set_current(self.dock.units);
         crate::profile::begin();
+        self.sync_ui_scale(&ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -1362,6 +1397,7 @@ impl Studio {
         self.cleanup_window(&ctx);
         self.swatch_window(&ctx);
         self.shape_window(&ctx);
+        self.rotate_window(&ctx);
         self.trace_window(&ctx);
         self.close_prompt(&ctx);
         self.quit_prompt(&ctx);
@@ -1448,7 +1484,14 @@ impl Studio {
         if self.lettering.typing.is_some() {
             return;
         }
-        if self.pen_keys(ctx) || self.direct_keys(ctx) || self.shape_keys(ctx) {
+        if self.pen_keys(ctx)
+            || self.curvature_keys(ctx)
+            || self.lasso_keys(ctx)
+            || self.build_keys(ctx)
+            || self.direct_keys(ctx)
+            || self.shape_keys(ctx)
+            || self.rotate_keys(ctx)
+        {
             return;
         }
         self.action_shortcuts(ctx);
@@ -1489,7 +1532,9 @@ impl Studio {
         let step = self.player_acc.floor() as usize;
         self.player_acc -= step as f32;
         let p = (self.player.unwrap_or(0) + step).min(total);
-        self.player = Some(p);
+        // (At the end it's the whole design again, not a stitch count that
+        // the next edit's stitches would be past.)
+        self.player = (p < total).then_some(p);
         if p >= total {
             self.playing = false;
         }
@@ -1707,6 +1752,9 @@ impl Studio {
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
+        // (The panels beside the canvas find their widths over the first
+        // frame or two: a fit made before then is made again.)
+        let settled = self.canvas_rect == rect;
         self.canvas_rect = rect;
         let ctx = ui.ctx().clone();
         let pal = crate::theme::pal(&ctx);
@@ -1725,7 +1773,10 @@ impl Studio {
                     (b.height() / 10.0).max(20.0),
                 );
             }
-            self.fit_pending = false;
+            self.fit_pending = !settled;
+            if !settled {
+                ctx.request_repaint();
+            }
         }
 
         // Zoom: a mouse's wheel, a pinch, or ⌘ and a scroll. Pan: a
@@ -1821,6 +1872,15 @@ impl Studio {
             self.point_tool_canvas(&ctx, &resp, rect, tol, alt);
         }
         let marker_busy = !space && self.markers_canvas(&ctx, &resp, rect);
+        if self.tool == Tool::Rotate && !space && !marker_busy {
+            let mods = crate::layout::DragMods {
+                shift,
+                alt,
+                snap: false,
+                tol,
+            };
+            self.rotate_canvas(&ctx, &resp, rect, mods);
+        }
         // A corner's widget takes the pointer before the selection box's
         // handles and the shape under it.
         let corner_busy = !space && !marker_busy && {
@@ -1853,6 +1913,18 @@ impl Studio {
             {
                 let v = hp - self.view.to_screen(rect, center);
                 self.want_cursor(crate::cursors::Glyph::Rotate(v.y.atan2(v.x)));
+            }
+            // Option over something that can be dragged: a drag from here
+            // takes a copy of it (Illustrator's doubled arrow says so).
+            if alt
+                && self.drag.is_none()
+                && self.marquee.is_none()
+                && self.hovered.is_some()
+                && resp
+                    .hover_pos()
+                    .is_some_and(|hp| self.handle_at(rect, hp).is_none())
+            {
+                self.want_cursor(crate::cursors::Glyph::Copy);
             }
             if resp.drag_started_by(egui::PointerButton::Primary) {
                 let start = ctx
@@ -1893,7 +1965,7 @@ impl Studio {
                 };
                 self.update_drag(self.view.to_design(rect, pos), mods);
                 if self.drag.as_ref().is_some_and(|d| d.copy) {
-                    ctx.set_cursor_icon(egui::CursorIcon::Copy);
+                    self.want_cursor(crate::cursors::Glyph::Copy);
                 }
                 ctx.request_repaint();
             }
@@ -2054,6 +2126,7 @@ impl Studio {
             // keyed by its stitches, so a keystroke re-tessellates just
             // that block, once, and the frames between keystrokes reuse it.)
             moving: self.moving_blocks(),
+            copy: self.drag.as_ref().is_some_and(|d| d.copy),
         };
         // While the Skitch sews: the design as sent, faded, and what's
         // sewn so far over it.
@@ -2088,6 +2161,8 @@ impl Studio {
             };
             self.paint_stitches(&painter, rect, d, &sewn_opts, 1, generation)
         } else {
+            // (Under the stitches: the color of what a moved object was over.)
+            self.draw_backing(&painter, rect);
             self.paint_stitches(&painter, rect, &self.design, &opts, 0, self.replans)
         };
         crate::profile::mark("c:stitches");
@@ -2175,8 +2250,9 @@ impl Studio {
                 // (Not while typing into it: the rails of every letter
                 // would be found again at each keystroke.)
                 Kind::Satin if !self.typing_into(i) => {
-                    let info = self.satin_info(i);
-                    canvas::draw_rails(&painter, rect, &self.view, &info);
+                    if let Some(info) = self.satin_info_shown(i) {
+                        canvas::draw_rails(&painter, rect, &self.view, &info);
+                    }
                 }
                 _ => {}
             }
@@ -2185,7 +2261,7 @@ impl Studio {
         self.draw_agent_work(&painter, rect);
         if matches!(
             self.tool,
-            Tool::Direct | Tool::Anchor | Tool::AddAnchor | Tool::DeleteAnchor
+            Tool::Direct | Tool::Lasso | Tool::Anchor | Tool::AddAnchor | Tool::DeleteAnchor
         ) || (self.tool == Tool::Pen && self.view_tools.pen.is_empty())
         {
             self.draw_path_edit(&painter, rect);
@@ -2252,14 +2328,17 @@ impl Studio {
             };
             self.hud(&painter, rect, msg);
         }
+        // (What was under the pointer when the frame began may be gone by
+        // now: a tool has cut it up, or joined it to another.)
         if let Some(i) = self.hovered
+            && let Some(shape) = self.doc.shapes.get(i)
             && self.angle_drag.is_none()
             && self.drag.is_none()
         {
             resp.on_hover_text_at_pointer(format!(
                 "{} · {}",
                 self.names.get(i).cloned().unwrap_or_default(),
-                kind_name(self.doc.shapes[i].params.kind.unwrap_or(Kind::Fill))
+                kind_name(shape.params.kind.unwrap_or(Kind::Fill))
             ));
         }
     }
@@ -2296,6 +2375,30 @@ pub(crate) fn snapshot_of(d: &Document) -> Snap {
             .collect(),
         d.settings.clone(),
     )
+}
+
+/// `src`'s stitch type and settings onto `shape` (the type only if a shape
+/// like it can be sewn that way). It keeps its own thread, its place in
+/// the sewing order, where it starts and ends, its trim and stop, and
+/// whether it's locked or hidden (which say nothing of how it's sewn).
+pub(crate) fn give_settings(shape: &mut Shape, src: &Params) {
+    let own = shape.params.clone();
+    let kind = src
+        .kind
+        .filter(|k| allowed_kinds(shape).contains(k))
+        .or(own.kind);
+    shape.params = Params {
+        kind,
+        thread: own.thread,
+        order: own.order,
+        start: own.start,
+        end: own.end,
+        trim: own.trim,
+        stop: own.stop,
+        lock: own.lock,
+        hide: own.hide,
+        ..src.clone()
+    };
 }
 
 /// Whether any of a shape is inside the box from `lo` to `hi`: a stretch of
@@ -2350,6 +2453,18 @@ pub struct SatinInfo {
 }
 
 impl Studio {
+    /// Object `i`'s [`SatinInfo`] for showing (its rails on the canvas,
+    /// its width in the Stitch panel), unless the stitches for the
+    /// document as it is are still to come. Finding a satin's columns is
+    /// most of the work of planning it (seconds, for a line of text in an
+    /// ornate font), and the plan finds them too, on the worker when it's
+    /// slow, and keeps what it finds where this looks first: so this waits
+    /// for the plan, and then costs next to nothing, rather than stop the
+    /// window to find them before it.
+    pub fn satin_info_shown(&self, i: usize) -> Option<std::rc::Rc<SatinInfo>> {
+        (!self.dirty && !self.planner.pending).then(|| self.satin_info(i))
+    }
+
     /// Object `i`'s [`SatinInfo`], from the memo when it hasn't changed.
     pub fn satin_info(&self, i: usize) -> std::rc::Rc<SatinInfo> {
         use std::hash::{Hash, Hasher};

@@ -58,6 +58,33 @@ struct Piece {
     holes: Vec<Ring>,
 }
 
+/// What a piece is as one column (see [`Piece::column`]).
+enum Found {
+    None,
+    /// A ring round its hole, if that's a column.
+    Ring(Option<Rails>),
+    /// A column between its ends, and whether its stitches stay inside
+    /// the shape. (Whether it may turn corners is the asker's to say.)
+    Open {
+        rails: Rails,
+        valid: bool,
+    },
+}
+
+/// What a search has worked out about the pieces it has come to, by
+/// [`Piece::key`]. Cutting a shape one way and then another leaves the
+/// pieces that the other order does, and the search for columns that
+/// turn corners goes over the ground of the one for columns that don't:
+/// most pieces are met many times, and finding one's column (or that it
+/// has none), its cuts, and what each cut leaves is nearly all the work.
+#[derive(Default)]
+struct Seen {
+    columns: std::collections::HashMap<u64, Found>,
+    cuts: std::collections::HashMap<u64, std::rc::Rc<Vec<(At, At)>>>,
+    /// By piece and which of its cuts.
+    pieces: std::collections::HashMap<(u64, usize), Option<std::rc::Rc<Vec<Piece>>>>,
+}
+
 fn area(pts: &[P]) -> f64 {
     let n = pts.len();
     (0..n).map(|i| cross(pts[i], pts[(i + 1) % n])).sum::<f64>() * 0.5
@@ -468,29 +495,69 @@ impl Piece {
         Some(vec![piece])
     }
 
+    /// A fingerprint of the piece: every point of its outlines, and which
+    /// of their edges are cuts.
+    fn key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.holes.len().hash(&mut h);
+        for r in self.rings() {
+            r.pts.len().hash(&mut h);
+            for p in &r.pts {
+                p.x.to_bits().hash(&mut h);
+                p.y.to_bits().hash(&mut h);
+            }
+            r.cut.hash(&mut h);
+        }
+        h.finish()
+    }
+
     /// This piece as one column, if it is one: between its two cut ends,
     /// from its one cut end to its tip, between its own two tips, or (a
     /// ring) round between its outer outline and its hole.
     /// With `turns`, a column may turn sharp corners (its stitches fanning
     /// round each); without, only straight and curving columns will do.
-    fn column(&self, turns: bool) -> Option<Rails> {
+    fn column(&self, turns: bool, seen: &mut Seen) -> Option<Rails> {
+        let found = seen
+            .columns
+            .entry(self.key())
+            .or_insert_with(|| self.found());
+        match found {
+            Found::None => None,
+            Found::Ring(rails) => rails.clone(),
+            Found::Open { rails, valid } => {
+                if !turns && !rails.sync.is_empty() {
+                    return None;
+                }
+                valid.then(|| rails.clone())
+            }
+        }
+    }
+
+    /// What [`Piece::column`] goes by, whichever columns will do: the
+    /// work of finding it, done once for a piece however often the
+    /// search comes to it.
+    fn found(&self) -> Found {
         let outlines = self.outlines();
         let walls = self.walls();
-        let rails = match self.holes.len() {
-            0 => squared(self.open_column(&outlines, &walls)?),
+        match self.holes.len() {
+            0 => match self.open_column(&outlines, &walls) {
+                Some(rails) => {
+                    let rails = squared(rails);
+                    let valid = valid(&rails, &outlines, &walls);
+                    Found::Open { rails, valid }
+                }
+                None => Found::None,
+            },
             // (Not a ring whose stitches would lean, its outlines turning
             // corners out of step: that one is cut at the corners.)
-            1 if self.rings().all(|r| !r.cut.contains(&true)) => {
-                return super::satin::auto_rails(&outlines)
+            1 if self.rings().all(|r| !r.cut.contains(&true)) => Found::Ring(
+                super::satin::auto_rails(&outlines)
                     .ok()
-                    .filter(|r| lean(std::slice::from_ref(r)) <= RING_LEAN);
-            }
-            _ => return None,
-        };
-        if !turns && !rails.sync.is_empty() {
-            return None;
+                    .filter(|r| lean(std::slice::from_ref(r)) <= RING_LEAN),
+            ),
+            _ => Found::None,
         }
-        valid(&rails, &outlines, &walls).then_some(rails)
     }
 
     fn open_column(&self, outlines: &[Polyline], walls: &[(P, P)]) -> Option<Rails> {
@@ -832,20 +899,37 @@ fn tip_rails(ring: &[P], outlines: &[Polyline], walls: &[(P, P)]) -> Option<Rail
 
 /// The columns `piece` can be sewn as, cutting it up to `depth` more times
 /// (`turns`: see [`Piece::column`]).
-fn solve(piece: &Piece, depth: usize, budget: &mut usize, turns: bool) -> Option<Vec<Rails>> {
+fn solve(
+    piece: &Piece,
+    depth: usize,
+    budget: &mut usize,
+    turns: bool,
+    seen: &mut Seen,
+) -> Option<Vec<Rails>> {
     if *budget == 0 {
         return None;
     }
     *budget -= 1;
-    if let Some(rails) = piece.column(turns) {
+    if let Some(rails) = piece.column(turns, seen) {
         return Some(vec![rails]);
     }
     if depth == 0 {
         return None;
     }
+    let key = piece.key();
+    let cuts = seen
+        .cuts
+        .entry(key)
+        .or_insert_with(|| std::rc::Rc::new(piece.cuts()))
+        .clone();
     let mut tried = 0;
-    for (a, b) in piece.cuts() {
-        let Some(pieces) = piece.cut(a, b) else {
+    for (k, &(a, b)) in cuts.iter().enumerate() {
+        let Some(pieces) = seen
+            .pieces
+            .entry((key, k))
+            .or_insert_with(|| piece.cut(a, b).map(std::rc::Rc::new))
+            .clone()
+        else {
             continue;
         };
         tried += 1;
@@ -854,8 +938,8 @@ fn solve(piece: &Piece, depth: usize, budget: &mut usize, turns: bool) -> Option
         }
         let mut all = Vec::new();
         let mut ok = true;
-        for p in &pieces {
-            match solve(p, depth - 1, budget, turns) {
+        for p in pieces.iter() {
+            match solve(p, depth - 1, budget, turns, seen) {
                 Some(rails) => all.extend(rails),
                 None => {
                     ok = false;
@@ -879,7 +963,10 @@ pub fn split(comp: &[Polyline]) -> Option<Vec<Rails>> {
     use std::sync::{Mutex, OnceLock};
     // Asked for again and again (planning, the checks, the rails drawn on
     // the canvas): worked out once per outline.
-    static MEMO: OnceLock<Mutex<HashMap<u64, Option<Vec<Rails>>>>> = OnceLock::new();
+    // (In two halves, the older dropped when the newer fills up: what was
+    // asked for lately, the letters on the canvas now, is never what goes.)
+    type Memo = HashMap<u64, Option<Vec<Rails>>>;
+    static MEMO: OnceLock<Mutex<(Memo, Memo)>> = OnceLock::new();
     let key = {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for ring in comp {
@@ -892,8 +979,14 @@ pub fn split(comp: &[Polyline]) -> Option<Vec<Rails>> {
         h.finish()
     };
     let memo = MEMO.get_or_init(Default::default);
-    if let Some(hit) = memo.lock().ok().and_then(|m| m.get(&key).cloned()) {
-        return hit;
+    if let Ok(mut m) = memo.lock() {
+        if let Some(hit) = m.0.get(&key) {
+            return hit.clone();
+        }
+        if let Some(hit) = m.1.remove(&key) {
+            m.0.insert(key, hit.clone());
+            return hit;
+        }
     }
     let found = (|| {
         let outer = Ring::new(comp.first()?, true)?;
@@ -910,16 +1003,17 @@ pub fn split(comp: &[Polyline]) -> Option<Vec<Rails>> {
         } else {
             BUDGET
         };
+        let mut seen = Seen::default();
         [false, true].into_iter().find_map(|turns| {
             let mut budget = tries;
-            solve(&piece, MAX_DEPTH, &mut budget, turns)
+            solve(&piece, MAX_DEPTH, &mut budget, turns, &mut seen)
         })
     })();
     if let Ok(mut m) = memo.lock() {
-        if m.len() > 2048 {
-            m.clear();
+        if m.0.len() >= 1024 {
+            m.1 = std::mem::take(&mut m.0);
         }
-        m.insert(key, found.clone());
+        m.0.insert(key, found.clone());
     }
     found
 }

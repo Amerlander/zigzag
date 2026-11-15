@@ -40,6 +40,9 @@ pub enum Icon {
     FlipV,
     RotateLeft,
     RotateRight,
+    /// The Rotate tool, as VectorCraft draws it (Lucide's rotate-ccw):
+    /// most of a circle, round to an arrowhead at the top left.
+    RotateTool,
     Target,
     LeftPanel,
     RightPanel,
@@ -111,6 +114,18 @@ pub enum Icon {
     ShapePolygon,
     ShapeStar,
     ShapeLine,
+    /// A loop of rope with its tail: the Lasso.
+    Lasso,
+    /// The Pen's nib over a curve through round points: Curvature.
+    Curvature,
+    /// A pipette: the Eyedropper.
+    Eyedropper,
+    /// A blade on a handle: the Knife.
+    Knife,
+    /// Two rings overlapping, where they overlap filled: the Shape Builder.
+    ShapeBuilder,
+    /// A brush over the blob it has painted: the Blob Brush.
+    BlobBrush,
 }
 
 /// An icon's line weight in a box `side` points across: a whole number of
@@ -123,6 +138,17 @@ pub fn line_width(side: f32, pixels_per_point: f32) -> f32 {
         / pixels_per_point
 }
 
+/// A coordinate (in points) moved to where a level or upright line `width`
+/// wide is drawn crisp: an odd number of pixels wide, centered on a pixel;
+/// even, between two.
+fn on_pixel(v: f32, width: f32, pixels_per_point: f32) -> f32 {
+    if (width * pixels_per_point).round() as i64 % 2 == 1 {
+        ((v * pixels_per_point - 0.5).round() + 0.5) / pixels_per_point
+    } else {
+        (v * pixels_per_point).round() / pixels_per_point
+    }
+}
+
 /// Level and upright lines of a path moved onto the pixel grid, where a
 /// line `width` wide is drawn crisp, as egui does for the rectangles icons
 /// are also made of (it leaves paths where they are, and a line that falls
@@ -133,15 +159,7 @@ fn on_pixels(pts: &mut [Pos2], closed: bool, width: f32, pixels_per_point: f32) 
     if n < 2 {
         return;
     }
-    // An odd number of pixels wide: centered on a pixel; even: between two.
-    let odd = (width * pixels_per_point).round() as i64 % 2 == 1;
-    let snap = |v: f32| {
-        if odd {
-            ((v * pixels_per_point - 0.5).round() + 0.5) / pixels_per_point
-        } else {
-            (v * pixels_per_point).round() / pixels_per_point
-        }
-    };
+    let snap = |v: f32| on_pixel(v, width, pixels_per_point);
     let was = pts.to_vec();
     for i in 0..n {
         let before = if i > 0 {
@@ -238,19 +256,110 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
             );
         }
         Icon::Hand => {
-            // An open hand: four fingers and a thumb.
-            for (x, top) in [(0.32, 0.22), (0.45, 0.1), (0.58, 0.14), (0.71, 0.26)] {
-                line(&[(x, 0.56), (x, top)]);
+            // An open hand in one outline: four round-tipped fingers side
+            // by side (the middle one tallest), the palm rounding down to
+            // the wrist, and a thumb out to the upper left. Short lines
+            // part the fingers. It fills the box as the other tools do,
+            // its lines' outer edges about 0.06 in from each side.
+            //
+            // The fingers' sides and the palm's foot are put on the pixel
+            // grid before the curves are fitted to them (moving them after,
+            // as `on_pixels` does, would leave each fingertip a sliver off
+            // its sides, and the join a spike).
+            let grid_x = |x: f32| (on_pixel(at(x, 0.0).x, w, ppp) - o.x) / side;
+            let grid_y = |y: f32| (on_pixel(at(0.0, y).y, w, ppp) - o.y) / side;
+            let edges = [0.29, 0.43, 0.57, 0.71, 0.85].map(grid_x);
+            let foot = grid_y(0.9);
+            let fingers: [(f32, f32, f32); 4] = std::array::from_fn(|i| {
+                let tip = [0.3, 0.18, 0.215, 0.33][i];
+                (
+                    (edges[i] + edges[i + 1]) / 2.0,
+                    tip,
+                    (edges[i + 1] - edges[i]) / 2.0,
+                )
+            });
+            let arc_pts =
+                |cx: f32, cy: f32, r: f32, a0: f32, a1: f32, out: &mut Vec<(f32, f32)>| {
+                    let n = 10;
+                    for k in 0..=n {
+                        let a = a0 + (a1 - a0) * k as f32 / n as f32;
+                        out.push((cx + r * a.cos(), cy + r * a.sin()));
+                    }
+                };
+            let cubic = |p: [(f32, f32); 4], out: &mut Vec<(f32, f32)>| {
+                let n = 12;
+                for k in 1..=n {
+                    let t = k as f32 / n as f32;
+                    let u = 1.0 - t;
+                    let w = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+                    out.push((
+                        (0..4).map(|i| w[i] * p[i].0).sum(),
+                        (0..4).map(|i| w[i] * p[i].1).sum(),
+                    ));
+                }
+            };
+            // The thumb's axis, pointing up and left; its sides toward the
+            // fingers (inner) and away (outer); its tip.
+            let len = (0.42f32 * 0.42 + 0.91 * 0.91).sqrt();
+            let d = (-0.42 / len, -0.91 / len);
+            let inner = (-d.1, d.0);
+            let outer = (d.1, -d.0);
+            let (tip, r) = ((0.19, 0.49), 0.07);
+            // Where the thumb's inner side meets the index finger.
+            let index_left = edges[0];
+            let from = (tip.0 + r * inner.0, tip.1 + r * inner.1);
+            let join = (index_left, from.1 - d.1 * (index_left - from.0) / -d.0);
+            // Where a short finger meets a taller one the outline would run
+            // down one side and straight back up the other (a turn egui draws
+            // as a spike), so it is drawn as strokes that end on the fingers'
+            // shared sides instead. A finger's stroke starts where its left
+            // side shows above the finger before it, rounds its tip, and runs
+            // down its right side, which parts it from the next one.
+            let separator = 0.45;
+            let finger = |i: usize, out: &mut Vec<(f32, f32)>| {
+                let (x, y, r) = fingers[i];
+                if i > 0 && fingers[i - 1].1 > y {
+                    out.push((edges[i], fingers[i - 1].1));
+                }
+                arc_pts(x, y, r, PI, 2.0 * PI, out);
+            };
+            let stroke = |pts: Vec<(f32, f32)>| {
+                p.add(Shape::line(pts.iter().map(|&(x, y)| at(x, y)).collect(), s));
+            };
+            for i in 1..3 {
+                let mut pts = Vec::new();
+                finger(i, &mut pts);
+                pts.push((edges[i + 1], separator));
+                stroke(pts);
             }
-            line(&[
-                (0.32, 0.56),
-                (0.19, 0.44),
-                (0.12, 0.5),
-                (0.3, 0.86),
-                (0.64, 0.93),
-                (0.76, 0.72),
-                (0.71, 0.26),
-            ]);
+            // The rest in one stroke: the little finger, down the palm's
+            // side, round its foot, up the thumb, and over the index finger.
+            let mut pts = Vec::new();
+            finger(3, &mut pts);
+            let right = edges[4];
+            pts.push((right, 0.6));
+            cubic(
+                [(right, 0.6), (right, 0.8), (0.71, foot), (0.56, foot)],
+                &mut pts,
+            );
+            pts.push((0.45, foot));
+            let edge = (tip.0 + r * outer.0, tip.1 + r * outer.1);
+            let wrist = (edge.0 - d.0 * 0.22, edge.1 - d.1 * 0.22);
+            cubic(
+                [
+                    (0.45, foot),
+                    (0.37, foot),
+                    (wrist.0 - d.0 * 0.08, wrist.1 - d.1 * 0.08),
+                    wrist,
+                ],
+                &mut pts,
+            );
+            let a = outer.1.atan2(outer.0);
+            arc_pts(tip.0, tip.1, r, a, a + PI, &mut pts);
+            pts.push(join);
+            finger(0, &mut pts);
+            pts.push((edges[1], separator));
+            stroke(pts);
         }
         Icon::Pen => {
             // Fountain-pen nib.
@@ -506,6 +615,104 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
             closed(&v, None);
         }
         Icon::ShapeLine => line(&[(0.16, 0.84), (0.84, 0.16)]),
+        Icon::Lasso => {
+            // The loop, a little flattened, and the rope's end hanging
+            // from where it's tied.
+            let n = 28;
+            let ring: Vec<Pos2> = (0..n)
+                .map(|k| {
+                    let a = k as f32 / n as f32 * 2.0 * PI;
+                    at(0.5 + 0.42 * a.cos(), 0.4 + 0.28 * a.sin())
+                })
+                .collect();
+            p.add(Shape::closed_line(ring, s));
+            p.circle_filled(at(0.3, 0.66), side * 0.07, c);
+            line(&[(0.3, 0.66), (0.24, 0.8), (0.34, 0.94)]);
+        }
+        Icon::Curvature => {
+            // The nib, smaller and to the right; under it a curve through
+            // three round points.
+            let nib = Rect::from_min_size(at(0.34, 0.0), Vec2::splat(side * 0.66));
+            paint(p, nib, Icon::Pen, c);
+            let curve: Vec<Pos2> = (0..=16)
+                .map(|k| {
+                    let t = k as f32 / 16.0;
+                    at(0.08 + 0.84 * t, 0.84 - 0.1 * (t * 2.0 * PI).sin())
+                })
+                .collect();
+            p.add(Shape::line(curve, s));
+            for x in [0.08, 0.5, 0.92] {
+                p.circle_filled(at(x, 0.84), side * 0.075, c);
+            }
+        }
+        Icon::Eyedropper => {
+            // From the top right: the bulb, the collar across, the glass
+            // down to its tip at the bottom left.
+            closed(
+                &[(0.7, 0.06), (0.94, 0.3), (0.82, 0.42), (0.58, 0.18)],
+                Some(c),
+            );
+            line(&[(0.46, 0.2), (0.8, 0.54)]);
+            line(&[
+                (0.56, 0.3),
+                (0.2, 0.66),
+                (0.14, 0.86),
+                (0.34, 0.8),
+                (0.7, 0.44),
+            ]);
+            line(&[(0.14, 0.86), (0.06, 0.94)]);
+        }
+        Icon::Knife => {
+            // The handle at the top right, the blade down to its point.
+            closed(
+                &[(0.72, 0.06), (0.94, 0.28), (0.78, 0.44), (0.56, 0.22)],
+                Some(c),
+            );
+            closed(&[(0.56, 0.22), (0.78, 0.44), (0.1, 0.9)], None);
+        }
+        Icon::ShapeBuilder => {
+            // Two rings, and the lens where they overlap filled in.
+            let ring = |cx: f32| {
+                let n = 24;
+                let v: Vec<Pos2> = (0..n)
+                    .map(|k| {
+                        let a = k as f32 / n as f32 * 2.0 * PI;
+                        at(cx + 0.3 * a.cos(), 0.5 + 0.3 * a.sin())
+                    })
+                    .collect();
+                p.add(Shape::closed_line(v, s));
+            };
+            ring(0.34);
+            ring(0.66);
+            // (The rings cross where cos a = 0.16 / 0.3.)
+            let half = (0.16f32 / 0.3).acos();
+            let n = 8;
+            let lens: Vec<Pos2> = (0..=n)
+                .map(|k| {
+                    let a = -half + 2.0 * half * k as f32 / n as f32;
+                    at(0.34 + 0.3 * a.cos(), 0.5 + 0.3 * a.sin())
+                })
+                .chain((0..=n).map(|k| {
+                    let a = PI - half + 2.0 * half * k as f32 / n as f32;
+                    at(0.66 + 0.3 * a.cos(), 0.5 + 0.3 * a.sin())
+                }))
+                .collect();
+            p.add(Shape::convex_polygon(lens, c, Stroke::NONE));
+        }
+        Icon::BlobBrush => {
+            // The brush, smaller and to the right; the blob it's painting
+            // under its tip.
+            let brush = Rect::from_min_size(at(0.3, 0.0), Vec2::splat(side * 0.7));
+            paint(p, brush, Icon::Brush, c);
+            let n = 20;
+            let blob: Vec<Pos2> = (0..n)
+                .map(|k| {
+                    let a = k as f32 / n as f32 * 2.0 * PI;
+                    at(0.36 + 0.3 * a.cos(), 0.78 + 0.16 * a.sin())
+                })
+                .collect();
+            p.add(Shape::convex_polygon(blob, c, Stroke::NONE));
+        }
         Icon::Play => closed(&[(0.25, 0.12), (0.88, 0.5), (0.25, 0.88)], Some(c)),
         Icon::Machine => {
             // Arm across the top, pillar at the right, bed under, the
@@ -667,6 +874,20 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
         Icon::RotateRight => {
             arc(0.5, 0.55, 0.34, 0.7 * PI, 2.0 * PI);
             line(&[(0.72, 0.44), (0.84, 0.6), (0.96, 0.44)]);
+        }
+        Icon::RotateTool => {
+            // From the left, round the bottom, the right and the top, to
+            // the corner of an arrowhead at the top left.
+            let n = 28;
+            let mut pts: Vec<Pos2> = (0..=n)
+                .map(|k| {
+                    let a = PI - 1.75 * PI * k as f32 / n as f32;
+                    at(0.5 + 0.375 * a.cos(), 0.5 + 0.375 * a.sin())
+                })
+                .collect();
+            pts.push(at(0.125, 0.333));
+            p.add(Shape::line(pts, s));
+            line(&[(0.125, 0.125), (0.125, 0.333), (0.333, 0.333)]);
         }
         Icon::Gear => {
             // Six broad teeth round a ring, and the hole for the shaft:

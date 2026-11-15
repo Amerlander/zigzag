@@ -350,6 +350,24 @@ impl Targets {
         })
     }
 
+    /// The anchor or center nearest `p`, within `tol` (VectorCraft's
+    /// `snap_pick`): where a point picked on the artwork lands, such as the
+    /// Rotate tool's reference point. `centers`: more centers (the
+    /// selection's own).
+    pub fn pick(&self, p: P, centers: &[P], tol: f64) -> Option<Snapped> {
+        self.points
+            .iter()
+            .copied()
+            .chain(centers.iter().map(|&q| (q, Kind::Center)))
+            .filter(|(q, _)| q.dist(p) <= tol)
+            .min_by(|a, b| a.0.dist(p).total_cmp(&b.0.dist(p)))
+            .map(|(q, k)| Snapped {
+                p: q,
+                label: Some(k.label()),
+                lines: vec![],
+            })
+    }
+
     /// Slide `q`, on the line from `at` along `dir` (forward only), to where
     /// it lines up with the nearest target, at most twice `tol` away: where it
     /// lands and the target.
@@ -466,6 +484,30 @@ impl Studio {
         }
     }
 
+    /// Snap a point picked on the artwork (the Rotate tool's reference
+    /// point) to the nearest anchor or center, labelled by `draw_snap`: to
+    /// the grid when it's showing, and left where it is with smart guides
+    /// off. `centers`: more centers to land on (the selection's own).
+    pub fn snap_pick(&self, p: P, centers: &[P]) -> P {
+        if self.view_tools.grid {
+            return self.snap_to_grid(p);
+        }
+        if !self.view_tools.smart_guides {
+            return p;
+        }
+        let Some(t) = &self.snap.targets else {
+            return p;
+        };
+        match t.pick(p, centers, self.snap_tol()) {
+            Some(s) => {
+                let q = s.p;
+                *self.snap.shown.borrow_mut() = Some(s);
+                q
+            }
+            None => p,
+        }
+    }
+
     /// Draw this frame's snap (guide lines, a mark and the label).
     pub fn draw_snap(&self, painter: &egui::Painter, rect: Rect) {
         let Some(s) = self.snap.shown.borrow_mut().take() else {
@@ -561,6 +603,27 @@ mod tests {
         let s = t.snap(far, None, false, &[], tol).unwrap();
         assert_eq!(s.label, Some("align"));
         assert_eq!(s.p.x, a.x);
+    }
+
+    #[test]
+    fn a_picked_point_lands_on_an_anchor_or_a_center_and_nothing_else() {
+        let (doc, t) = targets();
+        let tol = 5.0;
+        let paths = doc.all_edit_paths();
+        let a = paths[0].as_ref().unwrap()[0].anchors[0].p;
+        let s = t.pick(a + P::new(2.0, -1.5), &[], tol).unwrap();
+        assert_eq!((s.p, s.label), (a, Some("anchor")));
+        let c = shape_bounds(&doc.shapes[0]).center();
+        let s = t.pick(c + P::new(-3.0, 1.0), &[], tol).unwrap();
+        assert_eq!((s.p, s.label), (c, Some("center")));
+        // On an edge away from the corners, or in line with one: not a
+        // place a picked point snaps to (a drawn one would).
+        assert_eq!(t.pick(P::new(a.x + 120.0, a.y + 2.0), &[], tol), None);
+        assert_eq!(t.pick(P::new(a.x + 3.0, a.y + 900.0), &[], tol), None);
+        // A center handed in (the selection's own).
+        let mine = P::new(-700.0, 300.0);
+        let s = t.pick(mine + P::new(1.0, 1.0), &[mine], tol).unwrap();
+        assert_eq!((s.p, s.label), (mine, Some("center")));
     }
 
     #[test]

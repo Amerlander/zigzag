@@ -39,12 +39,36 @@ impl View {
         let after = self.to_design(rect, anchor);
         self.center = self.center + (before - after);
     }
+    /// Scale by `factor` about the canvas center (the interface changing
+    /// size under a design that isn't to).
+    pub fn rescale(&mut self, factor: f32) {
+        self.scale = (self.scale * factor).clamp(1.0, 120.0);
+    }
     /// Fit a box of `w_mm` × `h_mm` centered at `c` into `rect`.
     pub fn fit(&mut self, rect: Rect, c: P, w_mm: f64, h_mm: f64) {
         self.center = c;
         let s = (rect.width() as f64 / (w_mm * 1.15)).min(rect.height() as f64 / (h_mm * 1.15));
         self.scale = (s as f32).clamp(1.0, 120.0);
     }
+}
+
+/// How much detail fits in a length in points: what it's multiplied by
+/// before it's judged. It's the interface size, so that a design is drawn
+/// the same at every interface size, where a point is more or fewer pixels.
+pub fn detail(ctx: &egui::Context) -> f32 {
+    ctx.zoom_factor()
+}
+
+/// Whether thread `w` points wide is drawn shaded, as a round thread (any
+/// thinner and it's a flat line: there's nowhere to put the shading).
+pub fn shaded(detail: f32, w: f32) -> bool {
+    w * detail >= 2.2
+}
+
+/// Whether the Lines view shows needle points at `view`: once there's room
+/// to see them.
+pub fn needle_points(detail: f32, view: &View) -> bool {
+    view.scale * detail > 10.0
 }
 
 pub fn color32(c: [u8; 3]) -> Color32 {
@@ -76,6 +100,9 @@ pub struct DrawOptions {
     /// transform so far: their stitches are drawn through it, so the
     /// gesture shows live without re-planning anything until it ends.
     pub moving: Option<(Vec<bool>, zigzag::geom::Affine)>,
+    /// What's moving is a copy being dragged off (Option held): those
+    /// blocks are drawn where they were as well, as they'll stay.
+    pub copy: bool,
     /// An object whose stitches aren't drawn (text being typed with every
     /// letter deleted: its frame and caret show instead).
     pub hidden: Option<usize>,
@@ -353,6 +380,7 @@ pub fn draw_design_cached(
                 let one = one(k);
                 let mut shapes = Vec::new();
                 let end = design_shapes(
+                    detail(ctx),
                     rect,
                     view,
                     d,
@@ -398,6 +426,7 @@ pub fn draw_design_cached(
                 let mut shapes = Vec::new();
                 let flags = one(k);
                 design_shapes(
+                    detail(ctx),
                     rect,
                     view,
                     d,
@@ -419,7 +448,12 @@ pub fn draw_design_cached(
         cache.blocks.push(entry);
         let entry = cache.blocks.last_mut().unwrap();
         match through {
-            Some(m) => entry.paint_through(painter, origin, rect, view, m),
+            Some(m) => {
+                if opt.copy {
+                    entry.paint(painter, origin);
+                }
+                entry.paint_through(painter, origin, rect, view, m)
+            }
             None => entry.paint(painter, origin),
         }
         last = blk
@@ -500,6 +534,7 @@ fn partial_block(
         };
         let mut shapes = Vec::new();
         design_shapes(
+            detail(ctx),
             rect,
             view,
             &piece,
@@ -523,6 +558,7 @@ fn partial_block(
 /// given). Returns the position of the last stitch drawn.
 /// `blocks`: draw only the blocks whose flag is (or isn't) set.
 fn design_shapes(
+    detail: f32,
     rect: Rect,
     view: &View,
     d: &Design,
@@ -588,14 +624,14 @@ fn design_shapes(
                         out.push(egui::Shape::line(pts.clone(), Stroke::new(1.0, line)));
                     }
                     // Needle points once there's room to see them.
-                    if view.scale > 10.0 {
+                    if needle_points(detail, view) {
                         let r = (view.scale * 0.06).clamp(1.2, 2.2);
                         for &q in pts.iter().filter(|q| seen(**q)) {
                             out.push(egui::Shape::circle_filled(q, r, line));
                         }
                     }
                 }
-                StitchView::Thread if w >= 2.2 => {
+                StitchView::Thread if shaded(detail, w) => {
                     for s in pts.windows(2) {
                         if seen(s[0]) || seen(s[1]) {
                             thread_segment(out, s[0], s[1], w, &shade);
@@ -896,6 +932,7 @@ mod tests {
                 view: StitchView::Thread,
                 background: [255, 255, 255],
                 moving: None,
+                copy: false,
                 hidden: None,
             };
             let view = View {
@@ -937,5 +974,66 @@ mod tests {
         assert_eq!(draw(&ctx, &d, 115, &mut stepped).0, all.0);
         // The last stitch, (980, 230), with the view centered on (400, 100).
         assert_eq!(all.1, Some(egui::pos2(980.0, 430.0)));
+    }
+
+    #[test]
+    fn a_copy_being_dragged_is_drawn_where_it_was_as_well() {
+        // The second block carried 30 mm to the right: moved, its
+        // stitches are drawn once, there; as a copy, there and where they
+        // were (the same again).
+        let d = zigzag_design();
+        let drawn = |moving: Option<(Vec<bool>, zigzag::geom::Affine)>, copy: bool| {
+            let ctx = egui::Context::default();
+            let mut xs: Vec<f32> = Vec::new();
+            let mut out = ctx.run_pass(egui::RawInput::default(), |ctx| {
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+                let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), rect);
+                let opt = DrawOptions {
+                    show_jumps: false,
+                    limit: usize::MAX,
+                    thread_mm: 0.4,
+                    view: StitchView::Thread,
+                    background: [255, 255, 255],
+                    moving: moving.clone(),
+                    copy,
+                    hidden: None,
+                };
+                let view = View {
+                    center: P::new(400.0, 100.0),
+                    scale: 10.0,
+                };
+                draw_design_cached(&painter, rect, &view, &d, &opt, 1, &mut None);
+            });
+            let mut vertices = 0;
+            for c in &out.shapes {
+                if let egui::Shape::Mesh(m) = &c.shape {
+                    vertices += m.vertices.len();
+                    xs.extend(m.vertices.iter().map(|v| v.pos.x));
+                }
+            }
+            out.textures_delta.clear();
+            let far = xs.iter().copied().fold(f32::MIN, f32::max);
+            (vertices, far)
+        };
+        let carry = Some((vec![false, true], [1.0, 0.0, 0.0, 1.0, 300.0, 0.0]));
+        let (still, far) = drawn(None, false);
+        let (moved, far_moved) = drawn(carry.clone(), false);
+        let (copied, far_copied) = drawn(carry, true);
+        assert_eq!(moved, still, "moved: the same stitches, elsewhere");
+        assert!(
+            (far_moved - far - 300.0).abs() < 1.0,
+            "{far_moved} from {far}"
+        );
+        // The second block's stitches, twice.
+        let second = {
+            let one = Design {
+                blocks: vec![d.blocks[1].clone()],
+                ..Design::default()
+            };
+            let ctx = egui::Context::default();
+            draw(&ctx, &one, usize::MAX, &mut None).0
+        };
+        assert_eq!(copied, still + second, "the copy, and what it's a copy of");
+        assert!((far_copied - far_moved).abs() < 1.0);
     }
 }

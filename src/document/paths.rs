@@ -622,11 +622,11 @@ fn fmt_len(v: f64) -> String {
 
 /// How closely the curves fitted to path operations' results follow them
 /// (design units: 0.06 mm, twice the 0.03 mm curves are flattened to).
-const RESULT_TOL: f64 = 0.6;
+pub(super) const RESULT_TOL: f64 = 0.6;
 
 impl Document {
     /// The area an object covers: its fill, or its stroked line.
-    fn area(&self, i: usize) -> (Vec<Polyline>, FillRule) {
+    pub(super) fn area(&self, i: usize) -> (Vec<Polyline>, FillRule) {
         match &self.shapes[i].geometry {
             Geometry::Fill { rings, rule } => (rings.clone(), *rule),
             Geometry::Stroke { lines, width } => (
@@ -660,7 +660,7 @@ impl Document {
         out
     }
 
-    fn uid_indices(&self, uids: &[usize]) -> Vec<usize> {
+    pub(super) fn uid_indices(&self, uids: &[usize]) -> Vec<usize> {
         let mut v: Vec<usize> = self
             .shapes
             .iter()
@@ -744,7 +744,7 @@ impl Document {
         Ok(i)
     }
 
-    fn name_of(&self, i: usize) -> String {
+    pub(super) fn name_of(&self, i: usize) -> String {
         let w = svg::name_words(&self.shapes[i].label);
         if w.is_empty() {
             "shape".into()
@@ -754,7 +754,7 @@ impl Document {
     }
 
     /// Fill settings for a shape made from object `i`.
-    fn fill_params(&self, i: usize) -> crate::params::Params {
+    pub(super) fn fill_params(&self, i: usize) -> crate::params::Params {
         let mut p = self.shapes[i].params.clone();
         if !matches!(
             p.kind,

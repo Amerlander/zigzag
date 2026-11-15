@@ -350,8 +350,11 @@ impl Studio {
         if let Some(i) = self.doc.shapes.iter().position(|s| s.uid == uid) {
             self.set_selection(&[i]);
         }
-        // (Planned on the next frame: at once for a small design, on the
-        // worker for a big one, so the UI never stalls here.)
+        // Planned on the next frame, and on the worker: new letters are new
+        // outlines to find satin columns in, which is quick for most fonts
+        // and seconds for some (there's no telling which from how long the
+        // last font took), so the window never waits on it.
+        self.planner.expect_slow();
         self.dirty = true;
         Ok(())
     }
@@ -2197,6 +2200,55 @@ mod editing_tests {
         h.run_steps(3);
         assert_eq!(alike(&sewn(&h, 0)[1..], &text[1..]), Ok(()));
         assert_eq!(alike(&sewn(&h, 1), &shape), Ok(()));
+    }
+
+    #[test]
+    fn a_change_of_font_never_waits_on_the_satin_columns() {
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        // (As the app does it: by how long plans take.)
+        h.state_mut().planner.timed = true;
+        h.run_steps(2);
+        let spec = TextSpec {
+            text: "Hi".into(),
+            kind: Kind::Satin,
+            ..TextSpec::default()
+        };
+        let i = h.state_mut().add_lettering(&spec, (0.0, 0.0)).unwrap();
+        let wait = |h: &mut Harness<'_, Studio>| {
+            for _ in 0..4000 {
+                h.run_steps(1);
+                if !h.state().planner.pending && !h.state().dirty {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            panic!("the plan never arrived");
+        };
+        wait(&mut h);
+        assert!(h.state().satin_info_shown(i).is_some());
+        // The last plan was quick: the next would be made in the frame,
+        // were it not that new letters may take any time at all.
+        h.state_mut().planner.slow = false;
+        let bold = TextSpec {
+            bold: !spec.bold,
+            ..spec.clone()
+        };
+        h.state_mut().update_lettering(i, &bold).unwrap();
+        // Nothing found on this thread meanwhile: not for the Stitch
+        // panel's width, nor for the rails on the canvas.
+        assert!(h.state().satin_info_shown(i).is_none());
+        h.run_steps(1);
+        assert!(h.state().planner.pending, "planned by the worker");
+        assert!(h.state().satin_info_shown(i).is_none());
+        wait(&mut h);
+        let i = h.state().sel_index().unwrap();
+        let info = h.state().satin_info_shown(i).expect("once it's planned");
+        assert!(info.mean_width > 0.0);
     }
 
     #[test]

@@ -4,9 +4,10 @@ use crate::geom::{FillRule, P, Polyline};
 use i_overlay::core::fill_rule::FillRule as IFill;
 use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::float::single::SingleFloatOverlay;
+use i_overlay::float::slice::FloatSlice;
 use i_overlay::mesh::float::outline::offset::OutlineOffset;
 use i_overlay::mesh::float::stroke::offset::StrokeOffset;
-use i_overlay::mesh::float::style::{LineJoin, OutlineStyle, StrokeStyle};
+use i_overlay::mesh::float::style::{LineCap, LineJoin, OutlineStyle, StrokeStyle};
 
 type Shapes = Vec<Vec<Vec<[f64; 2]>>>;
 
@@ -239,6 +240,58 @@ pub fn stroke_area(lines: &[(Polyline, bool)], width: f64) -> Vec<Polyline> {
     out
 }
 
+/// The area a round brush `width` across covers, drawn along `line`: round
+/// at both ends and at every turn (a dab, for a line of one point).
+pub fn brush_area(line: &[P], width: f64) -> Vec<Polyline> {
+    // (Arcs in steps of a fifth of the radius: 0.1 mm on a 1 mm brush.)
+    const ARC: f64 = 0.2;
+    let mut path: Vec<[f64; 2]> = Vec::with_capacity(line.len());
+    for p in line {
+        if path
+            .last()
+            .is_none_or(|q| (q[0] - p.x).hypot(q[1] - p.y) > 1e-6)
+        {
+            path.push([p.x, p.y]);
+        }
+    }
+    match path.len() {
+        0 => return Vec::new(),
+        // (A stroke needs a length: the dab is a line too short to see.)
+        1 => path.push([path[0][0] + width * 1e-3, path[0][1]]),
+        _ => {}
+    }
+    let style: StrokeStyle<[f64; 2]> = StrokeStyle::new(width)
+        .line_join(LineJoin::Round(ARC))
+        .start_cap(LineCap::Round(ARC))
+        .end_cap(LineCap::Round(ARC));
+    from_shapes(path.stroke(style, false))
+}
+
+/// A shape cut along `cuts` (lines drawn across it): its pieces, each one's
+/// outline and then its holes. A cut that doesn't reach from edge to edge
+/// (or round on itself) parts nothing, and the shape comes back whole.
+pub fn slice(rings: &[Polyline], r: FillRule, cuts: &[Polyline]) -> Vec<Vec<Polyline>> {
+    let shapes = normalized(rings, r);
+    let lines: Vec<Vec<[f64; 2]>> = cuts
+        .iter()
+        .filter(|c| c.len() >= 2)
+        .map(|c| c.iter().map(|p| [p.x, p.y]).collect())
+        .collect();
+    let cut: Shapes = if lines.is_empty() {
+        shapes
+    } else {
+        shapes.slice_by(&lines, IFill::NonZero)
+    };
+    cut.into_iter()
+        .map(|shape| {
+            shape
+                .into_iter()
+                .map(|c| c.into_iter().map(|[x, y]| P::new(x, y)).collect())
+                .collect()
+        })
+        .collect()
+}
+
 /// Absolute area of a ring.
 pub fn ring_area(r: &[P]) -> f64 {
     let n = r.len();
@@ -277,6 +330,77 @@ mod tests {
             (area - (10000.0 + 1600.0)).abs() < 1.0,
             "outer + hole ring areas: {area}"
         );
+    }
+
+    #[test]
+    fn a_brush_paints_a_round_ended_area() {
+        // 100 long, 20 across: a 100 × 20 bar and a round end at each.
+        let r = brush_area(&[P::new(0.0, 0.0), P::new(100.0, 0.0)], 20.0);
+        let area: f64 = r.iter().map(|x| ring_area(x)).sum();
+        let want = 100.0 * 20.0 + std::f64::consts::PI * 100.0;
+        assert!((area - want).abs() < want * 0.02, "{area} for {want}");
+        assert!(point_inside(&r, FillRule::EvenOdd, P::new(-8.0, 0.0)));
+        assert!(!point_inside(&r, FillRule::EvenOdd, P::new(-8.0, 8.0)));
+        // A corner is round on the outside too.
+        let l = brush_area(
+            &[P::new(0.0, 0.0), P::new(100.0, 0.0), P::new(100.0, 100.0)],
+            20.0,
+        );
+        assert!(point_inside(&l, FillRule::EvenOdd, P::new(106.0, -6.0)));
+        assert!(!point_inside(&l, FillRule::EvenOdd, P::new(109.0, -9.0)));
+        // One point: a dab.
+        let dab = brush_area(&[P::new(5.0, 5.0)], 20.0);
+        let area: f64 = dab.iter().map(|x| ring_area(x)).sum();
+        assert!((area - std::f64::consts::PI * 100.0).abs() < 8.0, "{area}");
+        assert!(brush_area(&[], 20.0).is_empty());
+    }
+
+    #[test]
+    fn a_cut_across_a_shape_parts_it() {
+        let whole = [sq(0.0, 0.0, 100.0)];
+        let area = |piece: &[Polyline]| -> f64 {
+            let mut v: Vec<f64> = piece.iter().map(|x| ring_area(x)).collect();
+            v.sort_by(|x, y| y.total_cmp(x));
+            v[0] - v[1..].iter().sum::<f64>()
+        };
+        // Edge to edge: two pieces, 30 and 70 of the 100.
+        let cut = vec![P::new(-10.0, 30.0), P::new(110.0, 30.0)];
+        let mut pieces: Vec<f64> = slice(&whole, FillRule::NonZero, &[cut])
+            .iter()
+            .map(|p| area(p))
+            .collect();
+        pieces.sort_by(f64::total_cmp);
+        assert_eq!(pieces.len(), 2);
+        assert!((pieces[0] - 3000.0).abs() < 1.0 && (pieces[1] - 7000.0).abs() < 1.0);
+        // A cut that stops inside parts nothing; nor does one that misses.
+        let short = vec![P::new(-10.0, 30.0), P::new(50.0, 30.0)];
+        let one = slice(&whole, FillRule::NonZero, &[short]);
+        assert_eq!(one.len(), 1);
+        assert!((area(&one[0]) - 10000.0).abs() < 1.0);
+        let miss = vec![P::new(-10.0, 300.0), P::new(110.0, 300.0)];
+        assert_eq!(slice(&whole, FillRule::NonZero, &[miss]).len(), 1);
+        // A ring cut through its hole: the two arcs of it.
+        let ring = [sq(0.0, 0.0, 100.0), sq(30.0, 30.0, 40.0)];
+        let through = vec![P::new(50.0, -10.0), P::new(50.0, 110.0)];
+        let halves = slice(&ring, FillRule::EvenOdd, &[through]);
+        assert_eq!(halves.len(), 2);
+        for h in &halves {
+            assert!((area(h) - 4200.0).abs() < 1.0, "{}", area(h));
+        }
+        // A loop drawn inside cuts its inside out: a piece, and the rest
+        // with a hole where it was.
+        let lp = vec![
+            P::new(20.0, 20.0),
+            P::new(60.0, 20.0),
+            P::new(60.0, 60.0),
+            P::new(20.0, 60.0),
+            P::new(20.0, 20.0),
+        ];
+        let two = slice(&whole, FillRule::NonZero, &[lp]);
+        let mut a: Vec<f64> = two.iter().map(|p| area(p)).collect();
+        a.sort_by(f64::total_cmp);
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert!((a[0] - 1600.0).abs() < 1.0 && (a[1] - 8400.0).abs() < 1.0);
     }
 
     #[test]

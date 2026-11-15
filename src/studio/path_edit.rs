@@ -20,7 +20,7 @@ pub struct PathEdit {
     /// point). Reading one re-parses the SVG, so it's done once per change.
     outlines: std::collections::HashMap<usize, (u64, Option<BezPath>)>,
     /// The object whose points `selected` refers to.
-    points_of: Option<usize>,
+    pub(crate) points_of: Option<usize>,
     /// Selected anchors of that outline. With the Selection tool, the
     /// corners picked by clicking their widgets (a drag rounds just those).
     pub selected: Vec<AnchorRef>,

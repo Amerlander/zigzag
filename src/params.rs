@@ -643,7 +643,12 @@ pub fn parse_hex(v: &str) -> Option<[u8; 3]> {
 pub fn is_param_token(tok: &str) -> bool {
     let lower = tok.to_ascii_lowercase();
     let lower = lower.strip_prefix("stroke.").unwrap_or(&lower);
-    Kind::parse(lower).is_some() || lower == "border" || lower.contains('=')
+    // (Every word `apply_token` reads as a setting: one left out here is
+    // kept as part of the name, written again beside it at each save, and
+    // read back as on however it's been set since.)
+    Kind::parse(lower).is_some()
+        || matches!(lower, "border" | "trim" | "spiral" | "stop")
+        || lower.contains('=')
 }
 
 /// Decode Illustrator's `_xHH_` escapes (e.g. `_x3D_` → `=`, `_x2E_` → `.`).

@@ -1,7 +1,8 @@
 //! A frame profiler for development: with `TL_PROFILE=1` in the
 //! environment, every frame prints the sections of [`crate::app::Studio::frame`]
 //! that took longer than a few hundred microseconds, in order, to stderr.
-//! Off (and nearly free) otherwise.
+//! (`TL_PROFILE=quiet` times the sections without printing them, for the
+//! benches, which read them with [`last`].) Off (and nearly free) otherwise.
 
 use std::cell::RefCell;
 use std::time::Instant;
@@ -18,6 +19,33 @@ struct Frame {
 
 thread_local! {
     static WHOLE: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+    /// The sections of the frames since [`clear`] (egui may run the UI
+    /// twice for one frame on screen).
+    static LAST: RefCell<Vec<(&'static str, f64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Forget the sections kept for [`last`].
+#[cfg(test)]
+pub fn clear() {
+    LAST.with(|l| l.borrow_mut().clear());
+}
+
+/// How long the frames since [`clear`] spent in the section called `what`
+/// (ms; 0 when they had none, or nothing is being timed).
+#[cfg(test)]
+pub fn last(what: &str) -> f64 {
+    LAST.with(|l| {
+        l.borrow()
+            .iter()
+            .filter(|(w, _)| *w == what)
+            .map(|(_, ms)| ms)
+            .sum()
+    })
+}
+
+fn quiet() -> bool {
+    static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *QUIET.get_or_init(|| std::env::var_os("TL_PROFILE").is_some_and(|v| v == "quiet"))
 }
 
 /// What eframe measured for the previous frame as a whole (UI, egui's
@@ -71,6 +99,10 @@ pub fn end() {
     FRAME.with(|f| {
         if let Some(fr) = f.borrow_mut().take() {
             let total = fr.start.elapsed().as_secs_f64() * 1000.0;
+            if quiet() {
+                LAST.with(|l| l.borrow_mut().extend(fr.rows));
+                return;
+            }
             let whole = WHOLE
                 .with(|w| w.get())
                 .map(|s| format!(" (last whole frame {:.2} ms)", s * 1000.0))

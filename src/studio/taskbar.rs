@@ -3,6 +3,12 @@
 //! next things you're likely to do to it — how it's stitched, its thread,
 //! editing its points, rounding its corners, uniting several, duplicating.
 //! View › Contextual Task Bar (or its ••• menu) hides it.
+//!
+//! The grip at its left end moves it out of the way of the art, as in
+//! Illustrator (ported from VectorCraft's `canvas/task_bar.rs`): moved,
+//! it keeps that offset from its place by the selection as it follows it;
+//! pinned (••• › Pin Bar Position) it stays where it is. Reset Bar
+//! Position puts it back.
 
 use crate::app::{Studio, Tool};
 use crate::commands::Action;
@@ -16,6 +22,26 @@ const BUTTON: f32 = 28.0;
 /// Width of the stitch type's menu button (and of the outline's stitch
 /// types under it).
 const KIND_W: f32 = 96.0;
+/// Width of the grip that moves the bar (the line drawn in it is thinner).
+const GRIP_W: f32 = 10.0;
+
+/// Where the bar sits once its grip has moved it (VectorCraft's
+/// `TaskBarPlace`). Not kept from one launch to the next, as in
+/// Illustrator: the bar starts by the selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TaskBarPlace {
+    /// ••• › Pin Bar Position: the bar stays where it is instead of
+    /// following the selection.
+    pub pinned: bool,
+    /// Where a pinned bar's top-left corner is from the canvas's (none
+    /// when it was pinned before it showed, until it's drawn). Unpinning
+    /// leaves it for the next frame to turn into `offset`.
+    pub pin_at: Option<Vec2>,
+    /// How far a bar that follows the selection was moved from its place
+    /// by it, and in which document (its recovery number): in another,
+    /// the bar starts by the selection again.
+    pub offset: Option<(u32, Vec2)>,
+}
 
 impl Studio {
     /// Whether the bar shows: the setting is on, the Selection tool is
@@ -56,10 +82,37 @@ impl Studio {
         } else {
             (sel.top() - 24.0 - size.y).max(canvas.top() + space::M)
         };
-        let x = (sel.center().x - size.x / 2.0).clamp(
-            canvas.left() + space::M,
-            (canvas.right() - space::M - size.x).max(canvas.left() + space::M),
-        );
+        // Anywhere on the canvas, clear of the prompt bar.
+        let room_min = canvas.min + Vec2::splat(space::M);
+        let room_max = egui::pos2(canvas.right() - space::M - size.x, bottom_limit).max(room_min);
+        let keep_in = |p: egui::Pos2| p.clamp(room_min, room_max);
+        let x = (sel.center().x - size.x / 2.0).clamp(room_min.x, room_max.x);
+        // Its place by the selection, then where the grip moved it.
+        let by_sel = egui::pos2(x, y);
+        let doc = self.session.rec;
+        let place = &mut self.layout.task_bar_place;
+        // Just unpinned: it follows the selection from where it was pinned.
+        if !place.pinned
+            && let Some(at) = place.pin_at.take()
+        {
+            place.offset = Some((doc, canvas.min + at - by_sel));
+        }
+        let at = keep_in(match place.pin_at {
+            Some(at) => canvas.min + at,
+            None => {
+                by_sel
+                    + place
+                        .offset
+                        .filter(|(d, _)| *d == doc)
+                        .map_or(Vec2::ZERO, |(_, o)| o)
+            }
+        });
+        // Pinned before it showed: held where it is now.
+        if place.pinned && place.pin_at.is_none() {
+            place.pin_at = Some(at - canvas.min);
+        }
+        let pinned = place.pinned;
+        let mut moved = Vec2::ZERO;
         // (A shape selected with its own outline is the shape: the bar is
         // the shape's, with the outline's row under it.)
         let idx = self.subjects();
@@ -71,9 +124,10 @@ impl Studio {
         let mut outline_picker: Option<(usize, egui::Pos2)> = None;
         let mut picker_at: Option<egui::Pos2> = None;
         let mut text_edit: Option<(usize, zigzag::document::TextSpec)> = None;
+        let mut place_change: Option<PlaceChange> = None;
         egui::Area::new(id)
             .order(egui::Order::Middle)
-            .fixed_pos(egui::pos2(x, y))
+            .fixed_pos(at)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
                     .corner_radius(9)
@@ -82,6 +136,7 @@ impl Studio {
                         let top = ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = space::XS;
                             let p = pal_ui(ui);
+                            moved = grip(ui);
                             // How it's stitched: the common type, a menu of the others.
                             let kinds: Vec<_> = idx
                                 .iter()
@@ -346,6 +401,32 @@ impl Studio {
                                     act = Some(Action::ToggleTaskBar);
                                     ui.close();
                                 }
+                                if crate::flyout::menu_row(
+                                    ui,
+                                    crate::flyout::RowIcon::None,
+                                    "Pin Bar Position",
+                                    "",
+                                    pinned,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    place_change = Some(PlaceChange::Pin(!pinned));
+                                    ui.close();
+                                }
+                                if crate::flyout::menu_row(
+                                    ui,
+                                    crate::flyout::RowIcon::None,
+                                    "Reset Bar Position",
+                                    "",
+                                    false,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    place_change = Some(PlaceChange::Reset);
+                                    ui.close();
+                                }
                             });
                         })
                         .response
@@ -581,6 +662,21 @@ impl Studio {
                 Err(e) => self.status = format!("Couldn't update the text: {e:#}"),
             }
         }
+        let place = &mut self.layout.task_bar_place;
+        if moved != Vec2::ZERO {
+            let to = keep_in(at + moved);
+            if place.pinned {
+                place.pin_at = Some(to - canvas.min);
+            } else {
+                place.offset = Some((doc, to - by_sel));
+            }
+            ctx.request_repaint();
+        }
+        match place_change {
+            Some(PlaceChange::Pin(on)) => place.pinned = on,
+            Some(PlaceChange::Reset) => *place = TaskBarPlace::default(),
+            None => {}
+        }
         if let Some(a) = act {
             if a == Action::ToggleTaskBar {
                 self.status = "Task bar hidden. View › Contextual Task Bar shows it again.".into();
@@ -688,6 +784,35 @@ fn outline_button(
     })
 }
 
+/// A change to where the bar is, from its ••• menu.
+enum PlaceChange {
+    Pin(bool),
+    Reset,
+}
+
+/// The grip at the bar's left end: drag it to move the bar. Returns how
+/// far it was dragged this frame.
+fn grip(ui: &mut egui::Ui) -> Vec2 {
+    let p = pal_ui(ui);
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(GRIP_W, BUTTON), Sense::drag());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Move Task Bar"));
+    let active = resp.hovered() || resp.dragged();
+    ui.painter().rect_filled(
+        Rect::from_center_size(r.center(), Vec2::new(3.0, BUTTON - 10.0)),
+        1.5,
+        if active { p.secondary } else { p.tertiary },
+    );
+    if resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        resp.drag_delta()
+    } else {
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        Vec2::ZERO
+    }
+}
+
 fn separator(ui: &mut egui::Ui) {
     let p = pal_ui(ui);
     let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, BUTTON - 8.0), Sense::hover());
@@ -701,6 +826,85 @@ mod tests {
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
     use std::path::PathBuf;
+
+    #[test]
+    fn the_grip_moves_the_task_bar_and_pinning_holds_it() {
+        let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/badge.svg"));
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(Some(path), None),
+            );
+        h.run_steps(4);
+        let index = |h: &Harness<'_, Studio>, name: &str| {
+            h.state().names.iter().position(|n| n == name).unwrap()
+        };
+        let select = |h: &mut Harness<'_, Studio>, i: usize| {
+            h.state_mut().set_selection(&[i]);
+            h.run_steps(3);
+        };
+        let bar = |h: &Harness<'_, Studio>| h.get_by_label("Move Task Bar").rect().min;
+        let drag = |h: &mut Harness<'_, Studio>, by: Vec2| {
+            let from = h.get_by_label("Move Task Bar").rect().center();
+            h.hover_at(from);
+            h.run_steps(1);
+            h.drag_at(from);
+            h.run_steps(1);
+            for k in 1..=4 {
+                h.hover_at(from + by * (k as f32 / 4.0));
+                h.run_steps(1);
+            }
+            h.drop_at(from + by);
+            h.run_steps(3);
+        };
+        let menu = |h: &mut Harness<'_, Studio>, item: &str| {
+            h.get_by_label("Task bar options").click();
+            h.run_steps(2);
+            h.get_by_label(item).click();
+            h.run_steps(3);
+        };
+        let near = |a: egui::Pos2, b: egui::Pos2| (a - b).length() < 1.0;
+        let (sun, swoosh) = (index(&h, "sun"), index(&h, "swoosh"));
+        select(&mut h, swoosh);
+        let swoosh_by_sel = bar(&h);
+        select(&mut h, sun);
+        let by_sel = bar(&h);
+        // Moved by its grip, and the selection stays as it was.
+        let d = Vec2::new(-80.0, 30.0);
+        drag(&mut h, d);
+        assert!(
+            near(bar(&h), by_sel + d),
+            "{:?} vs {:?}",
+            bar(&h),
+            by_sel + d
+        );
+        assert_eq!(h.state().sel_indices(), vec![sun]);
+        // It follows the selection, as far from its place by it as moved.
+        select(&mut h, swoosh);
+        assert!(near(bar(&h), swoosh_by_sel + d));
+        // Pinned, it stays where it is whatever's selected, and the grip
+        // still moves it.
+        menu(&mut h, "Pin Bar Position");
+        assert!(h.state().layout.task_bar_place.pinned);
+        let pinned = bar(&h);
+        select(&mut h, sun);
+        assert!(near(bar(&h), pinned));
+        drag(&mut h, Vec2::new(40.0, 0.0));
+        select(&mut h, swoosh);
+        assert!(near(bar(&h), pinned + Vec2::new(40.0, 0.0)));
+        // Never off the canvas.
+        drag(&mut h, Vec2::new(-3000.0, -3000.0));
+        let canvas = h.state().canvas_rect;
+        let top_left = h.get_by_label("Stitch type").rect().min;
+        assert!(canvas.contains(top_left), "{top_left:?} in {canvas:?}");
+        // Reset: by the selection again, and following it.
+        menu(&mut h, "Reset Bar Position");
+        assert_eq!(h.state().layout.task_bar_place, TaskBarPlace::default());
+        assert!(near(bar(&h), swoosh_by_sel));
+        select(&mut h, sun);
+        assert!(near(bar(&h), by_sel));
+    }
 
     #[test]
     fn the_task_bar_follows_the_selection_and_acts_on_it() {

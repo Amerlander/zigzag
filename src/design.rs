@@ -14,7 +14,9 @@ use crate::stitch::fill::{FillParams, tatami};
 use crate::stitch::satin::{self, Rails, SatinParams};
 use crate::stitch::stroke::running;
 use crate::svg::{Geometry, Shape};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// A continuous sequence of stitches.
 #[derive(Clone, Debug)]
@@ -468,7 +470,8 @@ fn hidden_zone(
     reach: f64,
     covers: &mut [Option<Cover>],
     shape_bounds: &mut Option<Vec<Bounds>>,
-) -> Option<Zone> {
+    kept: &Kept,
+) -> Option<Rc<Zone>> {
     let bounds = shape_bounds.get_or_insert_with(|| {
         shapes
             .iter()
@@ -507,7 +510,7 @@ fn hidden_zone(
             continue;
         }
         if covers[j]
-            .get_or_insert_with(|| coverage(&shapes[j]))
+            .get_or_insert_with(|| kept.coverage(&shapes[j]))
             .is_some()
         {
             later.push(j);
@@ -525,7 +528,7 @@ fn hidden_zone(
     if parts.is_empty() {
         return None;
     }
-    Zone::new(&parts, b)
+    kept.zone(&parts, b)
 }
 
 /// The outline a shape's start and end points are measured along: a
@@ -1448,6 +1451,138 @@ fn satin_columns(shape: &Shape) -> Vec<Vec<Polyline>> {
         .collect()
 }
 
+/// What one plan works out that the next can use as it is, kept in the
+/// [`PlanCache`]: each satin's columns (found from its rails: most of the
+/// work of planning a design with satins in it, and the same until that
+/// satin's outline or settings change), and the zones travel can hide in
+/// (the same while what covers the ground there is) and each fill's
+/// travel ring (the same while its area is). Moving one object leaves
+/// nearly all of them as they were.
+#[derive(Default)]
+struct Kept {
+    /// By [`satin_key`].
+    satins: RefCell<HashMap<u64, Rc<Vec<Vec<Polyline>>>>>,
+    /// By what the zone is made of and the box it's in.
+    zones: RefCell<HashMap<u64, Option<Rc<Zone>>>>,
+    /// By the area the ring is inset from (see [`travel_ring`]).
+    travels: RefCell<HashMap<u64, Rc<Vec<Polyline>>>>,
+    /// The zones and rings the plan under way has asked for: the rest are
+    /// forgotten when it's done.
+    used: RefCell<HashSet<u64>>,
+}
+
+/// A fingerprint of every coordinate of `parts`, with their fill rules.
+fn parts_key(h: &mut impl std::hash::Hasher, parts: &[(&[Polyline], FillRule)]) {
+    use std::hash::Hash;
+    parts.len().hash(h);
+    for (rings, rule) in parts {
+        (*rule == FillRule::EvenOdd).hash(h);
+        rings.len().hash(h);
+        for r in rings.iter() {
+            r.len().hash(h);
+            for p in r {
+                p.x.to_bits().hash(h);
+                p.y.to_bits().hash(h);
+            }
+        }
+    }
+}
+
+/// What a satin's columns depend on: its outline, its settings, and
+/// whether it's a shape's outline (see [`satin_rails`]).
+fn satin_key(shape: &Shape) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = hasher();
+    geometry_key(&shape.geometry).hash(&mut h);
+    format!("{:?}", shape.params).hash(&mut h);
+    shape.outline.hash(&mut h);
+    h.finish()
+}
+
+impl Kept {
+    /// [`satin_columns`], from last time when the satin is as it was.
+    fn satin_columns(&self, shape: &Shape) -> Rc<Vec<Vec<Polyline>>> {
+        let key = satin_key(shape);
+        if let Some(c) = self.satins.borrow().get(&key) {
+            return c.clone();
+        }
+        let c = Rc::new(satin_columns(shape));
+        self.satins.borrow_mut().insert(key, c.clone());
+        c
+    }
+
+    /// [`coverage`], a satin's from its kept columns.
+    fn coverage(&self, shape: &Shape) -> Cover {
+        if shape.params.kind.unwrap_or(Kind::Fill) == Kind::Satin {
+            return Some((
+                self.satin_columns(shape)
+                    .iter()
+                    .flatten()
+                    .cloned()
+                    .collect(),
+                FillRule::EvenOdd,
+            ));
+        }
+        coverage(shape)
+    }
+
+    /// [`Zone::new`], from last time when it was asked for the same ground.
+    fn zone(&self, parts: &[(&[Polyline], FillRule)], bounds: Bounds) -> Option<Rc<Zone>> {
+        use std::hash::{Hash, Hasher};
+        let key = {
+            let mut h = hasher();
+            for v in [bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y] {
+                v.to_bits().hash(&mut h);
+            }
+            parts_key(&mut h, parts);
+            h.finish()
+        };
+        self.used.borrow_mut().insert(key);
+        if let Some(z) = self.zones.borrow().get(&key) {
+            return z.clone();
+        }
+        let z = Zone::new(parts, bounds).map(Rc::new);
+        self.zones.borrow_mut().insert(key, z.clone());
+        z
+    }
+
+    /// [`travel_ring`], from last time when the area is as it was.
+    fn travel_ring(&self, rings: &[Polyline], rule: FillRule) -> Rc<Vec<Polyline>> {
+        use std::hash::Hasher;
+        let key = {
+            let mut h = hasher();
+            parts_key(&mut h, &[(rings, rule)]);
+            h.finish()
+        };
+        self.used.borrow_mut().insert(key);
+        if let Some(t) = self.travels.borrow().get(&key) {
+            return t.clone();
+        }
+        let t = Rc::new(travel_ring(rings, rule));
+        self.travels.borrow_mut().insert(key, t.clone());
+        t
+    }
+
+    /// A plan of `shapes` is starting: forget the satins that aren't
+    /// among them any more (or aren't as they were).
+    fn begin(&self, shapes: &[Shape]) {
+        let live: HashSet<u64> = shapes
+            .iter()
+            .filter(|s| s.params.kind == Some(Kind::Satin))
+            .map(satin_key)
+            .collect();
+        self.satins.borrow_mut().retain(|k, _| live.contains(k));
+        self.used.borrow_mut().clear();
+    }
+
+    /// The plan is made: forget the zones and rings it didn't ask for.
+    fn end(&self) {
+        let used = self.used.borrow();
+        self.zones.borrow_mut().retain(|k, _| used.contains(k));
+        self.travels.borrow_mut().retain(|k, _| used.contains(k));
+    }
+}
+
 fn geometry_bounds(g: &Geometry) -> Bounds {
     let mut b = Bounds::empty();
     match g {
@@ -1524,7 +1659,7 @@ fn sew_order(shapes: &[Shape], opt: &PlanOptions) -> Vec<usize> {
 
 /// Geometry each shape is actually stitched with, after overlap removal.
 pub fn effective_geometry(shapes: &[Shape], order: &[usize], opt: &PlanOptions) -> Vec<Geometry> {
-    effective_geometry_cached(shapes, order, opt, &mut HashMap::new())
+    effective_geometry_cached(shapes, order, opt, &mut HashMap::new(), &Kept::default())
 }
 
 /// [`effective_geometry`], reusing `cache` (keyed by what each result
@@ -1536,6 +1671,7 @@ fn effective_geometry_cached(
     order: &[usize],
     opt: &PlanOptions,
     cache: &mut HashMap<u64, Geometry>,
+    kept: &Kept,
 ) -> Vec<Geometry> {
     use std::hash::{Hash, Hasher};
     let mut out: Vec<Geometry> = shapes.iter().map(|s| s.geometry.clone()).collect();
@@ -1618,7 +1754,7 @@ fn effective_geometry_cached(
         let mut above: Vec<Vec<Polyline>> = Vec::new();
         for &j in &on_top {
             let c = cover[j].get_or_insert_with(|| {
-                coverage(&shapes[j]).map(|(r, f)| {
+                kept.coverage(&shapes[j]).map(|(r, f)| {
                     let rings = boolean::normalize(&r, f);
                     let mut bounds = Bounds::empty();
                     rings.iter().flatten().for_each(|&p| bounds.add(p));
@@ -1683,6 +1819,8 @@ pub struct PlanCache {
     /// Each shape's geometry after overlap removal, by what it depends on.
     overlap_shapes: HashMap<u64, Geometry>,
     runs: std::collections::HashMap<u64, (ShapeRuns, Vec<String>)>,
+    /// Satins' columns and travel's hiding places (see [`Kept`]).
+    kept: Kept,
 }
 
 fn hasher() -> std::collections::hash_map::DefaultHasher {
@@ -1755,6 +1893,8 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
     use std::hash::{Hash, Hasher};
     let order = sew_order(shapes, opt);
     let geo_keys: Vec<u64> = shapes.iter().map(|s| geometry_key(&s.geometry)).collect();
+    let kept = &cache.kept;
+    kept.begin(shapes);
     // (How narrow a satin may be is the checks' business: stitches kept
     // from last time are still right when only that changes.)
     let opt_key = format!(
@@ -1784,7 +1924,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
     let geometry = match &cache.overlaps {
         Some((k, g)) if *k == overlap_key && g.len() == shapes.len() => g.clone(),
         _ => {
-            let g = effective_geometry_cached(shapes, &order, opt, &mut cache.overlap_shapes);
+            let g = effective_geometry_cached(shapes, &order, opt, &mut cache.overlap_shapes, kept);
             cache.overlaps = Some((overlap_key, g.clone()));
             g
         }
@@ -1830,7 +1970,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
             continue;
         }
         // The fill's travel ring, worked out when a gap first needs it.
-        let travel: std::cell::OnceCell<Vec<Polyline>> = std::cell::OnceCell::new();
+        let travel: std::cell::OnceCell<Rc<Vec<Polyline>>> = std::cell::OnceCell::new();
         // A tatami fill's rows sewn so far (when it's in several
         // sections): the way to the next section goes straight across the
         // fill only where that isn't over them.
@@ -1844,10 +1984,10 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
         let mut fill_sewing: Option<Vec<(P, P)>> = None;
         // Likewise where travel is out of sight (and, for a satin, how
         // many of its columns had been sewn when that was worked out).
-        let mut zone: Option<(usize, Option<Zone>)> = None;
+        let mut zone: Option<(usize, Option<Rc<Zone>>)> = None;
         // (And where it's under what's sewn later, whatever this shape
         // has sewn: for a fill's travel over its own finished rows.)
-        let mut later_zone: Option<Option<Zone>> = None;
+        let mut later_zone: Option<Option<Rc<Zone>>> = None;
         // Under a fill's own stitches, if they're close enough to hide it.
         let own_hides = shape.params.kind.unwrap_or(Kind::Fill) == Kind::Fill
             && shape.params.fill_spacing(&opt.fabric) <= HIDING_SPACING;
@@ -1857,7 +1997,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
         // travel through a column that's done would lie on top of it, a
         // line down the middle of the satin.
         let is_satin = shape.params.kind == Some(Kind::Satin);
-        let satin_cols: std::cell::OnceCell<Vec<Vec<Polyline>>> = std::cell::OnceCell::new();
+        let satin_cols: std::cell::OnceCell<Rc<Vec<Vec<Polyline>>>> = std::cell::OnceCell::new();
         let satin_sewn: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
         // (The column of the piece in hand: sewn once the way to it has
         // been found, which may be under it.)
@@ -1927,7 +2067,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
             })
             .map(|j| {
                 let cover = covers[j]
-                    .get_or_insert_with(|| coverage(&shapes[j]))
+                    .get_or_insert_with(|| kept.coverage(&shapes[j]))
                     .clone();
                 let ends = match &shapes[j].geometry {
                     Geometry::Stroke { lines, .. } => lines
@@ -1991,7 +2131,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
                     && let Some((rings, rule)) = sr.area.as_ref()
                 {
                     across = route_along(
-                        travel.get_or_init(|| travel_ring(rings, *rule)),
+                        travel.get_or_init(|| kept.travel_ring(rings, *rule)),
                         prev,
                         start,
                         opt.travel_route,
@@ -2019,6 +2159,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
                                     opt.travel_route,
                                     &mut covers,
                                     &mut shape_bounds,
+                                    kept,
                                 )
                             },
                         ) > FEW_ROWS
@@ -2038,7 +2179,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
                             let done = satin_sewn.borrow();
                             (
                                 satin_cols
-                                    .get_or_init(|| satin_columns(shape))
+                                    .get_or_init(|| kept.satin_columns(shape))
                                     .iter()
                                     .enumerate()
                                     .filter(|(k, _)| !done.contains(k))
@@ -2063,6 +2204,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
                                 opt.travel_route,
                                 &mut covers,
                                 &mut shape_bounds,
+                                kept,
                             ),
                         ));
                     }
@@ -2092,6 +2234,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
                                     opt.travel_route,
                                     &mut covers,
                                     &mut shape_bounds,
+                                    kept,
                                 )
                             },
                         ) > FEW_ROWS
@@ -2215,7 +2358,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
                     &group,
                     cursor,
                     area,
-                    travel.get_or_init(|| travel_ring(&area.0, area.1)),
+                    travel.get_or_init(|| kept.travel_ring(&area.0, area.1)),
                     opt,
                 )
             {
@@ -2342,7 +2485,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
                 // somewhere for travel to hide: which one it is, by a
                 // stitch across its middle.
                 if is_satin && pts.len() >= 2 {
-                    let cols = satin_cols.get_or_init(|| satin_columns(shape));
+                    let cols = satin_cols.get_or_init(|| kept.satin_columns(shape));
                     let done = satin_sewn.borrow();
                     let probes = [pts.len() / 2, pts.len() * 3 / 4, pts.len() / 4];
                     let found = probes.iter().find_map(|&k| {
@@ -2454,6 +2597,7 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
     }
     // Forget shapes no longer there (or no longer like that).
     cache.runs.retain(|k, _| used.contains(k));
+    kept.end();
     let keep: Vec<bool> = design.blocks.iter().map(|b| !b.runs.is_empty()).collect();
     let mut k = keep.iter();
     design.block_shapes.retain(|_| *k.next().unwrap());
@@ -2528,8 +2672,8 @@ fn over_sewn(
     path: &[P],
     start: P,
     rows: &[(P, P)],
-    later: &mut Option<Option<Zone>>,
-    zone: impl FnOnce() -> Option<Zone>,
+    later: &mut Option<Option<Rc<Zone>>>,
+    zone: impl FnOnce() -> Option<Rc<Zone>>,
 ) -> usize {
     let mut whole = vec![prev];
     whole.extend(path.iter().copied());
@@ -3177,6 +3321,72 @@ mod tests {
         // And once nothing has changed, nothing is redone.
         let again = plan_cached("t", &moved, &opt, &mut cache);
         assert!(same_stitches(&again, &fresh));
+    }
+
+    /// What one plan keeps for the next (satins' columns, the zones travel
+    /// hides in, fills' travel rings) never changes a plan: with any one
+    /// object moved, or gone, the plan from a warm cache is the plan from
+    /// nothing, stitch for stitch.
+    #[test]
+    fn a_plan_from_a_warm_cache_is_the_plan_from_nothing() {
+        for file in ["badge.svg", "groups.svg", "lettering.svg"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples")
+                .join(file);
+            let base = crate::document::Document::open(&path).unwrap();
+            let opt = PlanOptions {
+                remove_overlaps: true,
+                ..base.plan_options()
+            };
+            let mut cache = PlanCache::default();
+            let whole = plan("t", &base.shapes, &opt);
+            assert!(same_stitches(
+                &plan_cached("t", &base.shapes, &opt, &mut cache),
+                &whole
+            ));
+            for i in 0..base.shapes.len() {
+                let mut doc = base.clone();
+                doc.preview_transform_from(&base, &[i], [1.0, 0.0, 0.0, 1.0, 37.0, -12.0]);
+                assert!(
+                    same_stitches(
+                        &plan_cached("t", &doc.shapes, &opt, &mut cache),
+                        &plan("t", &doc.shapes, &opt)
+                    ),
+                    "{file}: object {i} moved"
+                );
+                let rest: Vec<Shape> = (0..base.shapes.len())
+                    .filter(|&j| j != i)
+                    .map(|j| base.shapes[j].clone())
+                    .collect();
+                assert!(
+                    same_stitches(
+                        &plan_cached("t", &rest, &opt, &mut cache),
+                        &plan("t", &rest, &opt)
+                    ),
+                    "{file}: object {i} gone"
+                );
+                // And back as it was: what was kept is still right.
+                assert!(
+                    same_stitches(&plan_cached("t", &base.shapes, &opt, &mut cache), &whole),
+                    "{file}: object {i} back"
+                );
+            }
+            // A setting changed: a satin's columns are its settings' too.
+            for i in 0..base.shapes.len() {
+                let mut shapes = base.shapes.clone();
+                shapes[i].params.kind = Some(match shapes[i].params.kind {
+                    Some(Kind::Satin) => Kind::Fill,
+                    _ => Kind::Satin,
+                });
+                assert!(
+                    same_stitches(
+                        &plan_cached("t", &shapes, &opt, &mut cache),
+                        &plan("t", &shapes, &opt)
+                    ),
+                    "{file}: object {i} sewn another way"
+                );
+            }
+        }
     }
 
     #[test]

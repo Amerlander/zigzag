@@ -156,12 +156,40 @@ impl Studio {
                 // Groups: the Pen's (Pen, Add / Delete Anchor Point, Anchor
                 // Point) and the shapes', each in one slot with a flyout.
                 match t {
+                    Tool::Direct => {
+                        self.group_button(ui, crate::flyout::Group::Direct);
+                        continue;
+                    }
+                    Tool::Measure => {
+                        self.group_button(ui, crate::flyout::Group::Sample);
+                        continue;
+                    }
                     Tool::Pen => {
                         self.group_button(ui, crate::flyout::Group::Pen);
                         continue;
                     }
                     Tool::Shape => {
                         self.group_button(ui, crate::flyout::Group::Shape);
+                        // Rotate comes after the drawing tools, as in
+                        // Illustrator. (Not one of `TOOLS`: R alone is
+                        // the Run stitch, so its key is Shift+R.)
+                        let r = icon_button(
+                            ui,
+                            Icon::RotateTool,
+                            "Rotate",
+                            self.tool == Tool::Rotate,
+                            30.0,
+                        )
+                        .on_hover_text("Rotate (Shift+R)");
+                        if r.clicked() {
+                            self.set_tool(Tool::Rotate);
+                        }
+                        // A double-click on the tool: its dialog, as in
+                        // VectorCraft and Illustrator.
+                        if r.double_clicked() {
+                            self.open_rotate_dialog(None);
+                        }
+                        self.group_button(ui, crate::flyout::Group::Build);
                         continue;
                     }
                     Tool::Brush => {
@@ -172,12 +200,9 @@ impl Studio {
                 }
                 let icon = match t {
                     Tool::Select => Icon::Select,
-                    Tool::Direct => Icon::Direct,
                     Tool::Hand => Icon::Hand,
-                    Tool::Brush => Icon::Brush,
                     Tool::Text => Icon::Text,
                     Tool::Angle => Icon::Angle,
-                    Tool::Measure => Icon::Measure,
                     _ => continue,
                 };
                 let tip = if t == Tool::Text {

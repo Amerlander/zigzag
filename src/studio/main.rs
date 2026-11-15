@@ -6,20 +6,26 @@ mod agent;
 mod agent_log;
 mod app;
 mod app_icon;
+mod backing;
 mod brush;
+mod build_tools;
 mod canvas;
 mod capture;
 mod chrome;
 mod commands;
 mod crash;
 mod cursors;
+mod curvature;
 mod density;
 mod dialog;
 mod dock;
+mod eyedropper;
+mod file_dialog;
 mod flyout;
 mod gpu;
 mod icons;
 mod kits;
+mod lasso;
 mod layout;
 mod lettering;
 mod lights;
@@ -35,6 +41,7 @@ mod pen;
 mod perf_bench;
 mod planner;
 mod profile;
+mod rotate;
 mod session;
 mod settings;
 mod sew;
@@ -48,6 +55,7 @@ mod theme;
 mod threads;
 mod tools;
 mod trace_ui;
+mod ui_scale;
 mod units;
 mod update;
 mod view_tools;
@@ -118,11 +126,13 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: {
+            // Room for the layout at the interface size in Settings.
+            let (first, min) = ui_scale::first_window(settings::Prefs::load().ui_size);
             let v = eframe::egui::ViewportBuilder::default()
                 .with_title("ZigZag")
                 .with_app_id("zigzag-studio")
-                .with_inner_size([1360.0, 860.0])
-                .with_min_inner_size([1000.0, 620.0])
+                .with_inner_size(first)
+                .with_min_inner_size(min)
                 .with_drag_and_drop(true);
             // macOS: content runs under a transparent title bar, so the toolbar
             // and traffic lights share one strip (a unified toolbar).

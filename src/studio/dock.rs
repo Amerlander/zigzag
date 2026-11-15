@@ -181,6 +181,11 @@ pub struct DockState {
     /// The Threads panel shows a palette to click (its menu's Show Palette).
     /// Off by default: the thread picker has the same palettes.
     pub show_palette: bool,
+    /// Layers lists what's sewn first at the top (its menu's List in Sewing
+    /// Order; View › Sewing Order is the numbers on the canvas),
+    /// as the Threads panel does and embroidery software's object lists.
+    /// Off by default: what's on top is at the top, as in Illustrator.
+    pub layers_sewing_order: bool,
     /// Where each panel lives.
     pub place: [Place; N],
     /// Panel order within the docks.
@@ -223,6 +228,7 @@ impl Default for DockState {
             hidden,
             collapsed: [false; N],
             show_palette: false,
+            layers_sewing_order: false,
             units: Default::default(),
             place: ALL.map(default_place),
             order: ALL.to_vec(),
@@ -294,6 +300,7 @@ impl DockState {
         d.left = v["left"].as_bool().unwrap_or(true);
         d.right = v["right"].as_bool().unwrap_or(true);
         d.show_palette = v["show_palette"].as_bool().unwrap_or(false);
+        d.layers_sewing_order = v["layers_sewing_order"].as_bool().unwrap_or(false);
         d.units = v["units"]
             .as_str()
             .and_then(crate::units::Unit::named)
@@ -385,6 +392,7 @@ impl DockState {
             "left": self.left,
             "right": self.right,
             "show_palette": self.show_palette,
+            "layers_sewing_order": self.layers_sewing_order,
             "units": self.units.suffix(),
             "task_bar": self.task_bar,
             "agent_share": self.agent_share,
@@ -517,9 +525,11 @@ impl DockState {
     pub fn reset_layout(&mut self) {
         let path = self.path.take();
         let (show_palette, units) = (self.show_palette, self.units);
+        let layers_sewing_order = self.layers_sewing_order;
         *self = DockState {
             path,
             show_palette,
+            layers_sewing_order,
             units,
             ..DockState::default()
         };
@@ -937,6 +947,20 @@ impl Studio {
                     // (Which agent: the name in the header.)
                     if ui.button("New Chat").clicked() {
                         self.agent.new_chat();
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                if id == PanelId::Objects {
+                    let on = self.dock.layers_sewing_order;
+                    if ui
+                        .add(egui::Button::new("List in Sewing Order").selected(on))
+                        .on_hover_text(
+                            "List the layers as they sew, the first at the top. Off: what's on top is at the top, as in Illustrator.",
+                        )
+                        .clicked()
+                    {
+                        self.dock.layers_sewing_order = !on;
                         ui.close();
                     }
                     ui.separator();
@@ -1589,8 +1613,12 @@ impl Studio {
     }
 
     /// The Layers list as a tree: groups (open or closed) and their objects,
-    /// in sewing order. Layers aren't groups (see `svg::layer_ids`), and a
-    /// group of one object is listed as the object.
+    /// what's on top first (as Illustrator's Layers, and VectorCraft's): the
+    /// list reads as the stack does, so the last layer sewn is the first row
+    /// and the background the last. Or, with the panel menu's List in Sewing Order,
+    /// the other way up: what's sewn first is first. Layers aren't groups
+    /// (see `svg::layer_ids`), and a group of one object is listed as the
+    /// object.
     fn object_rows(&self) -> Vec<ObjRow> {
         let n = self.doc.shapes.len();
         let mut members: std::collections::HashMap<&str, Vec<usize>> =
@@ -1602,7 +1630,8 @@ impl Studio {
         }
         let mut rows = Vec::new();
         let mut stack: Vec<String> = Vec::new();
-        for i in 0..n {
+        let sewn = self.dock.layers_sewing_order;
+        for i in (0..n).map(|k| if sewn { k } else { n - 1 - k }) {
             // A group of one (a shape and its outline are one) is shown as
             // just its object.
             let gs: Vec<&String> = self.doc.shapes[i]
@@ -1694,6 +1723,9 @@ impl Studio {
             .and_then(|_| ui.input(|i| i.pointer.interact_pos()));
         let mut drop: Option<(usize, f32, f32)> = None;
         let mut drag_start: Option<(Vec<usize>, String)> = None;
+        // Which way up the list is: a row up is a layer later, unless it's
+        // in sewing order (then it's a layer earlier).
+        let sewn = self.dock.layers_sewing_order;
         egui::ScrollArea::vertical()
             .id_salt("objects")
             .max_height(list_h)
@@ -1731,7 +1763,7 @@ impl Studio {
                                 }
                                 drag_start = Some((moving, Studio::group_label(id)));
                             }
-                            // Dragged over: before the group, or after it
+                            // Dragged over: above the group, or below it
                             // (at the top of it, while it's open).
                             if let Some(q) = over.filter(|q| rect.contains(*q)) {
                                 let open = self.layout.expanded.contains(id);
@@ -1739,12 +1771,17 @@ impl Studio {
                                     members.iter().copied().min().unwrap_or(0),
                                     members.iter().copied().max().unwrap_or(0),
                                 );
-                                drop = Some(if q.y < rect.center().y {
-                                    (first, rect.top(), rect.left() + indent)
-                                } else if open {
-                                    (first, rect.bottom(), rect.left() + indent + 14.0)
+                                let (above, below) = if sewn {
+                                    (first, last + 1)
                                 } else {
-                                    (last + 1, rect.bottom(), rect.left() + indent)
+                                    (last + 1, first)
+                                };
+                                drop = Some(if q.y < rect.center().y {
+                                    (above, rect.top(), rect.left() + indent)
+                                } else if open {
+                                    (above, rect.bottom(), rect.left() + indent + 14.0)
+                                } else {
+                                    (below, rect.bottom(), rect.left() + indent)
                                 });
                             }
                             eye_and_lock(
@@ -1878,12 +1915,13 @@ impl Studio {
                     );
                     let label = self.names.get(i).cloned().unwrap_or_default();
                     let selected = all_sel.contains(&i);
-                    // Dragged over: before this layer, or after it.
+                    // Dragged over: above this layer, or below it.
                     if let Some(q) = over.filter(|q| rect.contains(*q)) {
+                        let (above, below) = if sewn { (i, i + 1) } else { (i + 1, i) };
                         drop = Some(if q.y < rect.center().y {
-                            (i, rect.top(), rect.left() + indent)
+                            (above, rect.top(), rect.left() + indent)
                         } else {
-                            (i + 1, rect.bottom(), rect.left() + indent)
+                            (below, rect.bottom(), rect.left() + indent)
                         });
                     }
                     last_row = Some((rect, indent));
@@ -2061,12 +2099,14 @@ impl Studio {
                 if let Some(q) = over.filter(|q| {
                     list.x_range().contains(q.x) && q.y >= list.top() && q.y <= list.bottom() + 28.0
                 }) {
-                    // Below the last layer: to the end.
+                    // Below the last row: under them all (sewn first, or
+                    // in sewing order last).
                     if drop.is_none()
                         && shown_to_the_end
                         && let Some((rect, indent)) = last_row.filter(|(r, _)| q.y >= r.bottom())
                     {
-                        drop = Some((self.doc.shapes.len(), rect.bottom(), rect.left() + indent));
+                        let end = if sewn { self.doc.shapes.len() } else { 0 };
+                        drop = Some((end, rect.bottom(), rect.left() + indent));
                     }
                     if let Some((_, y, x)) = drop {
                         ui.painter().line_segment(
@@ -2152,11 +2192,18 @@ impl Studio {
                     self.delete_selection();
                 }
                 ui.add_space(theme::space::S);
-                if icon_button(ui, Icon::ArrowUp, "Sew earlier", false, 24.0).clicked() {
-                    self.move_selected(-1);
+                // Up the list is up the stack, sewn later; in sewing
+                // order it's sewn earlier.
+                let (up, down) = if self.dock.layers_sewing_order {
+                    (("Sew earlier", -1), ("Sew later", 1))
+                } else {
+                    (("Sew later", 1), ("Sew earlier", -1))
+                };
+                if icon_button(ui, Icon::ArrowUp, up.0, false, 24.0).clicked() {
+                    self.move_selected(up.1);
                 }
-                if icon_button(ui, Icon::ArrowDown, "Sew later", false, 24.0).clicked() {
-                    self.move_selected(1);
+                if icon_button(ui, Icon::ArrowDown, down.0, false, 24.0).clicked() {
+                    self.move_selected(down.1);
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2172,8 +2219,9 @@ impl Studio {
     /// Layers dragged in the Layers list (after VectorCraft's): `start`
     /// begins a drag of those objects, called `label`; while one's under
     /// way a dimmed copy of the row follows the pointer; and when the
-    /// button's let go they move to `drop` (before the object numbered so;
-    /// the line in the list shows where), as one undo step. Escape, or
+    /// button's let go they move to `drop` (before the object numbered so
+    /// in the sewing order, which in the list is under its row; the line
+    /// there shows where), as one undo step. Escape, or
     /// letting go anywhere else, leaves them where they were.
     fn layer_drag(
         &mut self,
@@ -2287,13 +2335,14 @@ impl Studio {
         menu_separator(ui);
         self.action_row(ui, A::FlipH, "Flip Horizontal", RowIcon::Icon(Icon::FlipH));
         self.action_row(ui, A::FlipV, "Flip Vertical", RowIcon::Icon(Icon::FlipV));
-        self.action_row(
-            ui,
-            A::BringToFront,
-            "Sew Last",
-            RowIcon::Icon(Icon::ArrowDown),
-        );
-        self.action_row(ui, A::SendToBack, "Sew First", RowIcon::Icon(Icon::ArrowUp));
+        // The arrows point where it goes in the Layers list.
+        let (last, first) = if self.dock.layers_sewing_order {
+            (Icon::ArrowDown, Icon::ArrowUp)
+        } else {
+            (Icon::ArrowUp, Icon::ArrowDown)
+        };
+        self.action_row(ui, A::BringToFront, "Sew Last", RowIcon::Icon(last));
+        self.action_row(ui, A::SendToBack, "Sew First", RowIcon::Icon(first));
         // One path drawing several shapes: offer to split it up.
         let compound = match &self.doc.shapes[i].geometry {
             zigzag::svg::Geometry::Fill { rings, .. } => rings.len() > 1,
@@ -2473,9 +2522,11 @@ impl Studio {
         let default_width = design::default_satin_width(&self.doc.shapes[i]);
         // Only a satin needs its width (worked out once, not every frame;
         // not at all while its text is being typed, when every keystroke
-        // would mean finding the rails of every letter again).
+        // would mean finding the rails of every letter again; and not
+        // before its stitches are planned: see `satin_info_shown`).
         let satin_width = if current == Kind::Satin && !self.typing_into(i) {
-            self.satin_info(i).mean_width
+            self.satin_info_shown(i)
+                .map_or(default_width, |info| info.mean_width)
         } else if current == Kind::Satin {
             default_width
         } else {
@@ -3497,8 +3548,12 @@ mod tests {
             h.run_steps(3);
         };
         assert_eq!(order(&h), ["one", "two", "three", "four"]);
+        // What's on top is listed first, the background last.
+        assert!(row(&h, "four").top() < row(&h, "three").top());
+        assert!(row(&h, "two").top() < row(&h, "one").top());
 
-        // "four" onto the top half of "two": it's sewn before it.
+        // "four" onto the top half of "two": it goes just above it, sewn
+        // right after it.
         let (from, onto) = (row(&h, "four"), row(&h, "two"));
         h.hover_at(from.center());
         h.run_steps(1);
@@ -3512,23 +3567,24 @@ mod tests {
         h.drop_at(onto.center() - Vec2::new(0.0, 6.0));
         h.run_steps(3);
         assert!(h.state().dock_ui.layer_drag.is_none());
-        assert_eq!(order(&h), ["one", "four", "two", "three"]);
+        assert_eq!(order(&h), ["one", "two", "four", "three"]);
         assert_eq!(h.state().undo.len(), 1, "one undo step");
         // The order is the file's: it comes back from it.
         let saved = h.state().doc.to_svg().unwrap();
         let again = zigzag::document::Document::from_svg(&saved, "t", None).unwrap();
         assert_eq!(
             zigzag::svg::display_names(&again.shapes),
-            ["one", "four", "two", "three"]
+            ["one", "two", "four", "three"]
         );
 
-        // Onto the bottom half of a row: after it. Below them all: last.
-        let (from, onto) = (row(&h, "one"), row(&h, "two"));
+        // Onto the bottom half of a row: under it, sewn before it. Below
+        // them all: sewn first.
+        let (from, onto) = (row(&h, "three"), row(&h, "two"));
         drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
-        assert_eq!(order(&h), ["four", "two", "one", "three"]);
-        let (from, last) = (row(&h, "four"), row(&h, "three"));
+        assert_eq!(order(&h), ["one", "three", "two", "four"]);
+        let (from, last) = (row(&h, "four"), row(&h, "one"));
         drag(&mut h, from.center(), last.center() + Vec2::new(0.0, 40.0));
-        assert_eq!(order(&h), ["two", "one", "three", "four"]);
+        assert_eq!(order(&h), ["four", "one", "three", "two"]);
         assert_eq!(h.state().undo.len(), 3);
 
         // Dropped where it is already, or outside the list: nothing, and
@@ -3536,7 +3592,7 @@ mod tests {
         let at = row(&h, "one");
         drag(&mut h, at.center(), at.center() + Vec2::new(0.0, 6.0));
         drag(&mut h, at.center(), at.center() - Vec2::new(400.0, 0.0));
-        assert_eq!(order(&h), ["two", "one", "three", "four"]);
+        assert_eq!(order(&h), ["four", "one", "three", "two"]);
         assert_eq!(h.state().undo.len(), 3);
         h.get_by_label("three").click();
         h.run_steps(2);
@@ -3546,16 +3602,16 @@ mod tests {
         // own order, and stay selected.
         h.state_mut().set_selection(&[0, 2]);
         h.run_steps(2);
-        let (from, onto) = (row(&h, "three"), row(&h, "four"));
-        drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
-        assert_eq!(order(&h), ["one", "four", "two", "three"]);
+        let (from, onto) = (row(&h, "three"), row(&h, "two"));
+        drag(&mut h, from.center(), onto.center() - Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["one", "two", "four", "three"]);
         let mut sel = h.state().sel_indices();
         sel.sort_unstable();
         assert_eq!(sel, [2, 3]);
         // Undo puts them back.
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
         h.run_steps(3);
-        assert_eq!(order(&h), ["two", "one", "three", "four"]);
+        assert_eq!(order(&h), ["four", "one", "three", "two"]);
 
         // Escape while dragging calls it off.
         let (from, onto) = (row(&h, "four"), row(&h, "two"));
@@ -3569,7 +3625,7 @@ mod tests {
         h.run_steps(2);
         h.drop_at(onto.center());
         h.run_steps(3);
-        assert_eq!(order(&h), ["two", "one", "three", "four"]);
+        assert_eq!(order(&h), ["four", "one", "three", "two"]);
     }
 
     #[test]
@@ -3612,19 +3668,159 @@ mod tests {
             h.run_steps(3);
         };
         assert_eq!(order(&h), ["left", "right", "solo", "other"]);
-        // The group's row (closed) dragged below "solo": both its layers go.
+        // (The document's only group starts open; closed, for its row.)
+        assert!(h.state().layout.expanded.contains("pair"));
+        h.state_mut().layout.expanded.clear();
+        h.run_steps(2);
+        // The group's row (closed) dragged above "solo": both its layers go.
         let (from, onto) = (row(&h, "pair"), row(&h, "solo"));
-        drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
-        assert_eq!(order(&h), ["solo", "left", "right", "other"]);
-        // A layer dropped on the group's top half goes before all of it;
-        // on its bottom half, after all of it.
-        let (from, onto) = (row(&h, "other"), row(&h, "pair"));
         drag(&mut h, from.center(), onto.center() - Vec2::new(0.0, 6.0));
-        assert_eq!(order(&h), ["solo", "other", "left", "right"]);
+        assert_eq!(order(&h), ["solo", "left", "right", "other"]);
+        // A layer dropped on the group's top half goes above all of it
+        // (sewn after it); on its bottom half, under all of it.
         let (from, onto) = (row(&h, "solo"), row(&h, "pair"));
+        drag(&mut h, from.center(), onto.center() - Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["left", "right", "solo", "other"]);
+        let (from, onto) = (row(&h, "other"), row(&h, "pair"));
         drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
         assert_eq!(order(&h), ["other", "left", "right", "solo"]);
         assert_eq!(h.state().undo.len(), 3);
+    }
+
+    #[test]
+    fn layers_in_sewing_order_list_and_drop_the_other_way_up() {
+        use egui_kittest::kittest::NodeT;
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="40mm" viewBox="0 0 100 40">
+            <g id="pair">
+              <rect id="left" x="5" y="5" width="15" height="15" fill="#c00000"/>
+              <rect id="right" x="25" y="5" width="15" height="15" fill="#00a000"/>
+            </g>
+            <rect id="solo" x="45" y="5" width="15" height="15" fill="#0000c0"/>
+            <rect id="other" x="65" y="5" width="15" height="15" fill="#c0a000"/>
+        </svg>"##;
+        let doc = zigzag::document::Document::from_svg(svg, "t", None).unwrap();
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        h.state_mut().set_document(doc);
+        h.run_steps(4);
+        let order = |h: &Harness<'_, Studio>| h.state().names.clone();
+        let row = |h: &Harness<'_, Studio>, name: &str| {
+            h.query_all_by_label(name)
+                .find(|n| n.accesskit_node().role() == egui::accesskit::Role::ListItem)
+                .unwrap()
+                .rect()
+        };
+        let drag = |h: &mut Harness<'_, Studio>, from: Pos2, to: Pos2| {
+            h.hover_at(from);
+            h.run_steps(1);
+            h.drag_at(from);
+            h.run_steps(1);
+            for k in 1..=4 {
+                h.hover_at(from + (to - from) * (k as f32 / 4.0));
+                h.run_steps(1);
+            }
+            h.drop_at(to);
+            h.run_steps(3);
+        };
+        // What's on top is at the top, until the panel's menu says
+        // otherwise: then what's sewn first is.
+        assert!(row(&h, "other").top() < row(&h, "solo").top());
+        assert!(row(&h, "solo").top() < row(&h, "pair").top());
+        h.get_by_label("Layers menu").click();
+        h.run_steps(2);
+        h.get_by_label("List in Sewing Order").click();
+        h.run_steps(3);
+        assert!(h.state().dock.layers_sewing_order);
+        assert!(row(&h, "pair").top() < row(&h, "left").top());
+        assert!(row(&h, "left").top() < row(&h, "right").top());
+        assert!(row(&h, "right").top() < row(&h, "solo").top());
+        assert!(row(&h, "solo").top() < row(&h, "other").top());
+        assert_eq!(order(&h), ["left", "right", "solo", "other"]);
+
+        // The top half of a row is before it now, the bottom half after,
+        // and below them all is last.
+        let (from, onto) = (row(&h, "other"), row(&h, "solo"));
+        drag(&mut h, from.center(), onto.center() - Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["left", "right", "other", "solo"]);
+        let (from, onto) = (row(&h, "other"), row(&h, "solo"));
+        drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["left", "right", "solo", "other"]);
+        let (from, last) = (row(&h, "solo"), row(&h, "other"));
+        drag(&mut h, from.center(), last.center() + Vec2::new(0.0, 40.0));
+        assert_eq!(order(&h), ["left", "right", "other", "solo"]);
+        // A closed group: its top half is before all of it, its bottom
+        // half after all of it.
+        h.state_mut().layout.expanded.clear();
+        h.run_steps(2);
+        let (from, onto) = (row(&h, "solo"), row(&h, "pair"));
+        drag(&mut h, from.center(), onto.center() - Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["solo", "left", "right", "other"]);
+        let (from, onto) = (row(&h, "solo"), row(&h, "pair"));
+        drag(&mut h, from.center(), onto.center() + Vec2::new(0.0, 6.0));
+        assert_eq!(order(&h), ["left", "right", "solo", "other"]);
+
+        // The arrows under the list move the row the way they point.
+        h.state_mut().set_selection(&[2]);
+        h.run_steps(2);
+        h.get_by_label("Sew earlier").click();
+        h.run_steps(3);
+        assert_eq!(order(&h), ["left", "solo", "right", "other"]);
+        let (up, down) = (
+            h.get_by_label("Sew earlier").rect(),
+            h.get_by_label("Sew later").rect(),
+        );
+        assert!(up.left() < down.left(), "up arrow first: earlier");
+        h.state_mut().dock.layers_sewing_order = false;
+        h.run_steps(2);
+        let (up, down) = (
+            h.get_by_label("Sew later").rect(),
+            h.get_by_label("Sew earlier").rect(),
+        );
+        assert!(up.left() < down.left(), "up arrow first: later");
+        h.get_by_label("Sew later").click();
+        h.run_steps(3);
+        assert_eq!(order(&h), ["left", "right", "solo", "other"]);
+    }
+
+    #[test]
+    fn a_documents_only_group_starts_open() {
+        let open = |body: &str| {
+            let svg = format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="40mm" viewBox="0 0 100 40">{body}</svg>"##
+            );
+            let mut s = Studio::with_file(None, None);
+            s.set_document(zigzag::document::Document::from_svg(&svg, "t", None).unwrap());
+            let mut open: Vec<String> = s.layout.expanded.iter().cloned().collect();
+            open.sort();
+            open
+        };
+        let rect = |id: &str, x: u32| {
+            format!(r##"<rect id="{id}" x="{x}" y="5" width="10" height="10" fill="#c00000"/>"##)
+        };
+        let (a, b, c, d) = (rect("a", 5), rect("b", 20), rect("c", 35), rect("d", 50));
+        // The whole design in one group, or one group with layers beside it.
+        assert_eq!(open(&format!(r#"<g id="all">{a}{b}{c}</g>"#)), ["all"]);
+        assert_eq!(open(&format!(r#"<g id="pair">{a}{b}</g>{c}"#)), ["pair"]);
+        // Nothing in it but another group: that one too, and no further
+        // once there's a choice.
+        assert_eq!(
+            open(&format!(
+                r#"<g id="outer"><g id="inner"><g id="p">{a}{b}</g><g id="q">{c}{d}</g></g></g>"#
+            )),
+            ["inner", "outer"]
+        );
+        // Two groups, or none: as they were, closed.
+        assert!(open(&format!(r#"<g id="one">{a}{b}</g><g id="two">{c}{d}</g>"#)).is_empty());
+        assert!(open(&format!("{a}{b}")).is_empty());
+        // The next document doesn't keep the last one's open groups.
+        let mut s = Studio::with_file(None, None);
+        s.layout.expanded.insert("stale".into());
+        s.set_document(zigzag::document::Document::empty());
+        assert!(s.layout.expanded.is_empty());
     }
 
     #[test]
@@ -4093,8 +4289,11 @@ mod tests {
         d.iconic = [false, true];
         d.left = false;
         d.join_tab(PanelId::Transform, PanelId::Stitch);
+        assert!(!d.layers_sewing_order);
+        d.layers_sewing_order = true;
         d.save();
         let e = DockState::load_from(Some(file.clone()));
+        assert!(e.layers_sewing_order);
         assert_eq!(e.place_of(PanelId::Threads), Place::Float);
         assert_eq!(
             e.float_at[PanelId::Threads.index()],
