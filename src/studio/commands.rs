@@ -1055,7 +1055,7 @@ impl Studio {
         // Plain menu buttons (not a MenuBar, which claims the whole row).
         ui.scope(|ui| {
             ui.visuals_mut().button_frame = false;
-            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().item_spacing.x = 12.0;
             for (title, entries) in menus() {
                 ui.menu_button(title, |ui| self.menu_entries(ui, &ctx, &entries));
             }
@@ -1074,16 +1074,27 @@ impl Studio {
                 }
                 Item(a, label, sc) => {
                     let checked = self.action_checked(*a).unwrap_or(false);
-                    let text = if checked {
-                        format!("✓  {label}")
-                    } else {
-                        format!("     {label}")
-                    };
-                    let mut b = egui::Button::new(text);
+                    // The check is drawn, not typed: the fallback UI fonts
+                    // (Arial on Windows) have no ✓ and show a box instead.
+                    let mut b = egui::Button::new(format!("      {label}"));
                     if let Some(sc) = sc {
                         b = b.shortcut_text(ctx.format_shortcut(&sc.egui()));
                     }
-                    if ui.add_enabled(self.action_enabled(*a), b).clicked() {
+                    let resp = ui.add_enabled(self.action_enabled(*a), b);
+                    if checked {
+                        let x = resp.rect.left() + ui.spacing().button_padding.x + 6.0;
+                        let r = egui::Rect::from_center_size(
+                            egui::pos2(x, resp.rect.center().y),
+                            egui::Vec2::splat(12.0),
+                        );
+                        crate::icons::paint(
+                            ui.painter(),
+                            r,
+                            crate::icons::Icon::Check,
+                            ui.visuals().text_color(),
+                        );
+                    }
+                    if resp.clicked() {
                         self.run_action(*a);
                         ui.close();
                     }

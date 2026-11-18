@@ -104,6 +104,7 @@ fn system_font() -> Option<(String, Vec<u8>, u32)> {
     let db = zigzag::svg::fontdb();
     for family in [
         "Inter",
+        "Segoe UI",
         "Cantarell",
         "Helvetica Neue",
         "Helvetica",

@@ -32,9 +32,24 @@ impl AgentKind {
         self as usize
     }
 
-    /// How to install its command-line tool on a Mac: (how, command) pairs,
-    /// the first recommended, then how to sign in.
+    /// How to install its command-line tool on this computer (Windows or a Mac):
+    /// (how, command) pairs, the first recommended, then how to sign in.
     pub fn install_steps(self) -> (&'static [(&'static str, &'static str)], &'static str) {
+        if cfg!(windows) {
+            return match self {
+                AgentKind::Codex => (
+                    &[("With npm", "npm install -g @openai/codex")],
+                    "Then run `codex` once in a terminal and choose Sign in with ChatGPT.",
+                ),
+                AgentKind::Claude => (
+                    &[(
+                        "Recommended (PowerShell)",
+                        "irm https://claude.ai/install.ps1 | iex",
+                    )],
+                    "Then run `claude` once in a terminal to sign in.",
+                ),
+            };
+        }
         match self {
             AgentKind::Codex => (
                 &[
@@ -140,6 +155,10 @@ Don't save or export unless asked. Finish with one or two sentences on what you 
 /// PATH from the login shell, so `claude` and `codex` (and node) are found
 /// even when the app is opened from Finder.
 fn login_path() -> Option<String> {
+    // Windows apps get the user's PATH already, and there's no login shell.
+    if cfg!(windows) {
+        return None;
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let out = Command::new(&shell)
         .args(["-ilc", "printf '__TL__%s__TL__' \"$PATH\""])
@@ -160,7 +179,9 @@ fn locate(kind: AgentKind, login: Option<&str>) -> Option<PathBuf> {
     if let Some(p) = std::env::var_os(env) {
         return Some(PathBuf::from(p));
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
     let mut dirs: Vec<PathBuf> = Vec::new();
     for p in [login.map(str::to_string), std::env::var("PATH").ok()]
         .into_iter()
@@ -177,10 +198,28 @@ fn locate(kind: AgentKind, login: Option<&str>) -> Option<PathBuf> {
     ] {
         dirs.push(PathBuf::from(&home).join(d));
     }
-    dirs.push("/opt/homebrew/bin".into());
-    dirs.push("/usr/local/bin".into());
-    dirs.into_iter()
-        .map(|d| d.join(kind.program()))
+    if cfg!(windows) {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("npm"));
+        }
+    } else {
+        dirs.push("/opt/homebrew/bin".into());
+        dirs.push("/usr/local/bin".into());
+    }
+    // On Windows a program has an extension: a bare `claude` there is the
+    // npm shim for sh, which Windows can't run (os error 193). Prefer the
+    // native .exe anywhere on the PATH, then npm's .cmd launcher.
+    let names: Vec<String> = if cfg!(windows) {
+        [".exe", ".cmd"]
+            .iter()
+            .map(|ext| format!("{}{ext}", kind.program()))
+            .collect()
+    } else {
+        vec![kind.program().to_string()]
+    };
+    names
+        .iter()
+        .flat_map(|n| dirs.iter().map(move |d| d.join(n)))
         .find(|p| p.is_file())
 }
 
@@ -411,7 +450,10 @@ impl AgentState {
         };
         let bridge = std::env::current_exe()
             .ok()
-            .and_then(|e| e.parent().map(|d| d.join("zigzag-mcp")))
+            .and_then(|e| {
+                e.parent()
+                    .map(|d| d.join(format!("zigzag-mcp{}", std::env::consts::EXE_SUFFIX)))
+            })
             .filter(|p| p.is_file());
         let url = format!("http://{addr}/mcp");
         let mut cmd = self.command(program, &url, bridge, addr.port());
@@ -1581,7 +1623,7 @@ fn install_steps(ui: &mut egui::Ui, a: &mut AgentState) {
         let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
         icons::paint(ui.painter(), r, Icon::Info, p.secondary);
         ui.label(
-            egui::RichText::new(format!("{} isn't installed on this Mac", kind.name()))
+            egui::RichText::new(format!("{} isn't installed on this computer", kind.name()))
                 .size(13.0)
                 .strong()
                 .color(p.text),
@@ -1590,7 +1632,7 @@ fn install_steps(ui: &mut egui::Ui, a: &mut AgentState) {
     caption(
         ui,
         format!(
-            "ZigZag works with the {} command-line tool (`{}`). Install it in Terminal:",
+            "ZigZag works with the {} command-line tool (`{}`). Install it in a terminal:",
             kind.name(),
             kind.program()
         ),
