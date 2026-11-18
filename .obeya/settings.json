@@ -1,0 +1,18 @@
+{
+  "land": "main",
+  "push": true,
+  "setup": "rustup update stable --no-self-update && cargo build --features gui,ble --bins",
+  "checks": [
+    "cargo fmt --check",
+    "cargo build --locked --features gui,ble --bins",
+    "cargo test --lib --features gui,ble"
+  ],
+  "language": "en",
+  "app": {
+    "run": "ZigZag is a Rust desktop app, not a web app: `zigzag-studio` (the visual embroidery editor, egui on OpenGL, with an MCP server built in), the `zigzag` CLI and the `zigzag-mcp` bridge. The README describes all three. It needs Rust 1.95 or newer (the setup runs `rustup update stable`). Start the studio with `node .obeya/app.mjs start examples/badge.svg` from the workspace root: it builds the debug binaries (`cargo build --features gui,ble --bins`; a fresh workspace takes about six minutes, so run it in the background; later builds take from a few seconds to a minute or two), stops a studio this workspace started before, and opens the studio window with that design. It gets a settings folder of its own (`target/obeya/config`, so it never reopens or overwrites the owner's own ZigZag session) and its MCP server on a free port; the command prints the PID and the MCP address once the server answers, and `node .obeya/app.mjs status` prints them again. There is no login. Designs worth showing are in `examples/`: `badge.svg` (a round badge), `lettering.svg` (text), `groups.svg` (grouped objects), `bench-grid.svg` (a very large design, for performance work only). After any change to Rust code, run `node .obeya/app.mjs start <design>` again: it rebuilds and restarts the studio; nothing reloads by itself. To drive the studio without touching the owner's mouse and keyboard, call its MCP tools: `node .obeya/app.mjs mcp` lists them, `node .obeya/app.mjs mcp <tool> '<json arguments>' [out.png]` calls one (for example `mcp get_design`, `mcp add_text '{\"text\":\"Hello\"}'`, `mcp render_preview '{}' preview.png` writes the stitch preview as a PNG). `node .obeya/app.mjs shot out.png` saves a screenshot of the studio window as drawn, also when other windows cover it (Windows only; on a Mac press ⌃⌥⌘S in the studio, which saves into `target/obeya/capture/`). The window opens on the owner's desktop, so keep its use short and do not type or click into it while the owner may be working. The demo skill records a browser, not a desktop window: for a demo, take screenshots with `shot` (or MCP previews) at each step and put them on screen with `d.showImage`; output of the CLI (`target/debug/zigzag convert examples/badge.svg -o out.pes -o sheet.html -o preview.png`) can be shown as it is, the HTML worksheet in the browser. CLI-only work needs no studio: run `target/debug/zigzag` directly. Stop the studio with `node .obeya/app.mjs stop`, which ends only this workspace's studio, by its PID.",
+    "stop": "node .obeya/app.mjs stop"
+  },
+  "demo": {
+    "language": "en"
+  }
+}
