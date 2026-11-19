@@ -7,7 +7,7 @@
 
 use crate::app::Studio;
 use crate::icons::{self, Icon};
-use crate::theme::{caption, pal_ui, space};
+use crate::theme::{pal_ui, space};
 use eframe::egui::{self, Color32, Key, Rect, Sense, Stroke, Vec2};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -156,6 +156,8 @@ pub enum Entry {
     Tool(String, String, Option<bool>),
     Error(String),
     Done(String),
+    /// The notes pinned on the canvas that went with the prompt above.
+    Notes(Vec<String>),
 }
 
 /// Something the agent process reported.
@@ -189,6 +191,9 @@ pub struct AgentState {
     pub chrome_h: f32,
     /// Tool calls by id → their line in the log (to mark results).
     calls: std::collections::HashMap<String, usize>,
+    /// The runs of steps opened out in the transcript (by the log index of
+    /// their first step); the rest show as one line each.
+    pub open_steps: std::collections::HashSet<usize>,
     /// The user's login-shell PATH (GUI apps on macOS don't get it).
     path: Option<Option<String>>,
     config: Option<PathBuf>,
@@ -206,6 +211,8 @@ using the ZigZag MCP tools (get_design first; add_svg for artwork you write as S
 transform_objects to size and place, set_object for stitch types and thread colors). Keep everything inside the hoop. \
 Embroidery wants bold, simple shapes: no gradients, no hairlines, few colors, nothing smaller than about 1.5 mm. \
 After making changes, call render_preview to look at the stitches and fix problems, then check_design. \
+When they ask for options, alternatives or a few versions, make them with start_variants and save_variant: \
+the person sees them side by side with the original and picks one (show_comparison shows them again, or puts them away). \
 Don't save or export unless asked. Finish with one or two sentences on what you made.";
 
 /// PATH from the login shell, so `claude` and `codex` (and node) are found
@@ -344,6 +351,7 @@ impl AgentState {
         self.stop();
         self.log.clear();
         self.calls.clear();
+        self.open_steps.clear();
         self.session = None;
     }
 
@@ -479,12 +487,36 @@ impl AgentState {
     }
 
     /// Send the prompt. `mcp`: the studio's MCP endpoint (if it's running).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn send(&mut self, mcp: Option<std::net::SocketAddr>, ctx: &egui::Context) {
+        self.send_with(mcp, ctx, Vec::new(), "");
+    }
+
+    /// Send the prompt, with `notes` (the canvas notes going with it, as
+    /// the transcript shows them) and `extra` (what the agent is told
+    /// about them, and anything else it needs, after the prompt).
+    pub fn send_with(
+        &mut self,
+        mcp: Option<std::net::SocketAddr>,
+        ctx: &egui::Context,
+        notes: Vec<String>,
+        extra: &str,
+    ) {
         let text = self.prompt.trim().to_string();
-        if text.is_empty() || self.running() {
+        if (text.is_empty() && extra.is_empty()) || self.running() {
             return;
         }
-        self.log.push(Entry::You(text.clone()));
+        if !text.is_empty() {
+            self.log.push(Entry::You(text.clone()));
+        }
+        if !notes.is_empty() {
+            self.log.push(Entry::Notes(notes));
+        }
+        let text = match (text.is_empty(), extra.is_empty()) {
+            (_, true) => text,
+            (true, false) => extra.to_string(),
+            (false, false) => format!("{text}\n\n{extra}"),
+        };
         let Some(addr) = mcp else {
             self.log.push(Entry::Error(
                 "The agent works through the studio's MCP server, which is off (started with --no-mcp).".into(),
@@ -641,7 +673,7 @@ impl AgentState {
                 .log
                 .iter()
                 .rev()
-                .take_while(|x| !matches!(x, Entry::You(_)))
+                .take_while(|x| !matches!(x, Entry::You(_) | Entry::Notes(_)))
                 .any(|x| matches!(x, Entry::Error(n) if n == m))
         {
             return;
@@ -969,15 +1001,23 @@ pub fn activity(tool: &str) -> &'static str {
         "duplicate_objects" => "Duplicating",
         "delete_object" => "Removing",
         "round_corners" => "Rounding corners",
+        "break_into_columns" | "create_outlines" => "Breaking into parts",
+        "get_path" => "Reading",
+        "edit_path" => "Reshaping",
         "add_outline" => "Outlining",
         "simplify_design" => "Simplifying",
         "trace_image" => "Tracing",
         "render_preview" => "Looking",
-        "check_design" => "Checking",
+        "check_design" | "measure_stitching" => "Checking",
         "get_design" | "get_svg" | "select" => "Reading",
         "set_document" => "Setting up",
         "batch" => "Making changes",
         "undo" => "Undoing",
+        "get_annotations" => "Reading notes",
+        "resolve_note" => "Resolving a note",
+        "start_variants" => "Setting up versions",
+        "save_variant" => "Keeping a version",
+        "show_comparison" => "Comparing",
         "save" | "export" => "Saving",
         _ => "Working",
     }
@@ -1002,7 +1042,7 @@ pub fn spinner(p: &egui::Painter, at: egui::Pos2, r: f32, color: Color32, time: 
 }
 
 /// A cheap fingerprint of a shape, to tell which ones a call changed.
-fn fingerprint(s: &zigzag::svg::Shape) -> u64 {
+pub(crate) fn fingerprint(s: &zigzag::svg::Shape) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.color.hash(&mut h);
@@ -1025,6 +1065,10 @@ impl Studio {
     /// Take in the agent's output; every frame, whether its panel shows or not.
     pub fn agent_tick(&mut self, ctx: &egui::Context) {
         self.agent.poll();
+        if !self.agent.running() {
+            self.end_turn();
+            self.send_queued_notes(ctx);
+        }
         if self.agent.running() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -1084,6 +1128,7 @@ impl Studio {
             }
         }
         self.agent.work.note(name, &touched);
+        self.agent_changed();
         result
     }
 
@@ -1295,13 +1340,17 @@ impl Studio {
         let mut send = false;
         let top = ui.cursor().top();
 
+        let review = &self.review;
+        let here = self.session.rec;
+        let mut act: Option<crate::review::TurnAction> = None;
         let a = &mut self.agent;
         // The conversation: plain, on the panel itself.
         let transcript_h = egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(0, space::S as i8))
+            // (Room round the conversation, and between its lines.)
+            .inner_margin(egui::Margin::symmetric(space::XS as i8, space::M as i8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                let inner_h = h - 2.0 * space::S;
+                let inner_h = h - 2.0 * space::M;
                 if a.log.is_empty() && !a.running() {
                     let (r, _) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), inner_h),
@@ -1340,7 +1389,7 @@ impl Studio {
                                 "Ask {} for a design, or a change to this one. It works on the canvas as you watch.",
                                 a.kind.name()
                             ))
-                            .size(12.0)
+                            .size(PANEL_PT)
                             .color(p.secondary),
                         )
                         .halign(egui::Align::Center)
@@ -1356,7 +1405,7 @@ impl Studio {
                         "Simplify this for a 4x4 hoop",
                     ] {
                         if child
-                            .add(egui::Button::new(egui::RichText::new(idea).size(11.5)).corner_radius(10))
+                            .add(egui::Button::new(egui::RichText::new(idea).size(PANEL_PT)).corner_radius(10))
                             .clicked()
                         {
                             a.prompt = idea.to_string();
@@ -1372,10 +1421,82 @@ impl Studio {
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = space::S;
+                        // (Room between the conversation's lines.)
+                        ui.spacing_mut().item_spacing.y = FEED_GAP;
                         let time = ui.input(|i| i.time);
-                        for e in &a.log {
-                            entry(ui, e, time);
+                        let mut k = 0;
+                        while k < a.log.len() {
+                            // Steps one after another are one line, opened
+                            // out with a click (one alone is just itself).
+                            let run = a.log[k..]
+                                .iter()
+                                .take_while(|e| matches!(e, Entry::Tool(..)))
+                                .count();
+                            if run >= 1 {
+                                let open = a.open_steps.contains(&k);
+                                if steps(ui, k, &a.log[k..k + run], open, time) {
+                                    if open {
+                                        a.open_steps.remove(&k);
+                                    } else {
+                                        a.open_steps.insert(k);
+                                    }
+                                }
+                                if open {
+                                    opened(ui, |ui| {
+                                        for e in &a.log[k..k + run] {
+                                            entry(ui, e, time);
+                                        }
+                                    });
+                                }
+                                k += run;
+                            } else {
+                                // A turn that ended here: its before, after and
+                                // side by side, on its Done line (or under how
+                                // it ended, if it didn't finish).
+                                let ended = review.turn_ending_at(k);
+                                let done = match &a.log[k] {
+                                    Entry::Done(t) => Some(t),
+                                    _ => None,
+                                };
+                                match (ended, done) {
+                                    (Some(t), done) => {
+                                        if done.is_none() {
+                                            entry(ui, &a.log[k], time);
+                                        }
+                                        // Done, and at the right end of its line,
+                                        // the turn's view buttons.
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = space::S;
+                                            if let Some(text) = done {
+                                                done_line(ui, text);
+                                            }
+                                            let w = crate::review::turn_controls_width(t);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.allocate_ui_with_layout(
+                                                        Vec2::new(w, crate::review::BUTTON),
+                                                        egui::Layout::left_to_right(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            if let Some(x) =
+                                                                crate::review::turn_controls(
+                                                                    ui, review, t, here,
+                                                                )
+                                                            {
+                                                                act = Some(x);
+                                                            }
+                                                        },
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    }
+                                    (None, _) => entry(ui, &a.log[k], time),
+                                }
+                                k += 1;
+                            }
                         }
                         // Between steps: thinking (a step running shows its own spinner).
                         if a.running() && !matches!(a.log.last(), Some(Entry::Tool(_, _, None))) {
@@ -1383,7 +1504,7 @@ impl Studio {
                                 let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
                                 spinner(ui.painter(), r.center(), 4.5, p.accent, time);
                                 let secs = a.started.map_or(0, |t| t.elapsed().as_secs());
-                                caption(ui, format!("{}… {secs} s", a.status()));
+                                quiet(ui, format!("{}… {secs} s", a.status()));
                             });
                         }
                     });
@@ -1391,6 +1512,10 @@ impl Studio {
             .response
             .rect
             .height();
+        // The notes pinned for the next prompt, and the ways to add more.
+        let has_notes = self.review.pending(self.session.rec) > 0;
+        let annotating = self.review.annotating;
+        let mut annotate = false;
         // Just a divider between the conversation and the prompt.
         let (line, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
@@ -1399,6 +1524,9 @@ impl Studio {
             line.center().y,
             Stroke::new(1.0, p.separator),
         );
+        // The comments pinned on the canvas, as an attachment to the prompt.
+        let notes_act = self.notes_list(ui);
+        let a = &mut self.agent;
         // The prompt: one line (it grows with Shift-Enter), Send beside it.
         let field_id = ui.make_persistent_id("agent-prompt");
         // (Above it, its own space; below, the panel's padding is enough.)
@@ -1412,11 +1540,11 @@ impl Studio {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    let button_w = 56.0;
-                    let button_h = 24.0;
-                    // The text inset like the button's label.
+                    let button_w = crate::review::BUTTON;
+                    let button_h = crate::review::BUTTON;
                     ui.add_space(space::S);
-                    let field_w = ui.available_width() - button_w - space::S;
+                    // (Room for Annotate and Send at the right.)
+                    let field_w = ui.available_width() - 2.0 * button_w - 2.0 * space::S;
                     let r = ui.add_sized(
                         [field_w, button_h],
                         egui::TextEdit::multiline(&mut a.prompt)
@@ -1428,7 +1556,11 @@ impl Studio {
                             // As tall as the button, the text centered on it.
                             .min_size(Vec2::new(field_w, button_h))
                             .align(egui::Align2::LEFT_CENTER)
-                            .hint_text("Describe a design, or a change…")
+                            .font(egui::FontId::proportional(crate::review::FIELD_PT))
+                            .hint_text(
+                                egui::RichText::new("Describe a design, or a change…")
+                                    .color(crate::review::hint_color(p)),
+                            )
                             .return_key(None),
                     );
                     r.widget_info(|| {
@@ -1449,23 +1581,19 @@ impl Studio {
                     {
                         a.prompt.push('\n');
                     }
-                    if a.running() {
-                        if ui
-                            .add_sized([button_w, button_h], egui::Button::new("Stop"))
-                            .clicked()
-                        {
+                    let ok = !a.prompt.trim().is_empty() || has_notes;
+                    let running = a.running();
+                    // Beside Send: pin comments on the canvas.
+                    if crate::review::annotate_button(ui, annotating)
+                        .on_hover_text("Annotate: click the canvas to pin a comment for the agent, or drag a box round an area (N)")
+                        .clicked()
+                    {
+                        annotate = true;
+                    }
+                    if crate::review::send_button(ui, ok, running).clicked() {
+                        if running {
                             a.stop();
-                        }
-                    } else {
-                        let ok = !a.prompt.trim().is_empty();
-                        let b =
-                            egui::Button::new(egui::RichText::new("Send").color(Color32::WHITE))
-                                .fill(p.accent);
-                        if ui
-                            .add_enabled_ui(ok, |ui| ui.add_sized([button_w, button_h], b))
-                            .inner
-                            .clicked()
-                        {
+                        } else {
                             send = true;
                         }
                     }
@@ -1473,19 +1601,36 @@ impl Studio {
             });
         // Everything but the transcript, to size it next frame.
         a.chrome_h = (ui.cursor().top() - top - transcript_h).max(0.0);
+        if annotate {
+            self.set_annotating(!annotating);
+        }
+        if let Some(x) = notes_act {
+            self.notes_action(x);
+        }
+        if let Some(x) = act {
+            self.turn_action(x);
+        }
         if send {
             self.agent_send(ui.ctx());
         }
     }
 
-    /// Send the prompt. What's selected is what the agent starts on.
+    /// Send the prompt. What's selected is what the agent starts on; the
+    /// notes pinned on the canvas go with it; and the document as it is
+    /// now is kept, to compare with what the agent makes of it.
     pub fn agent_send(&mut self, ctx: &egui::Context) {
-        if self.agent.prompt.trim().is_empty() || self.agent.running() {
+        let here = self.session.rec;
+        let has_notes = self.review.pending(here) > 0;
+        if (self.agent.prompt.trim().is_empty() && !has_notes) || self.agent.running() {
             return;
         }
         let addr = self.mcp.as_ref().map(|m| m.addr);
-        self.agent.send(addr, ctx);
+        let (shown, extra) = self.notes_for_prompt();
+        let prompt = self.agent.prompt.trim().to_string();
+        let start = self.agent.log.len();
+        self.agent.send_with(addr, ctx, shown, &extra);
         if self.agent.running() {
+            self.begin_turn(prompt, start);
             let sel: Vec<usize> = self
                 .sel_indices()
                 .iter()
@@ -1598,19 +1743,14 @@ fn entry(ui: &mut egui::Ui, e: &Entry, time: f64) {
     let p = pal_ui(ui);
     match e {
         Entry::You(t) => {
-            egui::Frame::new()
-                .fill(p.accent.gamma_multiply(0.18))
-                .corner_radius(8)
-                .inner_margin(egui::Margin::symmetric(space::S as i8, space::XS as i8 + 2))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(t).size(12.5).color(p.text)).wrap(),
-                    );
-                });
+            you_bubble(ui, |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(t).size(PANEL_PT).color(p.text)).wrap(),
+                );
+            });
         }
         Entry::Said(t) => {
-            ui.add(egui::Label::new(egui::RichText::new(t).size(12.5).color(p.text)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(t).size(PANEL_PT).color(p.text)).wrap());
         }
         Entry::Tool(name, args, state) => {
             ui.horizontal(|ui| {
@@ -1632,31 +1772,245 @@ fn entry(ui: &mut egui::Ui, e: &Entry, time: f64) {
                     } else {
                         activity(name).to_string()
                     })
-                    .size(11.5)
-                    .color(if state.is_none() { p.text } else { p.secondary }),
+                    .size(PANEL_PT)
+                    .color(if state.is_none() {
+                        p.secondary
+                    } else {
+                        p.tertiary
+                    }),
                 );
+                let dim = crate::review::hint_color(p);
                 ui.label(
                     egui::RichText::new(name)
-                        .size(10.5)
+                        .size(PANEL_PT)
                         .monospace()
-                        .color(p.tertiary),
+                        .color(dim),
                 );
                 if !args.is_empty() {
                     ui.add(
-                        egui::Label::new(egui::RichText::new(args).size(10.5).color(p.tertiary))
+                        egui::Label::new(egui::RichText::new(args).size(PANEL_PT).color(dim))
                             .truncate(),
                     )
                     .on_hover_text(args);
                 }
             });
         }
+        // The comments pinned on the canvas that went with it: each one a
+        // message like the person's own, a comment's icon at its right.
+        Entry::Notes(notes) => {
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = space::XS;
+                for n in notes {
+                    you_bubble(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = space::S;
+                            let icon = crate::review::ICON - 2.0;
+                            let w = ui.available_width() - icon - space::S;
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(w, 0.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_min_width(w);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(n).size(PANEL_PT).color(p.text),
+                                        )
+                                        .wrap(),
+                                    );
+                                },
+                            );
+                            // At the right: the canvas comment's icon, outlined.
+                            let line = ui.text_style_height(&egui::TextStyle::Body);
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::new(icon, line), Sense::hover());
+                            icons::paint(
+                                ui.painter(),
+                                Rect::from_center_size(r.center(), Vec2::splat(icon)),
+                                Icon::Comment,
+                                p.text,
+                            );
+                        });
+                    });
+                }
+            });
+        }
         Entry::Error(t) => crate::theme::callout(ui, p.warning, Icon::Warning, t),
-        Entry::Done(t) => {
-            if !t.is_empty() {
-                caption(ui, format!("Done · {t}"));
+        Entry::Done(t) => done_line(ui, t),
+    }
+}
+
+/// The Agent panel's one text size: what matters more is brighter, not bigger.
+const PANEL_PT: f32 = crate::review::PANEL_PT;
+
+/// A quieter line in the Agent panel (the panel's size, a dimmer color).
+fn quiet(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    let p = pal_ui(ui);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text.into())
+                .size(PANEL_PT)
+                .color(p.tertiary),
+        )
+        .wrap(),
+    )
+}
+
+/// Between the lines of the conversation.
+const FEED_GAP: f32 = 16.0;
+
+/// The person's message: a soft blue box the panel's width.
+fn you_bubble(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let p = pal_ui(ui);
+    egui::Frame::new()
+        .fill(p.accent.gamma_multiply(0.18))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+}
+
+/// "Done · 6 turns · 8 s", dim (nothing, if there's nothing to say).
+fn done_line(ui: &mut egui::Ui, t: &str) {
+    if !t.is_empty() {
+        let p = pal_ui(ui);
+        ui.label(
+            egui::RichText::new(format!("Done · {t}"))
+                .size(PANEL_PT)
+                .color(crate::review::hint_color(p)),
+        );
+    }
+}
+
+/// Steps one after another, as one line (a click opens it out): how they went, and
+/// what they were (`Checking ×12 · Reading ×7`); the one running, while
+/// one is. `first`: the first step's place in the log (the line's id).
+/// Returns whether it was clicked (to open it out, or fold it away).
+fn steps(ui: &mut egui::Ui, first: usize, run: &[Entry], open: bool, time: f64) -> bool {
+    let p = pal_ui(ui);
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
+    let mut failed = 0;
+    let mut current = None;
+    for e in run {
+        if let Entry::Tool(name, _, state) = e {
+            let what = activity(name);
+            match counts.iter_mut().find(|c| c.0 == what) {
+                Some(c) => c.1 += 1,
+                None => counts.push((what, 1)),
+            }
+            match state {
+                Some(false) => failed += 1,
+                None => current = Some(name.as_str()),
+                _ => {}
             }
         }
     }
+    let mut what: Vec<String> = counts
+        .iter()
+        .map(|(w, n)| {
+            if *n > 1 {
+                format!("{w} ×{n}")
+            } else {
+                w.to_string()
+            }
+        })
+        .collect();
+    if failed > 0 {
+        what.push(format!("{failed} failed"));
+    }
+    let n = run.len();
+    let count = if n == 1 {
+        "1 step".to_string()
+    } else {
+        format!("{n} steps")
+    };
+    let row = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::XS;
+        // How they went: a spinner while one runs, a warning if one failed,
+        // else a dot.
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+        match current {
+            Some(_) => spinner(ui.painter(), r.center(), 4.0, p.accent, time),
+            None if failed > 0 => icons::paint(ui.painter(), r, Icon::Warning, p.warning),
+            None => {
+                ui.painter()
+                    .circle_filled(r.center(), 3.5, p.accent.gamma_multiply(0.7));
+            }
+        }
+        let (title, rest) = match current {
+            Some(name) => (
+                format!("{}…", activity(name)),
+                format!("{count} · {}", what.join(" · ")),
+            ),
+            None => (count.clone(), what.join(" · ")),
+        };
+        // (Quieter than what was said: the steps are how, not what.)
+        ui.label(
+            egui::RichText::new(title)
+                .size(PANEL_PT)
+                .color(if current.is_some() {
+                    p.secondary
+                } else {
+                    p.tertiary
+                }),
+        );
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(rest)
+                    .size(PANEL_PT)
+                    .color(crate::review::hint_color(p)),
+            )
+            .truncate(),
+        );
+    });
+    let resp = ui
+        .interact(
+            row.response.rect,
+            ui.make_persistent_id(("agent-steps", first)),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::Role::Button,
+            true,
+            format!(
+                "{} {count}: {}",
+                if open { "Hide" } else { "Show" },
+                what.join(" · ")
+            ),
+        )
+    });
+    if resp.hovered() {
+        ui.painter().rect_filled(
+            row.response.rect.expand2(Vec2::new(3.0, 1.0)),
+            4.0,
+            p.text.gamma_multiply(0.05),
+        );
+    }
+    resp.clicked()
+}
+
+/// A run of steps opened out: each one, set in under its line.
+fn opened(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let p = pal_ui(ui);
+    let r = egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 18,
+            right: 0,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = space::XS;
+            add(ui);
+        })
+        .response
+        .rect;
+    ui.painter()
+        .vline(r.left() + 6.0, r.y_range(), Stroke::new(1.0, p.separator));
 }
 
 /// The agent's command-line tool isn't installed: the commands to install
@@ -1672,12 +2026,12 @@ fn install_steps(ui: &mut egui::Ui, a: &mut AgentState) {
         icons::paint(ui.painter(), r, Icon::Info, p.secondary);
         ui.label(
             egui::RichText::new(format!("{} isn't installed on this computer", kind.name()))
-                .size(13.0)
+                .size(PANEL_PT)
                 .strong()
                 .color(p.text),
         );
     });
-    caption(
+    quiet(
         ui,
         format!(
             "ZigZag works with the {} command-line tool (`{}`). Install it in a terminal:",
@@ -1688,7 +2042,7 @@ fn install_steps(ui: &mut egui::Ui, a: &mut AgentState) {
     for (how, command) in ways {
         crate::mcp_chip::copy_block(ui, how, command);
     }
-    caption(ui, sign_in);
+    quiet(ui, sign_in);
     ui.add_space(space::XS);
     ui.horizontal(|ui| {
         if ui
@@ -2315,6 +2669,48 @@ mod tests {
             vec![added],
             "a new object is one it's on"
         );
+    }
+
+    #[test]
+    fn steps_one_after_another_are_one_line_that_opens() {
+        use crate::dock::PanelId;
+        use egui_kittest::kittest::Queryable;
+        let mut h = studio();
+        h.state_mut().dock.reveal(PanelId::Agent);
+        let a = &mut h.state_mut().agent;
+        a.log.push(Entry::You("tidy".into()));
+        for (k, t) in [
+            "get_path",
+            "measure_stitching",
+            "measure_stitching",
+            "edit_path",
+        ]
+        .iter()
+        .enumerate()
+        {
+            a.push(
+                Some(k.to_string()),
+                Entry::Tool((*t).into(), format!("object: {k}"), Some(k != 3)),
+            );
+        }
+        a.log.push(Entry::Said("Done tidying.".into()));
+        a.push(
+            Some("9".into()),
+            Entry::Tool("render_preview".into(), String::new(), Some(true)),
+        );
+        h.run_steps(4);
+        // Four steps: one line, saying what they were.
+        h.get_by_label("Show 4 steps: Reading · Checking ×2 · Reshaping · 1 failed");
+        assert!(h.query_by_label("object: 1").is_none(), "folded away");
+        // One alone is folded away too.
+        h.get_by_label("Show 1 step: Looking");
+        assert!(h.query_by_label("render_preview").is_none());
+        h.get_by_label_contains("Show 4 steps").click();
+        h.run_steps(3);
+        h.get_by_label("object: 1");
+        h.get_by_label_contains("Hide 4 steps").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("object: 1").is_none());
     }
 
     #[test]

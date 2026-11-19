@@ -23,7 +23,7 @@ const BUTTON: f32 = 28.0;
 /// types under it).
 const KIND_W: f32 = 96.0;
 /// Width of the grip that moves the bar (the line drawn in it is thinner).
-const GRIP_W: f32 = 10.0;
+const GRIP_W: f32 = 14.0;
 
 /// Where the bar sits once its grip has moved it (VectorCraft's
 /// `TaskBarPlace`). Not kept from one launch to the next, as in
@@ -285,11 +285,18 @@ impl Studio {
                                     .response
                                     .on_hover_text("Font");
                                 self.lettering.font_filter = filter;
-                                let r = ui.add(crate::units::drag_mm(
-                                    &mut spec.size_mm,
-                                    3.0..=40.0,
-                                    0.5,
-                                ));
+                                // (Typed, the height is taken when it's entered:
+                                // `spec` is read from the document every frame,
+                                // so a value set while typing would be read
+                                // back as it was and reset what's typed.)
+                                let r = ui.add(
+                                    crate::units::drag_mm(&mut spec.size_mm, 3.0..=40.0, 0.5)
+                                        .update_while_editing(false)
+                                        // (Text scaled by its handles past
+                                        // what's set here keeps its size
+                                        // until this is what's changed.)
+                                        .clamp_existing_to_range(false),
+                                );
                                 if r.drag_stopped() || r.lost_focus() {
                                     changed = true;
                                 }
@@ -793,13 +800,19 @@ enum PlaceChange {
 /// The grip at the bar's left end: drag it to move the bar. Returns how
 /// far it was dragged this frame.
 fn grip(ui: &mut egui::Ui) -> Vec2 {
+    grip_for(ui, "Move Task Bar")
+}
+
+/// A bar's grip (see [`grip`]), named for what it moves.
+pub(crate) fn grip_for(ui: &mut egui::Ui, label: &str) -> Vec2 {
     let p = pal_ui(ui);
     let (r, resp) = ui.allocate_exact_size(Vec2::new(GRIP_W, BUTTON), Sense::drag());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Move Task Bar"));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     let active = resp.hovered() || resp.dragged();
-    ui.painter().rect_filled(
-        Rect::from_center_size(r.center(), Vec2::new(3.0, BUTTON - 10.0)),
-        1.5,
+    crate::icons::grip_dots(
+        ui.painter(),
+        r.center(),
+        true,
         if active { p.secondary } else { p.tertiary },
     );
     if resp.dragged() {

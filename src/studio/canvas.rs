@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 use zigzag::design::Design;
-use zigzag::geom::{P, point_inside};
+use zigzag::geom::{FillRule, P, point_inside};
 use zigzag::svg::{Geometry, Shape};
 
 /// Maps design units (0.1 mm, y down) to screen points.
@@ -699,9 +699,9 @@ pub fn hit_test_where(
     // A shape whose box `p` isn't within `tol` of can't be hit: one cheap
     // pass over its points saves the inside and distance tests (most of a
     // traced design's hundreds of objects, every frame the pointer moves).
-    let near_box = |pts: &[P], tol: f64| {
+    let near_box = |pts: &mut dyn Iterator<Item = &P>, tol: f64| {
         let mut b = zigzag::geom::Bounds::empty();
-        pts.iter().for_each(|&q| b.add(q));
+        pts.for_each(|&q| b.add(q));
         !b.is_empty()
             && p.x >= b.min.x - tol
             && p.x <= b.max.x + tol
@@ -714,11 +714,14 @@ pub fn hit_test_where(
         .rev()
         .filter(|(i, _)| keep(*i))
         .find_map(|(i, s)| {
+            // (A stroke's box is all its lines': a satin drawn as rails and
+            // rungs is hit between them, where no one line's box is.)
             let near = match &s.geometry {
-                Geometry::Fill { rings, .. } => rings.iter().any(|r| near_box(r, tol)),
-                Geometry::Stroke { lines, width } => lines
-                    .iter()
-                    .any(|(l, _)| near_box(l, (width / 2.0).max(tol))),
+                Geometry::Fill { rings, .. } => rings.iter().any(|r| near_box(&mut r.iter(), tol)),
+                Geometry::Stroke { lines, width } => near_box(
+                    &mut lines.iter().flat_map(|(l, _)| l),
+                    (width / 2.0).max(tol),
+                ),
             };
             if !near {
                 return None;
@@ -728,12 +731,28 @@ pub fn hit_test_where(
                     point_inside(rings, *rule, p)
                         || rings.iter().any(|r| dist_to_polyline(r, true, p) <= tol)
                 }
-                Geometry::Stroke { lines, width } => lines
-                    .iter()
-                    .any(|(l, closed)| dist_to_polyline(l, *closed, p) <= (width / 2.0).max(tol)),
+                Geometry::Stroke { lines, width } => {
+                    lines.iter().any(|(l, closed)| {
+                        dist_to_polyline(l, *closed, p) <= (width / 2.0).max(tol)
+                    }) || column_of(s).is_some_and(|ring| point_inside(&ring, FillRule::EvenOdd, p))
+                }
             };
             hit.then_some(i)
         })
+}
+
+/// What a satin drawn as its two rails covers: the column between them
+/// (the rings of a closed one), where its stitches are, and so where a
+/// click picks it. Its lines alone are a hairline each.
+fn column_of(s: &Shape) -> Option<Vec<Vec<P>>> {
+    let Geometry::Stroke { lines, .. } = &s.geometry else {
+        return None;
+    };
+    if s.params.kind != Some(zigzag::params::Kind::Satin) || s.outline || lines.len() < 2 {
+        return None;
+    }
+    let r = zigzag::stitch::satin::rails_from_subpaths(lines, s.params.satin_rails())?;
+    Some(r.outline())
 }
 
 fn dist_to_polyline(pts: &[P], closed: bool, p: P) -> f64 {

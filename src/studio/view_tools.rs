@@ -821,6 +821,7 @@ mod tests {
     fn start_and_end_markers_are_placed_and_dragged() {
         use egui_kittest::kittest::Queryable;
         let mut h = studio(Some("badge.svg"));
+        h.state_mut().prefs.advanced = true;
         let sun = h.state().names.iter().position(|n| n == "sun").unwrap();
         h.state_mut().set_selection(&[sun]);
         h.run_steps(2);
@@ -868,6 +869,7 @@ mod tests {
     fn trim_stop_and_connect_are_in_the_panels() {
         use egui_kittest::kittest::Queryable;
         let mut h = studio(Some("badge.svg"));
+        h.state_mut().prefs.advanced = true;
         let sun = h.state().names.iter().position(|n| n == "sun").unwrap();
         h.state_mut().set_selection(&[sun]);
         h.run_steps(2);
@@ -946,6 +948,7 @@ mod tests {
     fn the_connect_bar_counts_the_cuts_it_saves_and_shows_what_it_sews() {
         use egui_kittest::kittest::Queryable;
         let mut h = studio(None);
+        h.state_mut().prefs.advanced = true;
         // One object in two squares 3 mm apart, on bare cloth: a cut.
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="20mm" viewBox="0 0 40 20"><path id="pair" d="M2,2H12V12H2Z M15,2H25V12H15Z" fill="#203040"/></svg>"##;
         let doc = zigzag::document::Document::from_svg(svg, "pair", None).unwrap();

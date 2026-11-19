@@ -8,7 +8,7 @@
 use crate::app::{Studio, Tool};
 use crate::commands::Flag;
 use crate::icons::{self, Icon};
-use crate::theme::{self, Form, callout, caption, form, icon_button, pal_ui, value_row};
+use crate::theme::{self, Form, callout, caption, form_for, icon_button, pal_ui, value_row};
 use crate::widgets::*;
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use zigzag::checks::Level;
@@ -833,6 +833,8 @@ impl Studio {
                 .align(egui::RectAlign::BOTTOM_START)
                 .show(|ui| {
                     ui.set_min_width(150.0);
+                    // (A menu's own buttons sit tight to the left: room.)
+                    ui.spacing_mut().button_padding = Vec2::new(12.0, 4.0);
                     use crate::agent::AgentKind;
                     for k in AgentKind::ALL {
                         if ui
@@ -2534,8 +2536,9 @@ impl Studio {
         };
         let mut to_angle_tool = false;
         let color_now = self.doc.shapes[i].color;
+        let advanced = self.prefs.advanced;
         let pr = &mut self.doc.shapes[i].params;
-        form(ui, "stitch-form", |fm| match current {
+        let left_out = form_for(ui, "stitch-form", advanced, |fm| match current {
             Kind::Fill => {
                 fm.row("Angle", |ui, lid| {
                     let shown = pr.angle.unwrap_or(defaults::FILL_ANGLE);
@@ -2578,37 +2581,43 @@ impl Studio {
                     0.01,
                     "Row spacing: smaller is denser",
                 );
-                value_row(
-                    fm,
-                    "Length",
-                    &mut pr.len,
-                    f.fill_len,
-                    1.5..=7.0,
-                    " mm",
-                    0.1,
-                    "Longest stitch in a row",
-                );
-                value_row(
-                    fm,
-                    "Pull comp.",
-                    &mut pr.pull,
-                    f.fill_pull,
-                    0.0..=0.6,
-                    " mm",
-                    0.05,
-                    "Extends rows at the edges to counter fabric pulling in",
-                );
-                fm.row("Underlay", |ui, _| {
-                    underlay_box(
-                        ui,
-                        pr,
-                        if f.fill_edge_walk {
-                            "Edge walk + rows"
-                        } else {
-                            "Stabilizing rows"
-                        },
-                    )
-                });
+                if fm.advanced(pr.len.is_some()) {
+                    value_row(
+                        fm,
+                        "Length",
+                        &mut pr.len,
+                        f.fill_len,
+                        1.5..=7.0,
+                        " mm",
+                        0.1,
+                        "Longest stitch in a row",
+                    );
+                }
+                if fm.advanced(pr.pull.is_some()) {
+                    value_row(
+                        fm,
+                        "Pull comp.",
+                        &mut pr.pull,
+                        f.fill_pull,
+                        0.0..=0.6,
+                        " mm",
+                        0.05,
+                        "Extends rows at the edges to counter fabric pulling in",
+                    );
+                }
+                if fm.advanced(pr.underlay.is_some()) {
+                    fm.row("Underlay", |ui, _| {
+                        underlay_box(
+                            ui,
+                            pr,
+                            if f.fill_edge_walk {
+                                "Edge walk + rows"
+                            } else {
+                                "Stabilizing rows"
+                            },
+                        )
+                    });
+                }
             }
             Kind::Satin => {
                 if filled {
@@ -2621,6 +2630,60 @@ impl Studio {
                             &[(false, "Column"), (true, "Border")],
                         ) {
                             pr.border = border.then_some(true);
+                        }
+                    });
+                }
+                // (Overlapping strokes aren't offered: they leave more letters
+                // with seams and satin piled three deep than columns do. An
+                // object that has them can be put back.)
+                if filled && !pr.is_border() && pr.satin_overlap() {
+                    fm.row("Columns", |ui, _| {
+                        let mut overlap = pr.satin_overlap();
+                        let r = ui.scope(|ui| {
+                            theme::segmented(
+                                ui,
+                                "satin-columns",
+                                &mut overlap,
+                                &[(false, "Strokes"), (true, "Overlapping")],
+                            )
+                        });
+                        r.response.on_hover_text("This text is set to overlapping strokes, which are no longer offered: they leave more seams and piled satin than columns. Strokes puts it back.");
+                        if r.inner {
+                            pr.overlap = overlap.then_some(true);
+                        }
+                    });
+                }
+                // How a filled satin's strokes meet: cut, corners squared, one
+                // stroke run on and the other ended against it (the default);
+                // or mitred, each stroke a column (its chordal axis), where
+                // that sews cleanly (Auto) or everywhere.
+                if filled
+                    && !pr.is_border()
+                    && !pr.satin_overlap()
+                    && fm.advanced(pr.cut.is_some() || pr.mitred.is_some())
+                {
+                    fm.row("Corners", |ui, _| {
+                        // (0 Auto, 1 Mitred, 2 Cut.)
+                        let mut how: u8 = if pr.satin_cut() {
+                            2
+                        } else if pr.satin_mitred() {
+                            1
+                        } else {
+                            0
+                        };
+                        let r = ui.scope(|ui| {
+                            theme::segmented(
+                                ui,
+                                "satin-corners",
+                                &mut how,
+                                &[(0, "Auto"), (1, "Mitred"), (2, "Cut")],
+                            )
+                        });
+                        r.response.on_hover_text("Mitred: each stroke of a letter is its own column, and where two meet at a corner both end on the line between them. Cut: the shape is cut into columns where its strokes part, corners squared, one stroke running on and the other ending against it. Auto: mitred, unless a corner is too sharp for a mitre to sew cleanly (the point of a V) or a join can't be read clearly, when it's cut. Cut is the default.");
+                        if r.inner {
+                            // (Cut, the default, is nothing set.)
+                            pr.cut = (how != 2).then_some(false);
+                            pr.mitred = (how == 1).then_some(true);
                         }
                     });
                 }
@@ -2640,7 +2703,8 @@ impl Studio {
                         pr.style = (st != SatinStyle::Plain).then_some(st);
                     }
                 });
-                fm.row("Threads", |ui, _| {
+                if fm.advanced(pr.colors.is_some()) {
+                    fm.row("Threads", |ui, _| {
                     // Multicolor satin: the threads across the column.
                     let mut colors = pr.colors.clone().unwrap_or_default();
                     let mut changed = false;
@@ -2679,6 +2743,8 @@ impl Studio {
                         pr.colors = (colors.len() >= 2).then_some(colors);
                     }
                 });
+                }
+
                 if !filled || pr.is_border() {
                     value_row(
                         fm,
@@ -2701,74 +2767,98 @@ impl Studio {
                     0.01,
                     "Distance between zigzags (auto-adjusted for width unless set)",
                 );
-                value_row(
-                    fm,
-                    "Pull comp.",
-                    &mut pr.pull,
-                    f.satin_pull,
-                    0.0..=0.6,
-                    " mm",
-                    0.05,
-                    "Extra width per side; satins pull in narrower than drawn",
-                );
-                fm.row("Underlay", |ui, _| {
+                if fm.advanced(pr.pull.is_some()) {
+                    value_row(
+                        fm,
+                        "Pull comp.",
+                        &mut pr.pull,
+                        f.satin_pull,
+                        0.0..=0.6,
+                        " mm",
+                        0.05,
+                        "Extra width per side; satins pull in narrower than drawn",
+                    );
+                }
+                if fm.advanced(pr.satin_underlay.is_some() || pr.underlay.is_some()) {
+                    fm.row("Underlay", |ui, _| {
                     let mut auto = pr.satin_underlay.is_none() && pr.underlay_on();
                     if ui
                         .checkbox(&mut auto, "Automatic")
-                        .on_hover_text(
-                            "None under 1.5 mm, center walk to 4 mm, contour + zigzag above",
-                        )
+                        .on_hover_text(format!(
+                            "None under {} mm on this fabric, center walk to 4 mm, contour + zigzag above",
+                            zigzag::params::fmt_num(f.satin_underlay_from)
+                        ))
                         .changed()
                     {
                         pr.satin_underlay = if auto {
                             None
                         } else {
-                            Some(pr.satin_underlay_for(satin_width))
+                            Some(pr.satin_underlay_for(&f, satin_width))
                         };
                         pr.underlay = None;
                     }
                 });
-                let current_ul = pr.satin_underlay_for(satin_width);
-                fm.wide(|ui| {
-                    for (bit, name, tip) in [
-                        (
-                            underlay::CENTER,
-                            "Center",
-                            "A run down the middle: anchors narrow columns",
-                        ),
-                        (
-                            underlay::CONTOUR,
-                            "Contour",
-                            "Runs just inside both edges: crisp edges on wide columns",
-                        ),
-                        (
-                            underlay::ZIGZAG,
-                            "Zigzag",
-                            "Sparse zigzag: lifts and supports wide columns",
-                        ),
-                    ] {
-                        let mut on = current_ul & bit != 0;
-                        if ui.checkbox(&mut on, name).on_hover_text(tip).changed() {
-                            pr.satin_underlay = Some(if on {
-                                current_ul | bit
-                            } else {
-                                current_ul & !bit
-                            });
-                            pr.underlay = None;
+                    let current_ul = pr.satin_underlay_for(&f, satin_width);
+                    fm.wide(|ui| {
+                        for (bit, name, tip) in [
+                            (
+                                underlay::CENTER,
+                                "Center",
+                                "A run down the middle: anchors narrow columns",
+                            ),
+                            (
+                                underlay::CONTOUR,
+                                "Contour",
+                                "Runs just inside both edges: crisp edges on wide columns",
+                            ),
+                            (
+                                underlay::ZIGZAG,
+                                "Zigzag",
+                                "Sparse zigzag: lifts and supports wide columns",
+                            ),
+                        ] {
+                            let mut on = current_ul & bit != 0;
+                            if ui.checkbox(&mut on, name).on_hover_text(tip).changed() {
+                                pr.satin_underlay = Some(if on {
+                                    current_ul | bit
+                                } else {
+                                    current_ul & !bit
+                                });
+                                pr.underlay = None;
+                            }
                         }
-                    }
-                });
-                fm.row("Curves", |ui, _| {
-                    let mut short = pr.short_stitches_on();
+                    });
+                }
+                if fm.advanced(pr.short_stitches.is_some()) {
+                    fm.row("Curves", |ui, _| {
+                        let mut short = pr.short_stitches_on();
+                        if ui
+                            .checkbox(&mut short, "Short stitches")
+                            .on_hover_text(
+                                "Shortens every other stitch on the inside of tight curves",
+                            )
+                            .changed()
+                        {
+                            pr.short_stitches = Some(short);
+                        }
+                    });
+                }
+
+                if fm.advanced(pr.even.is_some()) {
+                    fm.row("Zigzag", |ui, _| {
+                    let mut even = pr.satin_even();
                     if ui
-                        .checkbox(&mut short, "Short stitches")
-                        .on_hover_text("Shortens every other stitch on the inside of tight curves")
+                        .checkbox(&mut even, "Even")
+                        .on_hover_text("Each step along the column is shared between the stitch over and the stitch back, so both slant the same. Off: one stitch goes straight across and the next takes the whole step.")
                         .changed()
                     {
-                        pr.short_stitches = Some(short);
+                        pr.even = (even != defaults::SATIN_EVEN).then_some(even);
                     }
                 });
-                fm.row("Lean", |ui, lid| {
+                }
+
+                if fm.advanced(pr.lean.is_some()) {
+                    fm.row("Lean", |ui, lid| {
                     let mut v = pr.satin_lean();
                     let r = ui
                         .add(
@@ -2784,32 +2874,38 @@ impl Studio {
                         pr.lean = (v != 0.0).then_some(v);
                     }
                 });
-                fm.row("Auto split", |ui, lid| {
-                    let mut on = pr.satin_split().is_some();
-                    if ui
-                        .checkbox(&mut on, "")
-                        .labelled_by(lid)
-                        .on_hover_text("Split stitches longer than this so wide columns don't snag")
-                        .changed()
-                    {
-                        pr.split = Some(if on { defaults::SATIN_SPLIT } else { 0.0 });
-                    }
-                    if let Some(mut v) = pr.satin_split() {
-                        let r = ui.add(
-                            egui::DragValue::new(&mut v)
-                                .range(3.0..=12.0)
-                                .speed(0.1)
-                                .fixed_decimals(1)
-                                .suffix(" mm"),
-                        );
-                        r.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::Role::Slider, true, "Split length")
-                        });
-                        if r.changed() {
-                            pr.split = Some(v);
+                }
+
+                if fm.advanced(pr.split.is_some()) {
+                    fm.row("Auto split", |ui, lid| {
+                        let mut on = pr.satin_split().is_some();
+                        if ui
+                            .checkbox(&mut on, "")
+                            .labelled_by(lid)
+                            .on_hover_text(
+                                "Split stitches longer than this so wide columns don't snag",
+                            )
+                            .changed()
+                        {
+                            pr.split = Some(if on { defaults::SATIN_SPLIT } else { 0.0 });
                         }
-                    }
-                });
+                        if let Some(mut v) = pr.satin_split() {
+                            let r = ui.add(
+                                egui::DragValue::new(&mut v)
+                                    .range(3.0..=12.0)
+                                    .speed(0.1)
+                                    .fixed_decimals(1)
+                                    .suffix(" mm"),
+                            );
+                            r.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::Role::Slider, true, "Split length")
+                            });
+                            if r.changed() {
+                                pr.split = Some(v);
+                            }
+                        }
+                    });
+                }
             }
             Kind::Contour => {
                 fm.row("Style", |ui, _| {
@@ -2833,16 +2929,18 @@ impl Studio {
                     0.05,
                     "Distance between the outline-following rows",
                 );
-                value_row(
-                    fm,
-                    "Length",
-                    &mut pr.len,
-                    f.run_len,
-                    1.0..=5.0,
-                    " mm",
-                    0.1,
-                    "",
-                );
+                if fm.advanced(pr.len.is_some()) {
+                    value_row(
+                        fm,
+                        "Length",
+                        &mut pr.len,
+                        f.run_len,
+                        1.0..=5.0,
+                        " mm",
+                        0.1,
+                        "",
+                    );
+                }
             }
             Kind::Blanket => {
                 value_row(
@@ -2877,17 +2975,21 @@ impl Studio {
                     0.1,
                     "Satin cover width",
                 );
-                value_row(
-                    fm,
-                    "Density",
-                    &mut pr.spacing,
-                    f.satin_spacing,
-                    0.2..=1.0,
-                    " mm",
-                    0.01,
-                    "",
-                );
-                fm.row("Underlay", |ui, _| underlay_box(ui, pr, "Under the cover"));
+                if fm.advanced(pr.spacing.is_some()) {
+                    value_row(
+                        fm,
+                        "Density",
+                        &mut pr.spacing,
+                        f.satin_spacing,
+                        0.2..=1.0,
+                        " mm",
+                        0.01,
+                        "",
+                    );
+                }
+                if fm.advanced(pr.underlay.is_some()) {
+                    fm.row("Underlay", |ui, _| underlay_box(ui, pr, "Under the cover"));
+                }
             }
             Kind::Manual => {}
             Kind::Meander => {
@@ -2901,16 +3003,18 @@ impl Studio {
                     0.1,
                     "How close the wandering line comes to itself",
                 );
-                value_row(
-                    fm,
-                    "Length",
-                    &mut pr.len,
-                    f.run_len,
-                    1.0..=5.0,
-                    " mm",
-                    0.1,
-                    "",
-                );
+                if fm.advanced(pr.len.is_some()) {
+                    value_row(
+                        fm,
+                        "Length",
+                        &mut pr.len,
+                        f.run_len,
+                        1.0..=5.0,
+                        " mm",
+                        0.1,
+                        "",
+                    );
+                }
             }
             Kind::Ripple => {
                 fm.row("Style", |ui, _| {
@@ -2934,16 +3038,18 @@ impl Studio {
                     0.1,
                     "Distance between the rows",
                 );
-                value_row(
-                    fm,
-                    "Length",
-                    &mut pr.len,
-                    f.run_len,
-                    1.0..=5.0,
-                    " mm",
-                    0.1,
-                    "",
-                );
+                if fm.advanced(pr.len.is_some()) {
+                    value_row(
+                        fm,
+                        "Length",
+                        &mut pr.len,
+                        f.run_len,
+                        1.0..=5.0,
+                        " mm",
+                        0.1,
+                        "",
+                    );
+                }
             }
             Kind::Cross => {
                 value_row(
@@ -3006,16 +3112,18 @@ impl Studio {
                         pr.angle = Some(v);
                     }
                 });
-                value_row(
-                    fm,
-                    "Spacing",
-                    &mut pr.spacing,
-                    f.fill_spacing,
-                    0.2..=0.8,
-                    " mm",
-                    0.01,
-                    "Row spacing within each stripe",
-                );
+                if fm.advanced(pr.spacing.is_some()) {
+                    value_row(
+                        fm,
+                        "Spacing",
+                        &mut pr.spacing,
+                        f.fill_spacing,
+                        0.2..=0.8,
+                        " mm",
+                        0.01,
+                        "Row spacing within each stripe",
+                    );
+                }
             }
             Kind::Run => {
                 value_row(
@@ -3042,9 +3150,12 @@ impl Studio {
         if to_angle_tool {
             self.tool = Tool::Angle;
         }
-        if current != Kind::Skip {
-            self.sewing_rows(ui, i);
-        }
+        let left_out = left_out
+            + if current != Kind::Skip {
+                self.sewing_rows(ui, i)
+            } else {
+                0
+            };
         for issue in self.issues.iter().filter(|x| x.shape == Some(i)) {
             let (c, icon) = if issue.level >= Level::Warning {
                 (p.warning, Icon::Warning)
@@ -3063,6 +3174,7 @@ impl Studio {
                     .clicked()
             })
             .inner;
+        self.left_out_note(ui, left_out);
         if reset {
             let kind = self.doc.shapes[i].params.kind;
             self.doc.shapes[i].params = Params {
@@ -3074,15 +3186,22 @@ impl Studio {
 
     /// Where object `i` starts and ends sewing, and what happens after it
     /// (Ink/Stitch's start, end, trim and stop commands).
-    fn sewing_rows(&mut self, ui: &mut egui::Ui, i: usize) {
+    /// An advanced row: returns 1 when it's left out (Basic, nothing set).
+    fn sewing_rows(&mut self, ui: &mut egui::Ui, i: usize) -> usize {
         use crate::view_tools::Marker;
+        let advanced = self.prefs.advanced;
+        let pr = &mut self.doc.shapes[i].params;
+        let set = pr.start.is_some() || pr.end.is_some() || pr.trim.is_some() || pr.stop.is_some();
+        if !advanced && !set {
+            return 1;
+        }
         theme::section_break(ui);
         let p = pal_ui(ui);
         let picking = self.view_tools.marker_pick;
         let mut pick: Option<Option<Marker>> = None;
         let mut clear: Option<Marker> = None;
-        let pr = &mut self.doc.shapes[i].params;
-        form(ui, "sewing-form", |fm| {
+        form_for(ui, "sewing-form", advanced, |fm| {
+            fm.advanced(set);
             fm.row("Sewing", |ui, _| {
                 for (m, label, set) in [
                     (Marker::Start, "Start", pr.start.is_some()),
@@ -3158,6 +3277,7 @@ impl Studio {
                 );
             }
         }
+        0
     }
 
     /// The threads in sewing order: one row per color block, a stop where
@@ -3277,7 +3397,9 @@ impl Studio {
     fn document_body(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.y = theme::space::S;
         let fabric = self.doc.settings.fabric();
-        form(ui, "doc-form", |fm: &mut Form| {
+        let advanced = self.prefs.advanced;
+        let usual = zigzag::document::Settings::default();
+        let left_out = form_for(ui, "doc-form", advanced, |fm: &mut Form| {
             self.machine_rows(fm);
             fm.row("Fabric", |ui, lid| {
                 egui::ComboBox::from_id_salt("fabric")
@@ -3354,55 +3476,61 @@ impl Studio {
                         });
                 });
             }
-            fm.row("Layers", |ui, _| {
-                ui.checkbox(&mut self.doc.settings.remove_overlaps, "Remove overlaps")
-                    .on_hover_text(
-                        "Don't fill areas that objects on top will cover (keeps 0.5 mm of overlap)",
-                    );
-            });
+            if fm.advanced(self.doc.settings.remove_overlaps != usual.remove_overlaps) {
+                fm.row("Layers", |ui, _| {
+                    ui.checkbox(&mut self.doc.settings.remove_overlaps, "Remove overlaps")
+                        .on_hover_text(
+                            "Don't fill areas that objects on top will cover (keeps 0.5 mm of overlap)",
+                        );
+                });
+            }
             fm.row("Order", |ui, _| {
                 ui.checkbox(&mut self.doc.settings.hat_order, "Cap order")
                     .on_hover_text("Sew from the center out and the bottom up, grouping colors, so puckering is pushed away");
             });
-            fm.row("Travel", |ui, _| {
-                ui.checkbox(&mut self.doc.settings.over_sewn, "Sew over fill")
-                    .on_hover_text(
-                        "Where the thread can't get from one part of an object to the next out of sight (under stitches still to come, or under what's sewn on top): off, it's cut; on, it's sewn over the fill already there. On saves cuts, and the running stitch shows on top of the fill.",
-                    );
-            });
+            if fm.advanced(self.doc.settings.over_sewn != usual.over_sewn) {
+                fm.row("Travel", |ui, _| {
+                    ui.checkbox(&mut self.doc.settings.over_sewn, "Sew over fill")
+                        .on_hover_text(
+                            "Where the thread can't get from one part of an object to the next out of sight (under stitches still to come, or under what's sewn on top): off, it's cut; on, it's sewn over the fill already there. On saves cuts, and the running stitch shows on top of the fill.",
+                        );
+                });
+            }
             // Connect: gaps this short are sewn across in the open rather
             // than cut. A bar to drag, the cuts it saves beside it, and what
             // it sews lit up on the canvas meanwhile.
             let mut peek = false;
-            fm.row("Connect", |ui, lid| {
-                let mm = &mut self.doc.settings.connect_mm;
-                ui.spacing_mut().slider_width = 100.0;
-                let bar = ui
-                    .add(
-                        egui::Slider::new(mm, 0.0..=CONNECT_BAR_MM)
-                            .show_value(false)
-                            .step_by(0.1)
-                            .clamping(egui::SliderClamping::Never),
-                    )
-                    .labelled_by(lid)
-                    .on_hover_text(
-                        "Sew across gaps up to this long with running stitches instead of cutting the thread, between objects or the parts of one. These stitches show: they light up on the canvas as you drag. (Travel that's out of sight, under a fill or what's sewn on top, is made anyway.)",
-                    );
-                bar.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::Role::Slider, true, "Connect gaps")
+            if fm.advanced(self.doc.settings.connect_mm != usual.connect_mm) {
+                fm.row("Connect", |ui, lid| {
+                    let mm = &mut self.doc.settings.connect_mm;
+                    ui.spacing_mut().slider_width = 100.0;
+                    let bar = ui
+                        .add(
+                            egui::Slider::new(mm, 0.0..=CONNECT_BAR_MM)
+                                .show_value(false)
+                                .step_by(0.1)
+                                .clamping(egui::SliderClamping::Never),
+                        )
+                        .labelled_by(lid)
+                        .on_hover_text(
+                            "Sew across gaps up to this long with running stitches instead of cutting the thread, between objects or the parts of one. These stitches show: they light up on the canvas as you drag. (Travel that's out of sight, under a fill or what's sewn on top, is made anyway.)",
+                        );
+                    bar.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::Role::Slider, true, "Connect gaps")
+                    });
+                    let field = ui.add(crate::units::drag_mm(mm, 0.0..=50.0, 0.1));
+                    peek = [&bar, &field]
+                        .iter()
+                        .any(|r| r.hovered() || r.dragged() || r.has_focus() || r.changed());
                 });
-                let field = ui.add(crate::units::drag_mm(mm, 0.0..=50.0, 0.1));
-                peek = [&bar, &field]
-                    .iter()
-                    .any(|r| r.hovered() || r.dragged() || r.has_focus() || r.changed());
-            });
-            let (cuts, bridged) = (self.design.trim_count(), self.design.bridges.len());
-            fm.wide(|ui| {
-                caption(
-                    ui,
-                    connect_note(self.doc.settings.connect_mm, cuts, bridged),
-                );
-            });
+                let (cuts, bridged) = (self.design.trim_count(), self.design.bridges.len());
+                fm.wide(|ui| {
+                    caption(
+                        ui,
+                        connect_note(self.doc.settings.connect_mm, cuts, bridged),
+                    );
+                });
+            }
             if peek {
                 self.bridges_peek =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
@@ -3413,7 +3541,29 @@ impl Studio {
                     .labelled_by(lid)
                     .on_hover_text("Your hat's color, for the preview (saved with the design; doesn't change the stitches)");
             });
-            self.narrow_satin_row(fm);
+            if fm.advanced(self.doc.settings.narrow_satin_mm != usual.narrow_satin_mm) {
+                self.narrow_satin_row(fm);
+            }
+        });
+        self.left_out_note(ui, left_out);
+    }
+
+    /// Under a panel's settings in Basic: how many more there are, and
+    /// where they're turned on (Settings › General: one choice for every
+    /// panel).
+    fn left_out_note(&self, ui: &mut egui::Ui, left_out: usize) {
+        if self.prefs.advanced || left_out == 0 {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(theme::LABEL_W + theme::space::S);
+            caption(
+                ui,
+                format!(
+                    "{left_out} more {}: Show advanced settings, in Settings › General.",
+                    if left_out == 1 { "setting" } else { "settings" }
+                ),
+            );
         });
     }
 
@@ -3509,6 +3659,76 @@ mod tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn overlapping_strokes_are_offered_only_to_be_put_back() {
+        let svg = |id: &str| {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" viewBox="0 0 100 100">
+              <path id="{id}" fill="#123456" d="M10 10 L13 10 L13 19 L27 19 L27 10 L30 10 L30 30 L27 30 L27 21 L13 21 L13 30 L10 30 Z"/>
+            </svg>"##
+            )
+        };
+        let open = |id: &str| {
+            let doc = zigzag::document::Document::from_svg(&svg(id), "t", None).unwrap();
+            let mut h = Harness::builder()
+                .with_size(Vec2::new(1400.0, 1000.0))
+                .build_ui_state(
+                    |ui, s: &mut Studio| s.frame(ui),
+                    Studio::with_file(None, None),
+                );
+            h.state_mut().set_document(doc);
+            h.run_steps(3);
+            h.state_mut().set_selection(&[0]);
+            h.run_steps(3);
+            h
+        };
+        let h = open("H_satin");
+        assert!(h.query_by_label("Overlapping").is_none(), "not offered");
+        // A file's text that has them: Strokes puts it back, and the row
+        // goes.
+        let mut h = open("H_satin_overlap");
+        assert_eq!(h.state().doc.shapes[0].params.overlap, Some(true));
+        h.get_by_label("Strokes").click();
+        h.run_steps(3);
+        assert_eq!(h.state().doc.shapes[0].params.overlap, None);
+        assert!(h.query_by_label("Overlapping").is_none());
+    }
+
+    #[test]
+    fn a_filled_satins_corners_are_auto_mitred_or_cut() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" viewBox="0 0 100 100">
+              <path id="H_satin" fill="#123456" d="M10 10 L13 10 L13 19 L27 19 L27 10 L30 10 L30 30 L27 30 L27 21 L13 21 L13 30 L10 30 Z"/>
+            </svg>"##;
+        let doc = zigzag::document::Document::from_svg(svg, "t", None).unwrap();
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        h.state_mut().prefs.advanced = true;
+        h.state_mut().set_document(doc);
+        h.run_steps(3);
+        h.state_mut().set_selection(&[0]);
+        h.run_steps(3);
+        // Cut unless it's asked to be mitred where that's clean (Auto) or
+        // everywhere; and back.
+        let p = |h: &Harness<Studio>| {
+            let p = &h.state().doc.shapes[0].params;
+            (p.cut, p.mitred)
+        };
+        assert_eq!(p(&h), (None, None));
+        h.get_by_label("Auto").click();
+        h.run_steps(3);
+        assert_eq!(p(&h), (Some(false), None));
+        h.get_by_label("Mitred").click();
+        h.run_steps(3);
+        assert_eq!(p(&h), (Some(false), Some(true)));
+        h.get_by_label("Cut").click();
+        h.run_steps(3);
+        assert_eq!(p(&h), (None, None));
+    }
 
     #[test]
     fn layers_are_dragged_to_another_place_in_the_sewing_order() {
@@ -4022,6 +4242,104 @@ mod tests {
             "{}",
             h.state().status
         );
+    }
+
+    #[test]
+    fn a_changed_row_stays_while_its_dragged_back_to_what_it_was() {
+        // Basic, a setting that's been changed: its row shows. Dragged to
+        // the value it had (a lean back to 0), the row stays under the
+        // pointer until it's let go, and then goes.
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(400.0, 200.0))
+            .build_ui_state(
+                |ui, v: &mut f64| {
+                    theme::form_for(ui, "t", false, |fm| {
+                        if fm.advanced(*v != 0.0) {
+                            fm.row("Lean", |ui, lid| {
+                                ui.add(egui::DragValue::new(v)).labelled_by(lid);
+                            });
+                        }
+                    });
+                },
+                4.0,
+            );
+        h.run_steps(2);
+        assert!(h.query_by_label("Lean").is_some());
+        let at = h
+            .query_all_by_role(egui::accesskit::Role::SpinButton)
+            .next()
+            .expect("its value")
+            .rect()
+            .center();
+        h.hover_at(at);
+        h.run_steps(1);
+        h.drag_at(at);
+        h.run_steps(2);
+        *h.state_mut() = 0.0;
+        h.run_steps(3);
+        assert!(h.query_by_label("Lean").is_some(), "still in hand");
+        h.drop_at(at);
+        h.run_steps(3);
+        assert!(h.query_by_label("Lean").is_none(), "let go: back to Basic");
+    }
+
+    #[test]
+    fn basic_shows_what_most_designs_need_and_whatever_was_changed() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" viewBox="0 0 100 100">
+              <path id="H_satin" fill="#123456" d="M10 10 L13 10 L13 19 L27 19 L27 10 L30 10 L30 30 L27 30 L27 21 L13 21 L13 30 L10 30 Z"/>
+            </svg>"##;
+        let doc = zigzag::document::Document::from_svg(svg, "t", None).unwrap();
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        assert!(h.state().prefs.advanced, "every setting to begin with");
+        h.state_mut().prefs.advanced = false;
+        h.state_mut().set_document(doc);
+        h.run_steps(3);
+        h.state_mut().set_selection(&[0]);
+        h.run_steps(3);
+        let advanced = [
+            "Pull comp.",
+            "Lean",
+            "Corners",
+            "Short stitches",
+            "Auto split",
+            "Trim",
+            "Remove overlaps",
+            "Connect gaps",
+        ];
+        assert!(h.query_by_label("Density").is_some());
+        for name in advanced {
+            assert!(h.query_by_label(name).is_none(), "{name} is advanced");
+        }
+        // Changed out of sight (by an agent, say): it shows, though Basic.
+        h.state_mut().doc.shapes[0].params.lean = Some(4.0);
+        h.state_mut().doc.settings.connect_mm = 3.0;
+        h.run_steps(3);
+        assert!(h.query_by_label("Lean").is_some());
+        assert!(h.query_by_label("Connect gaps").is_some());
+        assert!(h.query_by_label("Pull comp.").is_none());
+        // Advanced: everything.
+        // (Each panel says how many more it has, and where they're
+        // turned on: Settings › General.)
+        assert_eq!(
+            h.query_all_by_label_contains("Show advanced settings")
+                .count(),
+            2
+        );
+        h.state_mut().prefs.advanced = true;
+        h.run_steps(3);
+        assert_eq!(
+            h.query_all_by_label_contains("Show advanced settings")
+                .count(),
+            0
+        );
+        for name in advanced {
+            assert!(h.query_by_label(name).is_some(), "{name} shows in Advanced");
+        }
     }
 
     #[test]

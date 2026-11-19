@@ -126,6 +126,18 @@ pub enum Icon {
     ShapeBuilder,
     /// A brush over the blob it has painted: the Blob Brush.
     BlobBrush,
+    /// A speech bubble with one pointed corner: comment on the canvas for
+    /// the agent (its marker there is the same shape).
+    Comment,
+    /// An eye struck through: hide.
+    EyeOff,
+    /// A frame split down the middle: side by side.
+    Compare,
+    /// A bin: delete.
+    Trash,
+    /// A frame with its left half filled: before; its right: after.
+    BeforeHalf,
+    AfterHalf,
 }
 
 /// An icon's line weight in a box `side` points across: a whole number of
@@ -1094,6 +1106,72 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
                 (0.92, 0.7),
                 (0.7, 0.7),
             ]);
+        }
+        Icon::Comment => {
+            // The canvas's note marker as an outline: round but for the
+            // bottom-left corner, which comes to a point on the spot.
+            let r = (side * 0.4) as u8;
+            p.rect_stroke(
+                Rect::from_min_max(at(0.08, 0.08), at(0.92, 0.92)),
+                eframe::egui::CornerRadius {
+                    nw: r,
+                    ne: r,
+                    sw: 0,
+                    se: r,
+                },
+                Stroke::new(COMMENT_STROKE, c),
+                eframe::egui::StrokeKind::Middle,
+            );
+        }
+        Icon::EyeOff => {
+            paint(p, r, Icon::Eye, c);
+            line(&[(0.14, 0.12), (0.86, 0.88)]);
+        }
+        Icon::Compare => {
+            p.rect_stroke(
+                Rect::from_min_max(at(0.08, 0.16), at(0.92, 0.84)),
+                side * 0.14,
+                s,
+                eframe::egui::StrokeKind::Middle,
+            );
+            line(&[(0.5, 0.06), (0.5, 0.94)]);
+        }
+        Icon::BeforeHalf | Icon::AfterHalf => {
+            let frame = Rect::from_min_max(at(0.08, 0.16), at(0.92, 0.84));
+            let x = if icon == Icon::BeforeHalf { 0.08 } else { 0.5 };
+            p.rect_filled(
+                Rect::from_min_max(at(x, 0.16), at(x + 0.42, 0.84)),
+                side * 0.1,
+                c,
+            );
+            p.rect_stroke(frame, side * 0.14, s, eframe::egui::StrokeKind::Middle);
+        }
+        Icon::Trash => {
+            line(&[(0.1, 0.24), (0.9, 0.24)]);
+            line(&[(0.37, 0.24), (0.37, 0.1), (0.63, 0.1), (0.63, 0.24)]);
+            line(&[(0.2, 0.24), (0.26, 0.92), (0.74, 0.92), (0.8, 0.24)]);
+            line(&[(0.42, 0.42), (0.42, 0.74)]);
+            line(&[(0.58, 0.42), (0.58, 0.74)]);
+        }
+    }
+}
+
+/// The comment icon's line, and the prompt's Send arrow beside it: one
+/// weight, so the two look like a pair.
+pub const COMMENT_STROKE: f32 = 1.5;
+
+/// The dots a floating bar is dragged by: two columns of three (`upright`)
+/// or three columns of two, centered on `at`.
+pub fn grip_dots(p: &Painter, at: Pos2, upright: bool, c: Color32) {
+    let (cols, rows) = if upright { (2, 3) } else { (3, 2) };
+    let gap = 5.0;
+    for i in 0..cols {
+        for j in 0..rows {
+            let o = Vec2::new(
+                (i as f32 - (cols - 1) as f32 / 2.0) * gap,
+                (j as f32 - (rows - 1) as f32 / 2.0) * gap,
+            );
+            p.circle_filled(at + o, 1.4, c);
         }
     }
 }

@@ -277,6 +277,7 @@ impl Studio {
         self.replans += 1;
         *self.satin_memo.borrow_mut() = None;
         self.agent.work.clear();
+        self.leave_review();
     }
 
     /// Bring tab `j` to the front.

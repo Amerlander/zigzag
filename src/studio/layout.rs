@@ -825,6 +825,25 @@ impl Studio {
         }
     }
 
+    /// Object › Break into Columns, on the selection.
+    pub fn break_into_columns_selected(&mut self) {
+        let idx = self.sel_indices();
+        let mut new = Vec::new();
+        match self.structural(|d| {
+            new = d.break_into_columns(&idx)?;
+            Ok(())
+        }) {
+            Ok(()) => {
+                self.set_selection(&new);
+                self.status = format!(
+                    "Broke it into {} satin columns, sewn as before. Reorder them in Layers or reshape their rails; they stay one piece of thread while they're in one group with the same settings.",
+                    new.len()
+                );
+            }
+            Err(e) => self.status = format!("Couldn't break into columns: {e:#}"),
+        }
+    }
+
     /// Whether object `i` is a shape that can have an outline: a filled
     /// shape, not a line (one already) and not text.
     pub fn takes_outline(&self, i: usize) -> bool {
@@ -2554,6 +2573,55 @@ mod tests {
         s.end_drag();
         assert_eq!(s.replans, plans);
         let _ = c;
+    }
+
+    #[test]
+    fn a_dragged_satin_shows_the_columns_it_had_moved_with_it() {
+        // An L: two columns to find, which is the slow part (a line of
+        // text took a third of a second at every frame of a drag).
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" viewBox="0 0 100 100">
+          <path id="satin" d="M10 10 H16 V44 H40 V50 H10 Z" fill="#024"/>
+        </svg>"##;
+        let mut h = studio();
+        h.state_mut()
+            .set_document(zigzag::document::Document::from_svg(svg, "t", None).unwrap());
+        h.run_steps(3);
+        let s = h.state_mut();
+        s.set_selection(&[0]);
+        let was = s.satin_info_shown(0).expect("planned");
+        assert_eq!(was.rails.len(), 2);
+        let at = shape_bounds(&s.doc.shapes[0]).center();
+        s.begin_drag(None, at);
+        for k in 1..=3 {
+            let by = P::new(40.0 * k as f64, 25.0);
+            s.update_drag(at + by, DragMods::default());
+            let now = s.satin_info_shown(0).expect("shown while it moves");
+            // Where the shape is now, and not found again to be there.
+            for (a, b) in was.rails.iter().zip(&now.rails) {
+                assert!(a.0.iter().zip(&b.0).all(|(p, q)| (*p + by).dist(*q) < 1e-9));
+                assert!(a.1.iter().zip(&b.1).all(|(p, q)| (*p + by).dist(*q) < 1e-9));
+            }
+            assert_eq!(was.rungs.len(), now.rungs.len());
+            let kept = s.satin_memo.borrow();
+            assert!(std::rc::Rc::ptr_eq(&kept.as_ref().unwrap().1, &was));
+        }
+        // Twice the size: columns twice as wide.
+        s.end_drag();
+        h.run_steps(3);
+        let s = h.state_mut();
+        let b = shape_bounds(&s.doc.shapes[0]);
+        let was = s.satin_info_shown(0).expect("planned where it landed");
+        s.begin_drag(Some(Handle::Scale(1, 1)), b.max);
+        s.update_drag(
+            b.max + P::new(b.width(), b.height()),
+            DragMods {
+                shift: true,
+                ..DragMods::default()
+            },
+        );
+        let now = s.satin_info_shown(0).unwrap();
+        assert!((now.mean_width - was.mean_width * 2.0).abs() < 1e-6);
+        s.end_drag();
     }
 
     #[test]

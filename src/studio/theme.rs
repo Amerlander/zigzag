@@ -346,33 +346,121 @@ pub fn caption(ui: &mut egui::Ui, text: impl Into<String>) -> Response {
 
 /// A two-column form: labels right-aligned in a fixed column, controls after.
 pub fn form(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut Form)) {
+    form_for(ui, id, true, add);
+}
+
+/// A form whose advanced rows show only when `advanced` (or when they've
+/// been changed: see [`Form::advanced`]). Returns how many it left out.
+pub fn form_for(ui: &mut egui::Ui, id: &str, advanced: bool, add: impl FnOnce(&mut Form)) -> usize {
+    // (The changed rows Basic showed last frame, and whether something is
+    // in hand: see [`Form::advanced`].)
+    let rows = ui.make_persistent_id(("form-rows-shown", id));
+    let was: Vec<usize> = ui.data(|d| d.get_temp(rows)).unwrap_or_default();
+    let in_hand = ui.ctx().egui_is_using_pointer() || ui.memory(|m| m.focused().is_some());
+    let (left_out, shown) = form_rows(ui, id, advanced, was, in_hand, add);
+    ui.data_mut(|d| d.insert_temp(rows, shown));
+    left_out
+}
+
+fn form_rows(
+    ui: &mut egui::Ui,
+    id: &str,
+    advanced: bool,
+    was: Vec<usize>,
+    in_hand: bool,
+    add: impl FnOnce(&mut Form),
+) -> (usize, Vec<usize>) {
     egui::Grid::new(id)
         .num_columns(2)
         .spacing([space::S, space::S])
         .min_col_width(LABEL_W)
         .show(ui, |ui| {
-            let mut f = Form { ui };
+            let mut f = Form {
+                ui,
+                all: advanced,
+                mark: false,
+                left_out: 0,
+                asked: 0,
+                was,
+                in_hand,
+                shown: Vec::new(),
+            };
             add(&mut f);
-        });
+            (f.left_out, f.shown)
+        })
+        .inner
 }
 
 pub const LABEL_W: f32 = 84.0;
 
 pub struct Form<'a> {
     pub ui: &'a mut egui::Ui,
+    /// Every row shows (Advanced), not only the basic ones.
+    all: bool,
+    /// The next row is an advanced one shown in Basic because it's been
+    /// changed: its label says so.
+    mark: bool,
+    /// Advanced rows left out.
+    left_out: usize,
+    /// How many times [`Form::advanced`] has been asked, this frame.
+    asked: usize,
+    /// Which of those askings Basic showed a row for last frame, whether
+    /// a control is in hand (the pointer down on one, or one typed in),
+    /// and which it shows this frame.
+    was: Vec<usize>,
+    in_hand: bool,
+    shown: Vec<usize>,
 }
 
 impl Form<'_> {
+    /// Whether to show an advanced row (or rows): always in Advanced; in
+    /// Basic only when `changed` from what the fabric would do, so that
+    /// nothing out of sight changes the stitches (an agent's change
+    /// included). Such a row's label is marked.
+    ///
+    /// A row that's showing stays while a control is in hand: dragged
+    /// through the value it had before it was changed (a slider across
+    /// its default), it would otherwise go from under the pointer.
+    pub fn advanced(&mut self, changed: bool) -> bool {
+        if self.all {
+            return true;
+        }
+        let k = self.asked;
+        self.asked += 1;
+        let show = changed || (self.in_hand && self.was.contains(&k));
+        self.mark = show;
+        if show {
+            self.shown.push(k);
+        } else {
+            self.left_out += 1;
+        }
+        show
+    }
+
     /// One row: a right-aligned label and whatever `add` puts next to it.
     /// Returns the label's id so controls can be `labelled_by` it.
     pub fn row<R>(&mut self, label: &str, add: impl FnOnce(&mut egui::Ui, egui::Id) -> R) -> R {
         let p = pal_ui(self.ui);
+        let marked = std::mem::take(&mut self.mark);
         let l = self
             .ui
             .allocate_ui_with_layout(
                 Vec2::new(LABEL_W, 22.0),
                 egui::Layout::right_to_left(egui::Align::Center),
-                |ui| ui.label(egui::RichText::new(label).color(p.secondary)),
+                |ui| {
+                    let l = ui.label(egui::RichText::new(label).color(p.secondary));
+                    if marked {
+                        // (A dot before the label: an advanced setting,
+                        // changed.)
+                        let (dot, _) = ui.allocate_exact_size(Vec2::splat(6.0), Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 2.5, p.accent);
+                        l.on_hover_text(
+                            "An advanced setting, shown because it's been changed. Reset to Defaults puts it back.",
+                        )
+                    } else {
+                        l
+                    }
+                },
             )
             .inner;
         let r = self.ui.horizontal(|ui| add(ui, l.id)).inner;
