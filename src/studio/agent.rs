@@ -17,6 +17,33 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// The platform the studio runs on, for install steps and wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Os {
+    Mac,
+    Windows,
+    /// Linux and other Unixes.
+    Linux,
+}
+
+impl Os {
+    const CURRENT: Os = if cfg!(target_os = "macos") {
+        Os::Mac
+    } else if cfg!(windows) {
+        Os::Windows
+    } else {
+        Os::Linux
+    };
+
+    /// Where to run a command: the Mac's Terminal app, or any terminal.
+    fn terminal(self) -> &'static str {
+        match self {
+            Os::Mac => "Terminal",
+            Os::Windows | Os::Linux => "a terminal",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AgentKind {
     Claude,
@@ -32,33 +59,23 @@ impl AgentKind {
         self as usize
     }
 
-    /// How to install its command-line tool on this computer (Windows or a Mac):
-    /// (how, command) pairs, the first recommended, then how to sign in.
+    /// How to install its command-line tool on this computer: (how, command)
+    /// pairs, the first recommended, then how to sign in.
     pub fn install_steps(self) -> (&'static [(&'static str, &'static str)], &'static str) {
-        if cfg!(windows) {
-            return match self {
-                AgentKind::Codex => (
-                    &[("With npm", "npm install -g @openai/codex")],
-                    "Then run `codex` once in a terminal and choose Sign in with ChatGPT.",
-                ),
-                AgentKind::Claude => (
-                    &[(
-                        "Recommended (PowerShell)",
-                        "irm https://claude.ai/install.ps1 | iex",
-                    )],
-                    "Then run `claude` once in a terminal to sign in.",
-                ),
-            };
-        }
-        match self {
-            AgentKind::Codex => (
+        self.install_steps_on(Os::CURRENT)
+    }
+
+    /// How to install its command-line tool on `os`.
+    fn install_steps_on(self, os: Os) -> (&'static [(&'static str, &'static str)], &'static str) {
+        match (os, self) {
+            (Os::Mac, AgentKind::Codex) => (
                 &[
                     ("With Homebrew", "brew install --cask codex"),
                     ("Or with npm", "npm install -g @openai/codex"),
                 ],
                 "Then run `codex` once in Terminal and choose Sign in with ChatGPT.",
             ),
-            AgentKind::Claude => (
+            (Os::Mac, AgentKind::Claude) => (
                 &[
                     (
                         "Recommended",
@@ -68,7 +85,46 @@ impl AgentKind {
                 ],
                 "Then run `claude` once in Terminal to sign in.",
             ),
+            (Os::Windows | Os::Linux, AgentKind::Codex) => (
+                &[("With npm", "npm install -g @openai/codex")],
+                "Then run `codex` once in a terminal and choose Sign in with ChatGPT.",
+            ),
+            (Os::Windows, AgentKind::Claude) => (
+                &[
+                    (
+                        "Recommended (PowerShell)",
+                        "irm https://claude.ai/install.ps1 | iex",
+                    ),
+                    ("Or with WinGet", "winget install Anthropic.ClaudeCode"),
+                ],
+                "Then run `claude` once in a terminal to sign in.",
+            ),
+            (Os::Linux, AgentKind::Claude) => (
+                &[
+                    (
+                        "Recommended",
+                        "curl -fsSL https://claude.ai/install.sh | bash",
+                    ),
+                    ("Or with npm", "npm install -g @anthropic-ai/claude-code"),
+                ],
+                "Then run `claude` once in a terminal to sign in.",
+            ),
         }
+    }
+
+    /// Said in the transcript when a prompt is sent but its tool is missing.
+    fn not_installed_message(self, os: Os) -> String {
+        let (ways, sign_in) = self.install_steps_on(os);
+        format!(
+            "{} isn't installed (no `{}` command found). Install it in {} with `{}`{}. {sign_in} Then try again.",
+            self.name(),
+            self.program(),
+            os.terminal(),
+            ways[0].1,
+            ways.get(1)
+                .map(|w| format!(" (or `{}`)", w.1))
+                .unwrap_or_default(),
+        )
     }
 
     pub fn name(self) -> &'static str {
@@ -436,16 +492,8 @@ impl AgentState {
             return;
         };
         let Some(program) = self.find(self.kind) else {
-            let (ways, sign_in) = self.kind.install_steps();
-            self.log.push(Entry::Error(format!(
-                "{} isn't installed (no `{}` command found). Install it in Terminal with `{}`{}. {sign_in} Then try again.",
-                self.kind.name(),
-                self.kind.program(),
-                ways[0].1,
-                ways.get(1)
-                    .map(|w| format!(" (or `{}`)", w.1))
-                    .unwrap_or_default(),
-            )));
+            self.log
+                .push(Entry::Error(self.kind.not_installed_message(Os::CURRENT)));
             return;
         };
         let bridge = std::env::current_exe()
@@ -1259,7 +1307,7 @@ impl Studio {
                         Vec2::new(ui.available_width(), inner_h),
                         Sense::hover(),
                     );
-                    // Its program isn't on this Mac: how to install it instead.
+                    // Its program isn't on this computer: how to install it instead.
                     let kind = a.kind;
                     if a.installed(kind, &ui.ctx().clone()) == Some(false) {
                         let mut child = ui.new_child(
@@ -2046,9 +2094,23 @@ mod tests {
         h.state_mut().agent.found = [Some(None), Some(None)]; // neither installed
         h.state_mut().dock.reveal(PanelId::Agent);
         h.run_steps(5);
-        h.get_by_label_contains("Codex isn't installed");
-        h.get_by_label("brew install --cask codex");
-        h.get_by_label("npm install -g @openai/codex");
+        h.get_by_label("Codex isn't installed on this computer");
+        // This platform's install commands, each with its Copy button.
+        for (_, command) in AgentKind::Codex.install_steps().0 {
+            h.get_by_label(command);
+        }
+        if Os::CURRENT == Os::Mac {
+            h.get_by_label("brew install --cask codex");
+        } else {
+            assert!(
+                h.query_by_label_contains("this Mac").is_none(),
+                "no Mac here"
+            );
+            assert!(
+                h.query_by_label_contains("brew install").is_none(),
+                "no Homebrew"
+            );
+        }
         h.get_by_label_contains("Sign in with ChatGPT");
         assert!(
             h.query_by_label("A round camp badge with a pine tree")
@@ -2074,9 +2136,83 @@ mod tests {
         // Its own steps when it's missing.
         h.state_mut().agent.found = [Some(None), Some(None)];
         h.run_steps(3);
-        h.get_by_label("curl -fsSL https://claude.ai/install.sh | bash");
-        h.get_by_label("brew install --cask claude-code");
+        h.get_by_label("Claude Code isn't installed on this computer");
+        for (_, command) in AgentKind::Claude.install_steps().0 {
+            h.get_by_label(command);
+        }
+        if Os::CURRENT != Os::Mac {
+            assert!(
+                h.query_by_label_contains("this Mac").is_none(),
+                "no Mac here"
+            );
+            assert!(
+                h.query_by_label_contains("brew install").is_none(),
+                "no Homebrew"
+            );
+        }
         h.get_by_label("Check Again");
+    }
+
+    #[test]
+    fn install_steps_fit_the_platform() {
+        let commands = |os, kind: AgentKind| -> Vec<&str> {
+            kind.install_steps_on(os).0.iter().map(|w| w.1).collect()
+        };
+        let all_text = |os, kind: AgentKind| {
+            let (ways, sign_in) = kind.install_steps_on(os);
+            let mut s = kind.not_installed_message(os);
+            for (how, command) in ways {
+                s += &format!(" {how} {command}");
+            }
+            s + " " + sign_in
+        };
+        // A Mac: Homebrew, and its Terminal app.
+        assert_eq!(
+            commands(Os::Mac, AgentKind::Codex),
+            ["brew install --cask codex", "npm install -g @openai/codex"]
+        );
+        assert_eq!(
+            commands(Os::Mac, AgentKind::Claude),
+            [
+                "curl -fsSL https://claude.ai/install.sh | bash",
+                "brew install --cask claude-code"
+            ]
+        );
+        assert!(all_text(Os::Mac, AgentKind::Codex).contains("in Terminal"));
+        // Windows: npm, PowerShell and WinGet.
+        assert_eq!(
+            commands(Os::Windows, AgentKind::Codex),
+            ["npm install -g @openai/codex"]
+        );
+        assert_eq!(
+            commands(Os::Windows, AgentKind::Claude),
+            [
+                "irm https://claude.ai/install.ps1 | iex",
+                "winget install Anthropic.ClaudeCode"
+            ]
+        );
+        // Linux: npm, and the shell installer.
+        assert_eq!(
+            commands(Os::Linux, AgentKind::Codex),
+            ["npm install -g @openai/codex"]
+        );
+        assert_eq!(
+            commands(Os::Linux, AgentKind::Claude),
+            [
+                "curl -fsSL https://claude.ai/install.sh | bash",
+                "npm install -g @anthropic-ai/claude-code"
+            ]
+        );
+        // Neither speaks of a Mac, Homebrew or the Terminal app.
+        for os in [Os::Windows, Os::Linux] {
+            for kind in AgentKind::ALL {
+                let text = all_text(os, kind);
+                for mac in ["Mac", "brew", "Homebrew", "Terminal"] {
+                    assert!(!text.contains(mac), "{os:?} {kind:?}: {text}");
+                }
+                assert!(text.contains("in a terminal"), "{os:?} {kind:?}: {text}");
+            }
+        }
     }
 
     #[test]
