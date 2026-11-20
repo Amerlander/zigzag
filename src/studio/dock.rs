@@ -326,35 +326,88 @@ fn layout_file() -> Option<std::path::PathBuf> {
     config_file("panels.json")
 }
 
-/// A settings file in ZigZag's folder (Application Support on a Mac).
+/// A settings file in ZigZag's folder (Application Support on a Mac,
+/// AppData on Windows).
 pub(crate) fn config_file(name: &str) -> Option<std::path::PathBuf> {
     Some(config_dir()?.join(name))
 }
 
-/// ZigZag's settings folder. The app used to be called Threadline: the first
-/// time the new folder is missing and the old one is there, the old one is
-/// moved over, so sessions, panel layouts and palettes come along.
+/// ZigZag's settings folder. The first time it's missing and one it used
+/// to have is there (the app used to be called Threadline, and on Windows
+/// it was kept under `.config` when started from a shell that sets HOME),
+/// that one is moved over, so sessions, panel layouts and palettes come
+/// along.
 fn config_dir() -> Option<std::path::PathBuf> {
     use std::sync::OnceLock;
     static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
-        let (new, old) = if cfg!(target_os = "macos") {
-            let base = home.join("Library/Application Support");
-            (base.join("ZigZag"), base.join("threadline"))
+        let os = if cfg!(target_os = "macos") {
+            Os::Mac
+        } else if cfg!(windows) {
+            Os::Windows
         } else {
-            let base = std::env::var_os("XDG_CONFIG_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or(home.join(".config"));
-            (base.join("zigzag"), base.join("threadline"))
+            Os::Other
         };
-        if !new.exists() && old.is_dir() {
+        let (new, old) = config_dirs(os, |k| std::env::var_os(k))?;
+        if !new.exists()
+            && let Some(old) = old.iter().find(|d| d.is_dir())
+        {
             // Best effort: if the move fails the app simply starts fresh.
-            let _ = std::fs::rename(&old, &new);
+            let _ = std::fs::rename(old, &new);
         }
         Some(new)
     })
     .clone()
+}
+
+#[derive(Clone, Copy)]
+enum Os {
+    Mac,
+    Windows,
+    Other,
+}
+
+/// ZigZag's settings folder on `os`, with the environment `env`, and the
+/// folders it used to be kept in (most likely first).
+///
+/// Windows sets no HOME (only shells such as Git Bash do), so the folder
+/// there is in AppData: whether the app is started from Explorer or from
+/// a shell, it's the same one. XDG_CONFIG_HOME, where it's set, comes
+/// first everywhere but on a Mac.
+fn config_dirs(
+    os: Os,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> {
+    use std::path::PathBuf;
+    let var = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    match os {
+        Os::Mac => {
+            let base = var("HOME")?.join("Library/Application Support");
+            Some((base.join("ZigZag"), vec![base.join("threadline")]))
+        }
+        Os::Windows => {
+            if let Some(base) = var("XDG_CONFIG_HOME") {
+                return Some((base.join("zigzag"), vec![base.join("threadline")]));
+            }
+            let base = var("APPDATA")
+                .or_else(|| Some(var("USERPROFILE")?.join("AppData").join("Roaming")))?;
+            let mut old = Vec::new();
+            for name in ["zigzag", "threadline"] {
+                for home in [var("HOME"), var("USERPROFILE")].into_iter().flatten() {
+                    let d = home.join(".config").join(name);
+                    if !old.contains(&d) {
+                        old.push(d);
+                    }
+                }
+            }
+            old.push(base.join("threadline"));
+            Some((base.join("ZigZag"), old))
+        }
+        Os::Other => {
+            let base = var("XDG_CONFIG_HOME").or_else(|| Some(var("HOME")?.join(".config")))?;
+            Some((base.join("zigzag"), vec![base.join("threadline")]))
+        }
+    }
 }
 
 impl DockState {
@@ -3808,6 +3861,75 @@ mod tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
+
+    fn dirs_with(os: Os, vars: &[(&str, &str)]) -> Option<(PathBuf, Vec<PathBuf>)> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        config_dirs(os, |k| {
+            vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.into())
+        })
+    }
+
+    use std::path::PathBuf;
+
+    /// Started from Explorer, Windows sets no HOME: the settings (and the
+    /// open tabs with them) are still kept, in AppData.
+    #[test]
+    fn windows_keeps_settings_in_appdata_without_home() {
+        let appdata = r"C:\Users\ana\AppData\Roaming";
+        let (dir, old) = dirs_with(
+            Os::Windows,
+            &[("APPDATA", appdata), ("USERPROFILE", r"C:\Users\ana")],
+        )
+        .expect("a folder, HOME or not");
+        assert_eq!(dir, PathBuf::from(appdata).join("ZigZag"));
+        // Where a launch from Git Bash kept them is moved over.
+        assert_eq!(
+            old[0],
+            PathBuf::from(r"C:\Users\ana")
+                .join(".config")
+                .join("zigzag")
+        );
+        // A shell's HOME doesn't move it: the same folder either way.
+        let (with_home, _) = dirs_with(
+            Os::Windows,
+            &[("APPDATA", appdata), ("HOME", r"D:\home\ana")],
+        )
+        .unwrap();
+        assert_eq!(with_home, dir);
+        // Without APPDATA, the user's profile says where AppData is.
+        let (from_profile, _) =
+            dirs_with(Os::Windows, &[("USERPROFILE", r"C:\Users\ana")]).unwrap();
+        assert_eq!(from_profile, PathBuf::from(appdata).join("ZigZag"));
+        // XDG_CONFIG_HOME, where set, wins (as for a test run's own folder).
+        let (xdg, _) = dirs_with(
+            Os::Windows,
+            &[("APPDATA", appdata), ("XDG_CONFIG_HOME", r"D:\run\config")],
+        )
+        .unwrap();
+        assert_eq!(xdg, PathBuf::from(r"D:\run\config").join("zigzag"));
+    }
+
+    #[test]
+    fn mac_and_linux_keep_their_folders() {
+        let (mac, _) = dirs_with(Os::Mac, &[("HOME", "/Users/ana")]).unwrap();
+        assert_eq!(
+            mac,
+            PathBuf::from("/Users/ana/Library/Application Support/ZigZag")
+        );
+        let (linux, old) = dirs_with(Os::Other, &[("HOME", "/home/ana")]).unwrap();
+        assert_eq!(linux, PathBuf::from("/home/ana/.config/zigzag"));
+        assert_eq!(old, [PathBuf::from("/home/ana/.config/threadline")]);
+        let (xdg, _) = dirs_with(
+            Os::Other,
+            &[("HOME", "/home/ana"), ("XDG_CONFIG_HOME", "/tmp/cfg")],
+        )
+        .unwrap();
+        assert_eq!(xdg, PathBuf::from("/tmp/cfg/zigzag"));
+        assert!(dirs_with(Os::Other, &[]).is_none());
+    }
 
     #[test]
     fn overlapping_strokes_are_offered_only_to_be_put_back() {

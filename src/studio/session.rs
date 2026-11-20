@@ -1,7 +1,8 @@
 //! Picking up where you left off: what's open (the file, its unsaved
 //! changes, the view and the selection) is written to ZigZag's folder
 //! as you work, and reopened the next time the app starts, whether it was
-//! quit or it crashed.
+//! quit or it crashed. A file opened with the app at launch opens on top
+//! of what comes back, rather than in its place.
 //!
 //! `session.json` says which document and how it was shown; `recovery.svg`
 //! holds the document itself while it has unsaved changes (written as Save
@@ -326,6 +327,23 @@ impl Studio {
             && write_atomic(&json, &text).is_ok()
         {
             self.session.saved_meta = Some(meta);
+        }
+    }
+
+    /// At launch: what was open last time comes back (when `reopen`), and
+    /// a file asked for (on the command line, or opened with ZigZag from
+    /// the desktop) opens on top of it, in a tab of its own, or its tab
+    /// comes forward if it was open already. Either way nothing that was
+    /// open is lost.
+    pub(crate) fn start_with(&mut self, path: Option<&Path>, select: Option<usize>, reopen: bool) {
+        if reopen {
+            self.restore_session();
+        }
+        if let Some(p) = path {
+            self.load(p);
+            if let Some(i) = select.filter(|&i| i < self.doc.shapes.len()) {
+                self.select_index(Some(i));
+            }
         }
     }
 
@@ -973,6 +991,53 @@ mod tests {
                 .any(|e| e.file_name().to_string_lossy().starts_with("recovery-")),
             "three's recovery is gone"
         );
+    }
+
+    /// Opening a file with ZigZag (from the command line, or the desktop's
+    /// Open With) doesn't lose the tabs that were open: they come back,
+    /// with the file on top; one already open just comes forward.
+    #[test]
+    fn opening_a_file_at_launch_keeps_the_other_tabs() {
+        let dir = temp_dir("launchfile");
+        let (one, two, three) = (
+            dir.join("one.svg"),
+            dir.join("two.svg"),
+            dir.join("three.svg"),
+        );
+        for f in [&one, &two, &three] {
+            std::fs::write(f, SVG).unwrap();
+        }
+        let mut a = studio_in(&dir);
+        a.load(&one);
+        a.structural(|d| d.delete(0)).unwrap();
+        a.load(&two);
+        a.write_session();
+        drop(a);
+
+        let mut b = studio_in(&dir);
+        b.start_with(Some(&three), Some(1), true);
+        b.keep_session_at(0.0, false, false);
+        let names: Vec<String> = b.tab_infos().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["one", "two", "three"]);
+        assert_eq!(b.doc.name, "three", "the file asked for is in front");
+        assert_eq!(b.sel_index(), Some(1));
+        b.switch_tab(0);
+        assert!(b.modified, "one's unsaved changes are still there");
+        b.write_session();
+        drop(b);
+
+        // A file that's open already comes forward: no second tab.
+        let mut c = studio_in(&dir);
+        c.start_with(Some(&one), None, true);
+        assert_eq!(c.tab_count(), 3);
+        assert_eq!(c.doc.name, "one");
+        assert!(c.modified);
+
+        // A script taking pictures of a file gets just that file.
+        let mut d = studio_in(&dir);
+        d.start_with(Some(&two), None, false);
+        assert_eq!(d.tab_count(), 1);
+        assert_eq!(d.doc.name, "two");
     }
 
     /// A session written before tabs (one document) still opens.
