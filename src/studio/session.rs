@@ -219,13 +219,8 @@ impl Studio {
         if self.session.dir.is_none() || self.previewing() {
             return None;
         }
-        if self.session.restoring {
-            // A whole frame went by with the restored documents: they're safe.
-            self.session.restoring = false;
-            if let Some(m) = self.session.file(RESTORING) {
-                let _ = std::fs::remove_file(m);
-            }
-        }
+        // A whole frame went by with the restored documents: they're safe.
+        self.restore_survived();
         // (The tabs not in front can only have changed on their way to the
         // back, and that changes which one is in front.)
         let changed = self.doc_unsaved_changed()
@@ -336,13 +331,40 @@ impl Studio {
     /// comes forward if it was open already. Either way nothing that was
     /// open is lost.
     pub(crate) fn start_with(&mut self, path: Option<&Path>, select: Option<usize>, reopen: bool) {
+        let mut notice = None;
         if reopen {
+            let before = self.status.clone();
             self.restore_session();
+            // What the restore had to say (a session it wouldn't reopen,
+            // changes it couldn't read) still shows once the file is open.
+            if self.status != before
+                && (self.status.contains("went down") || self.status.contains("Couldn't"))
+            {
+                notice = Some(self.status.clone());
+            }
         }
         if let Some(p) = path {
+            // The tabs that came back are all in; should the file asked for
+            // take the app down, that's the file's doing, not the session's,
+            // so the next launch still brings the session back.
+            self.restore_survived();
             self.load(p);
             if let Some(i) = select.filter(|&i| i < self.doc.shapes.len()) {
                 self.select_index(Some(i));
+            }
+            if let Some(n) = notice {
+                self.status = format!("{} {n}", self.status);
+            }
+        }
+    }
+
+    /// The documents just restored got through: no longer marked as being
+    /// restored (see [`RESTORING`]).
+    fn restore_survived(&mut self) {
+        if self.session.restoring {
+            self.session.restoring = false;
+            if let Some(m) = self.session.file(RESTORING) {
+                let _ = std::fs::remove_file(m);
             }
         }
     }
@@ -1037,6 +1059,42 @@ mod tests {
         let mut d = studio_in(&dir);
         d.start_with(Some(&two), None, false);
         assert_eq!(d.tab_count(), 1);
+        assert_eq!(d.doc.name, "two");
+    }
+
+    /// A file opened at launch that takes the app down isn't blamed on the
+    /// session that came back with it; and when the session isn't reopened
+    /// (the launch before went down restoring it), opening the file doesn't
+    /// hide why.
+    #[test]
+    fn a_file_opened_at_launch_and_a_crash() {
+        let dir = temp_dir("launchcrash");
+        let (one, two) = (dir.join("one.svg"), dir.join("two.svg"));
+        for f in [&one, &two] {
+            std::fs::write(f, SVG).unwrap();
+        }
+        let mut a = studio_in(&dir);
+        a.load(&one);
+        a.structural(|d| d.delete(0)).unwrap();
+        a.write_session();
+        drop(a);
+
+        // The session is in before the file is opened: no longer marked.
+        let mut b = studio_in(&dir);
+        b.start_with(Some(&two), None, true);
+        assert!(!dir.join(RESTORING).exists(), "{}", b.status);
+        assert_eq!(b.tab_count(), 2);
+        drop(b);
+
+        // Went down restoring (marked, no frame): the next launch with a
+        // file says so beside "Opened".
+        let mut c = studio_in(&dir);
+        assert!(c.restore_session());
+        drop(c);
+        let mut d = studio_in(&dir);
+        d.start_with(Some(&two), None, true);
+        assert!(d.status.starts_with("Opened"), "{}", d.status);
+        assert!(d.status.contains("went down last time"), "{}", d.status);
         assert_eq!(d.doc.name, "two");
     }
 

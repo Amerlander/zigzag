@@ -3902,7 +3902,14 @@ mod tests {
         // Without APPDATA, the user's profile says where AppData is.
         let (from_profile, _) =
             dirs_with(Os::Windows, &[("USERPROFILE", r"C:\Users\ana")]).unwrap();
-        assert_eq!(from_profile, PathBuf::from(appdata).join("ZigZag"));
+        // (Joined the same way, so the separator is this platform's.)
+        assert_eq!(
+            from_profile,
+            PathBuf::from(r"C:\Users\ana")
+                .join("AppData")
+                .join("Roaming")
+                .join("ZigZag")
+        );
         // XDG_CONFIG_HOME, where set, wins (as for a test run's own folder).
         let (xdg, _) = dirs_with(
             Os::Windows,
