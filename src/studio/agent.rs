@@ -1106,7 +1106,7 @@ impl Studio {
             .iter()
             .map(|s| (s.uid, fingerprint(s)))
             .collect();
-        let result = self.run_tool(name, args);
+        let result = self.run_tool_caught(name, args);
         // What it added, or else what it changed. (A new document isn't a
         // piece of the design being worked on.)
         let added: Vec<usize> = self
