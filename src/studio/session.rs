@@ -133,14 +133,43 @@ impl SessionState {
 
 /// Write `text` to `path` whole or not at all (a crash mid-write leaves the
 /// old file).
-fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    write_atomic_as(path, text, false)
+}
+
+/// `write_atomic`, for a file only this user may read (on Unix `0600`,
+/// whatever the umask; elsewhere the settings folder is the user's own).
+pub(crate) fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    write_atomic_as(path, text, true)
+}
+
+fn write_atomic_as(path: &Path, text: &str, private: bool) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if private {
+                open.mode(0o600);
+            }
+        }
+        let mut f = open.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            // (A leftover temporary file keeps its mode when opened again.)
+            use std::os::unix::fs::PermissionsExt;
+            if private {
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = private;
         f.write_all(text.as_bytes())?;
         // On disk before it takes the old file's place: a power cut or a
         // kernel panic right after the rename can't leave an empty file.
@@ -330,7 +359,7 @@ impl Studio {
     /// the desktop) opens on top of it, in a tab of its own, or its tab
     /// comes forward if it was open already. Either way nothing that was
     /// open is lost.
-    pub(crate) fn start_with(&mut self, path: Option<&Path>, select: Option<usize>, reopen: bool) {
+    pub(crate) fn start_with(&mut self, paths: &[PathBuf], select: Option<usize>, reopen: bool) {
         let mut notice = None;
         if reopen {
             let before = self.status.clone();
@@ -343,12 +372,14 @@ impl Studio {
                 notice = Some(self.status.clone());
             }
         }
-        if let Some(p) = path {
-            // The tabs that came back are all in; should the file asked for
+        if !paths.is_empty() {
+            // The tabs that came back are all in; should a file asked for
             // take the app down, that's the file's doing, not the session's,
             // so the next launch still brings the session back.
             self.restore_survived();
-            self.load(p);
+            for p in paths {
+                self.load(p);
+            }
             if let Some(i) = select.filter(|&i| i < self.doc.shapes.len()) {
                 self.select_index(Some(i));
             }
@@ -1037,7 +1068,7 @@ mod tests {
         drop(a);
 
         let mut b = studio_in(&dir);
-        b.start_with(Some(&three), Some(1), true);
+        b.start_with(std::slice::from_ref(&three), Some(1), true);
         b.keep_session_at(0.0, false, false);
         let names: Vec<String> = b.tab_infos().into_iter().map(|t| t.name).collect();
         assert_eq!(names, ["one", "two", "three"]);
@@ -1050,14 +1081,14 @@ mod tests {
 
         // A file that's open already comes forward: no second tab.
         let mut c = studio_in(&dir);
-        c.start_with(Some(&one), None, true);
+        c.start_with(std::slice::from_ref(&one), None, true);
         assert_eq!(c.tab_count(), 3);
         assert_eq!(c.doc.name, "one");
         assert!(c.modified);
 
         // A script taking pictures of a file gets just that file.
         let mut d = studio_in(&dir);
-        d.start_with(Some(&two), None, false);
+        d.start_with(std::slice::from_ref(&two), None, false);
         assert_eq!(d.tab_count(), 1);
         assert_eq!(d.doc.name, "two");
     }
@@ -1081,7 +1112,7 @@ mod tests {
 
         // The session is in before the file is opened: no longer marked.
         let mut b = studio_in(&dir);
-        b.start_with(Some(&two), None, true);
+        b.start_with(std::slice::from_ref(&two), None, true);
         assert!(!dir.join(RESTORING).exists(), "{}", b.status);
         assert_eq!(b.tab_count(), 2);
         drop(b);
@@ -1092,7 +1123,7 @@ mod tests {
         assert!(c.restore_session());
         drop(c);
         let mut d = studio_in(&dir);
-        d.start_with(Some(&two), None, true);
+        d.start_with(std::slice::from_ref(&two), None, true);
         assert!(d.status.starts_with("Opened"), "{}", d.status);
         assert!(d.status.contains("went down last time"), "{}", d.status);
         assert_eq!(d.doc.name, "two");

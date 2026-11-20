@@ -275,24 +275,37 @@ pub struct Studio {
     pub(crate) tabs: crate::tabs::Tabs,
     /// The density map of the current plan (by plan number).
     pub(crate) density: std::cell::RefCell<Option<(u64, std::rc::Rc<crate::density::DensityMap>)>>,
+    /// Files that later launches of ZigZag hand to this window (see
+    /// `instance.rs`).
+    pub(crate) inbox: Option<crate::instance::Inbox>,
+    /// Bring the window to the front again next frame (it may only just
+    /// have been restored from the taskbar or Dock).
+    pub(crate) focus_again: bool,
 }
 
 impl Studio {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        path: Option<PathBuf>,
+        paths: Vec<PathBuf>,
         select: Option<usize>,
         mcp_port: Option<u16>,
+        inbox: Option<crate::instance::Inbox>,
     ) -> Self {
         crate::theme::install(&cc.egui_ctx);
         // (A script taking pictures of a file shows just that file.)
-        let reopen = path.is_none() || std::env::var_os("ZIGZAG_CAPTURE").is_none();
+        let reopen = paths.is_empty() || std::env::var_os("ZIGZAG_CAPTURE").is_none();
         let mut s = Self::with_file(None, None);
         s.load_machines();
         // Kept from now on: what was open comes back, and a file asked for
         // opens on top of it.
         s.session = crate::session::SessionState::in_config();
-        s.start_with(path.as_deref(), select, reopen);
+        s.start_with(&paths, select, reopen);
+        // What a later launch hands over wakes the window to open it.
+        if let Some(i) = &inbox {
+            let ctx = cc.egui_ctx.clone();
+            i.on_arrival(move || ctx.request_repaint());
+        }
+        s.inbox = inbox;
         // A job on the Skitch outlives the app: pick it up too.
         let resume = s.restore_sent() && s.session.resume_skitch;
         s.dock = crate::dock::DockState::load();
@@ -526,6 +539,8 @@ impl Studio {
             session: Default::default(),
             tabs: Default::default(),
             density: Default::default(),
+            inbox: None,
+            focus_again: false,
         };
         if let Some(p) = path {
             s.load(&p);
@@ -1220,9 +1235,12 @@ impl eframe::App for Studio {
         if let Some(c) = &mut self.capture {
             c.frame(ctx);
         }
-        if !self.handle_mcp() {
-            // Calls may be waiting on a gesture or a dialog: look again
-            // soon (their arrival was the only wake-up).
+        let calls_done = self.handle_mcp();
+        let handed_done = self.take_handed_over(ctx);
+        if !(calls_done && handed_done) {
+            // Calls (or files from another launch) may be waiting on a
+            // gesture or a dialog: look again soon (their arrival was the
+            // only wake-up).
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if let Some(mut m) = self.native_menu.take() {
@@ -1246,6 +1264,11 @@ impl eframe::App for Studio {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // A launch from now on opens a window of its own once this one is
+        // gone, rather than handing it files that would never open.
+        if let Some(i) = &self.inbox {
+            i.close();
+        }
         // Quitting from the menu bar ends the app without a closing frame.
         self.flush_session();
         if let Some(g) = &self.gpu {
@@ -1278,14 +1301,7 @@ impl Studio {
         if self.mcp.is_none() {
             return true;
         }
-        // Calls wait while a dialog previews into the document, and while
-        // something is dragged: the drag works from the document as it was
-        // when it began, and would drop an edit made under it.
-        if self.previewing()
-            || self.file_dialog_open()
-            || self.drag.is_some()
-            || self.path_edit.drag.is_some()
-        {
+        if self.mid_gesture() {
             return false;
         }
         let calls: Vec<crate::mcp::Call> = match &self.mcp {
@@ -1305,6 +1321,60 @@ impl Studio {
             let _ = call.reply.send(result);
         }
         true
+    }
+
+    /// A dialog previews into the document, or something is dragged: an
+    /// agent's call or another launch's file waits (the drag works from the
+    /// document as it was when it began, and would drop an edit made under
+    /// it).
+    fn mid_gesture(&self) -> bool {
+        self.previewing()
+            || self.file_dialog_open()
+            || self.drag.is_some()
+            || self.path_edit.drag.is_some()
+            || self.tabs.asking
+    }
+
+    /// Open what later launches of ZigZag handed over, each file in a tab,
+    /// and bring the window to the front. False when they have to wait.
+    pub(crate) fn take_handed_over(&mut self, ctx: &egui::Context) -> bool {
+        use egui::ViewportCommand;
+        if std::mem::take(&mut self.focus_again) {
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+        if self.inbox.is_none() {
+            return true;
+        }
+        if self.mid_gesture() {
+            return false;
+        }
+        let requests = match &self.inbox {
+            Some(i) => i.take(),
+            None => return true,
+        };
+        if requests.is_empty() {
+            return true;
+        }
+        for r in &requests {
+            self.open_handed_over(r);
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        self.focus_again = true;
+        ctx.request_repaint();
+        true
+    }
+
+    /// Another launch's files, as if they'd been opened here.
+    pub(crate) fn open_handed_over(&mut self, r: &crate::instance::Request) {
+        for f in &r.files {
+            self.load(f);
+        }
+        if !r.files.is_empty()
+            && let Some(i) = r.select.filter(|&i| i < self.doc.shapes.len())
+        {
+            self.select_index(Some(i));
+        }
     }
 
     /// One UI frame. Separate from `eframe::App::ui` so tests can drive it with plain egui.
