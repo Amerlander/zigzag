@@ -28,6 +28,16 @@ pub const MACHINE_FORMATS: [(&str, &str); 7] = [
 /// Machine files ZigZag can open.
 pub const READABLE_FORMATS: [&str; 5] = ["pes", "pec", "dst", "exp", "jef"];
 
+/// The furthest a stitch coordinate may be from the origin, in units
+/// (0.1 mm: a hundred metres — far past any hoop). Further out, a move
+/// would need more steps than a file should hold, so it's clamped here.
+const COORD_LIMIT: f64 = 1_000_000.0;
+
+/// The most pieces one move is split into. With [`COORD_LIMIT`], the
+/// longest possible move needs tens of thousands at the smallest
+/// `max_step`; this only guards against a bad one.
+const MAX_SPLIT_STEPS: usize = 1 << 18;
+
 /// Encode a design in the machine format for `ext` (no preview formats),
 /// with the usual locks and no shortest stitch.
 pub fn write_format(d: &Design, ext: &str) -> anyhow::Result<Vec<u8>> {
@@ -256,7 +266,20 @@ pub fn commands_owned(d: &Design, opt: &StreamOptions) -> (Vec<Cmd>, Vec<Option<
     // The shape the last stitches were for.
     let mut owner: Option<usize> = None;
     let mut out: Vec<Cmd> = Vec::new();
-    let r = |p: P| P::new(p.x.round(), p.y.round());
+    // Coordinates are rounded to whole units, clamped to what the writers
+    // can still encode as steps, and non-finite ones taken as the origin:
+    // a malformed design can't make the splitter allocate or loop without
+    // bound, or a writer's fields overflow.
+    let r = |p: P| {
+        let c = |v: f64| {
+            if v.is_finite() {
+                v.round().clamp(-COORD_LIMIT, COORD_LIMIT)
+            } else {
+                0.0
+            }
+        };
+        P::new(c(p.x), c(p.y))
+    };
     let mut pos: Option<P> = None;
     let mut prev_dir = P::new(1.0, 0.0);
 
@@ -266,6 +289,11 @@ pub fn commands_owned(d: &Design, opt: &StreamOptions) -> (Vec<Cmd>, Vec<Option<
         let d = to - from;
         let mut n = (d.x.abs().max(d.y.abs()) / opt.max_step).ceil().max(1.0) as usize;
         loop {
+            // (Coordinates are clamped, so a move needs thousands of steps
+            // at most; this guards only against a bad `max_step`.)
+            if n > MAX_SPLIT_STEPS {
+                return;
+            }
             let pts: Vec<P> = (1..=n)
                 .map(|i| r(from.lerp(to, i as f64 / n as f64)))
                 .collect();
@@ -747,6 +775,88 @@ mod lock_tests {
         assert_eq!(xs(&stream(&d, none, 0.0)), [0.0, 30.0, 34.0, 38.0, 60.0]);
         assert_eq!(xs(&stream(&d, none, 4.0)), [0.0, 30.0, 34.0, 38.0, 60.0]);
         assert_eq!(xs(&stream(&d, none, 5.0)), [0.0, 30.0, 38.0, 60.0]);
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+    use crate::design::{Block, Run};
+
+    /// A design whose one block sews `pts` as a single run.
+    fn design(pts: Vec<P>) -> Design {
+        Design {
+            blocks: vec![Block {
+                color: [0, 0, 0],
+                runs: vec![Run {
+                    pts,
+                    trim_before: false,
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The command stream with no locks and the DST step limit.
+    fn steps(d: &Design) -> Vec<Cmd> {
+        commands(
+            d,
+            &StreamOptions {
+                lock: Lock::new(LockStyle::None, 0.4, 4),
+                min_stitch: 0.0,
+                max_step: 121.0,
+            },
+        )
+    }
+
+    /// Ordinary splitting is unchanged: a 500-unit move becomes five
+    /// steps a format can hold.
+    #[test]
+    fn a_long_move_is_split_into_steps_the_format_can_hold() {
+        let d = design(vec![P::new(0.0, 0.0), P::new(500.0, 0.0)]);
+        let xs: Vec<f64> = steps(&d)
+            .iter()
+            .filter(|c| c.op == Op::Stitch)
+            .map(|c| c.x)
+            .collect();
+        assert_eq!(xs, [0.0, 100.0, 200.0, 300.0, 400.0, 500.0]);
+    }
+
+    /// NaN and infinite points can't hang the splitter: they're taken as
+    /// the origin, and everything written stays finite.
+    #[test]
+    fn non_finite_points_cant_hang_the_splitter() {
+        let d = design(vec![
+            P::new(0.0, 0.0),
+            P::new(f64::NAN, f64::NAN),
+            P::new(50.0, 0.0),
+            P::new(f64::INFINITY, 0.0),
+            P::new(60.0, 0.0),
+        ]);
+        let cmds = steps(&d);
+        assert!(
+            cmds.iter().all(|c| c.x.is_finite() && c.y.is_finite()),
+            "{cmds:?}"
+        );
+    }
+
+    /// Coordinates too large to count steps for are clamped instead of
+    /// exhausting memory: the move still splits, within the limit.
+    #[test]
+    fn absurd_coordinates_are_clamped_not_multiplied() {
+        let d = design(vec![
+            P::new(0.0, 0.0),
+            P::new(1e300, -1e300),
+            P::new(10.0, 0.0),
+        ]);
+        let cmds = steps(&d);
+        assert!(cmds.len() < 1_000_000, "{} commands", cmds.len());
+        assert!(
+            cmds.windows(2).all(|w| {
+                (w[1].x - w[0].x).abs() <= 121.0 && (w[1].y - w[0].y).abs() <= 121.0
+            }),
+            "every step fits the format"
+        );
     }
 }
 
