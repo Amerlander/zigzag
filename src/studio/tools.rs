@@ -1132,6 +1132,44 @@ impl Studio {
         })
     }
 
+    /// `run_tool`, with a panic inside it answered as a tool error rather
+    /// than taking the app (or the headless server) down with it — the
+    /// same guard the stitch planner has. What the tool changed before
+    /// it panicked is put back, like an atomic batch's rollback, and
+    /// `batching` goes back to what it was so a panicking batch can't
+    /// leave it set.
+    pub fn run_tool_caught(&mut self, name: &str, args: &Value) -> ToolResult {
+        let was_batching = self.batching;
+        let (undo0, doc0, redo0, sel0, modified0) = (
+            self.undo.len(),
+            self.doc.clone(),
+            self.redo.clone(),
+            self.selected,
+            self.modified,
+        );
+        // A tool that switched tabs swapped the live document out from
+        // under the snapshot: putting it back would give two tabs the
+        // same file, so only `batching` is restored then.
+        let tabs0 = (self.tabs.active, self.tab_count());
+        zigzag::design::caught(|| self.run_tool(name, args)).unwrap_or_else(|e| {
+            if (self.tabs.active, self.tab_count()) == tabs0 {
+                self.doc = doc0;
+                self.undo.truncate(undo0);
+                self.redo = redo0;
+                self.stable = self.doc.clone();
+                self.selected = sel0;
+                self.modified = modified0;
+                self.dirty = true;
+                self.replan();
+            }
+            self.batching = was_batching;
+            ToolResult::error(format!(
+                "`{name}` panicked: {}",
+                crate::planner::panic_text(&e)
+            ))
+        })
+    }
+
     /// Run one MCP tool against the live document.
     pub fn run_tool(&mut self, name: &str, args: &Value) -> ToolResult {
         if let Err(e) = check_args(name, args) {
@@ -1429,6 +1467,22 @@ impl Studio {
             }
             "send_to_skitch" => self.tool_send_to_skitch(),
             "machine_status" => Ok(ToolResult::json(&self.machine_json())),
+            // Lets tests prove a panic in a tool is an error, not a crash —
+            // and that what it changed first is put back.
+            #[cfg(test)]
+            "__panic__" => {
+                if args.get("mutate").and_then(Value::as_bool) == Some(true) {
+                    self.modified = true;
+                    self.selected = Some(usize::MAX);
+                    self.undo.push(self.doc.clone());
+                    self.redo.push(self.doc.clone());
+                    self.doc.name = "panicked".into();
+                }
+                if args.get("switch_tab").and_then(Value::as_bool) == Some(true) {
+                    self.new_tab();
+                }
+                panic!("test-only panic");
+            }
             other => Err(format!("unknown tool '{other}'")),
         };
         if !self.batching && self.dirty_needs_plan() {
@@ -1602,7 +1656,7 @@ impl Studio {
                 Err(format!("`{tool}` can't run inside an atomic batch."))
             } else {
                 resolve_refs(step.get("arguments").unwrap_or(&json!({})), &results)
-                    .map(|a| self.run_tool(tool, &a))
+                    .map(|a| self.run_tool_caught(tool, &a))
             };
             let r = outcome.unwrap_or_else(ToolResult::error);
             if r.is_error {
@@ -4633,5 +4687,76 @@ mod tests {
         assert_eq!(r["id"], 7);
         assert_eq!(r["result"]["isError"], false);
         assert_eq!(s.doc.shapes.len(), 4);
+    }
+
+    /// A panic inside a tool is a tool error, not a crash: the same guard
+    /// the stitch planner has, on the agent boundary too.
+    #[test]
+    fn a_panicking_tool_is_an_error_not_a_crash() {
+        let mut s = Studio::with_file(None, None);
+        let r = s.run_tool_caught("__panic__", &json!({}));
+        assert!(r.is_error, "{r:?}");
+        assert!(text_of(&r).contains("panicked"), "{}", text_of(&r));
+        // And through the dispatch agents actually use.
+        let r = s.run_mcp_call("__panic__", &json!({}));
+        assert!(r.is_error, "{r:?}");
+        assert!(text_of(&r).contains("panicked"), "{}", text_of(&r));
+    }
+
+    /// What a panicking tool changed is rolled back, like an atomic
+    /// batch's: the agent is told the call failed, so nothing it did
+    /// should be left behind.
+    #[test]
+    fn a_panicking_tool_rolls_back_what_it_changed() {
+        let mut s = Studio::with_file(None, None);
+        s.run_tool("add_svg", &json!({ "svg": BADGE }));
+        s.replan();
+        let (name0, undo0, redo0, sel0, modified0) = (
+            s.doc.name.clone(),
+            s.undo.len(),
+            s.redo.len(),
+            s.selected,
+            s.modified,
+        );
+        let r = s.run_tool_caught("__panic__", &json!({ "mutate": true }));
+        assert!(r.is_error, "{r:?}");
+        assert_eq!(s.doc.name, name0);
+        assert_eq!(s.undo.len(), undo0);
+        assert_eq!(s.redo.len(), redo0);
+        assert_eq!(s.selected, sel0);
+        assert_eq!(s.modified, modified0);
+        // And the plan was rebuilt from the restored document.
+        assert_eq!(s.names.len(), s.doc.shapes.len());
+    }
+
+    /// A panic can't leave `batching` set: it's put back to what it was,
+    /// so a panicking batch doesn't break every later replan check.
+    #[test]
+    fn a_panicking_tool_restores_batching() {
+        let mut s = Studio::with_file(None, None);
+        s.batching = true;
+        let _ = s.run_tool_caught("__panic__", &json!({}));
+        assert!(s.batching, "restored to the pre-call value");
+        s.batching = false;
+        let _ = s.run_tool_caught("__panic__", &json!({}));
+        assert!(!s.batching);
+    }
+
+    /// A tool that switched tabs before panicking can't be rolled back:
+    /// the snapshot's document belongs to the other tab. Only `batching`
+    /// is put back, and each tab keeps its own file.
+    #[test]
+    fn a_panicking_tab_switch_is_not_rolled_onto_the_wrong_doc() {
+        let mut s = Studio::with_file(None, None);
+        s.run_tool("add_svg", &json!({ "svg": BADGE }));
+        s.replan();
+        let r = s.run_tool_caught("__panic__", &json!({ "switch_tab": true }));
+        assert!(r.is_error, "{r:?}");
+        // The new tab is in front with its own empty document; the badge
+        // stayed in the first tab's husk — the snapshot wasn't copied in.
+        assert_eq!(s.tab_count(), 2);
+        assert_eq!(s.active_tab(), 1);
+        assert!(s.doc.shapes.is_empty(), "live doc is the new tab's");
+        assert_eq!(s.tabs.list[0].doc.shapes.len(), 4);
     }
 }
