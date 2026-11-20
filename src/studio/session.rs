@@ -133,7 +133,7 @@ impl SessionState {
 
 /// Write `text` to `path` whole or not at all (a crash mid-write leaves the
 /// old file).
-fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -335,15 +335,17 @@ impl Studio {
     /// the desktop) opens on top of it, in a tab of its own, or its tab
     /// comes forward if it was open already. Either way nothing that was
     /// open is lost.
-    pub(crate) fn start_with(&mut self, path: Option<&Path>, select: Option<usize>, reopen: bool) {
+    pub(crate) fn start_with(&mut self, paths: &[PathBuf], select: Option<usize>, reopen: bool) {
         if reopen {
             self.restore_session();
         }
-        if let Some(p) = path {
+        for p in paths {
             self.load(p);
-            if let Some(i) = select.filter(|&i| i < self.doc.shapes.len()) {
-                self.select_index(Some(i));
-            }
+        }
+        if !paths.is_empty()
+            && let Some(i) = select.filter(|&i| i < self.doc.shapes.len())
+        {
+            self.select_index(Some(i));
         }
     }
 
@@ -1015,7 +1017,7 @@ mod tests {
         drop(a);
 
         let mut b = studio_in(&dir);
-        b.start_with(Some(&three), Some(1), true);
+        b.start_with(std::slice::from_ref(&three), Some(1), true);
         b.keep_session_at(0.0, false, false);
         let names: Vec<String> = b.tab_infos().into_iter().map(|t| t.name).collect();
         assert_eq!(names, ["one", "two", "three"]);
@@ -1028,14 +1030,14 @@ mod tests {
 
         // A file that's open already comes forward: no second tab.
         let mut c = studio_in(&dir);
-        c.start_with(Some(&one), None, true);
+        c.start_with(std::slice::from_ref(&one), None, true);
         assert_eq!(c.tab_count(), 3);
         assert_eq!(c.doc.name, "one");
         assert!(c.modified);
 
         // A script taking pictures of a file gets just that file.
         let mut d = studio_in(&dir);
-        d.start_with(Some(&two), None, false);
+        d.start_with(std::slice::from_ref(&two), None, false);
         assert_eq!(d.tab_count(), 1);
         assert_eq!(d.doc.name, "two");
     }
