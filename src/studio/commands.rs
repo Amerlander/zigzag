@@ -69,6 +69,9 @@ pub enum Action {
     AddOutline,
     /// Object › Path › Remove Outline: a shape's outline, taken off.
     RemoveOutline,
+    /// Object › Break into Columns: a satin shape as the columns it's sewn
+    /// as, two-rail satins of their own to adjust.
+    BreakIntoColumns,
     /// Object › Path › Release Compound Path: one object per separate shape.
     ReleaseCompound,
     SimplifyPath,
@@ -226,7 +229,7 @@ pub fn menus() -> Vec<(&'static str, Vec<Entry>)> {
             vec![
                 Item(Action::New, "New", cmd(Key::N)),
                 Item(Action::Open, "Open…", cmd(Key::O)),
-                Item(Action::Place, "Place SVG…", cmd_shift(Key::P)),
+                Item(Action::Place, "Place…", cmd_shift(Key::P)),
                 Sep,
                 Item(Action::CloseTab, "Close", cmd(Key::W)),
                 Item(Action::Save, "Save", cmd(Key::S)),
@@ -292,6 +295,7 @@ pub fn menus() -> Vec<(&'static str, Vec<Entry>)> {
                 Item(Action::Hide, "Hide", cmd(Key::Num3)),
                 Item(Action::ShowAll, "Show All", None),
                 Sep,
+                Item(Action::BreakIntoColumns, "Break into Columns", None),
                 Sub(
                     "Path",
                     vec![
@@ -638,6 +642,7 @@ impl Studio {
             | Action::OffsetPath
             | Action::OutlineStroke
             | Action::AddOutline
+            | Action::BreakIntoColumns
             | Action::ReleaseCompound
             | Action::SimplifyPath
             | Action::RoundCorners
@@ -813,6 +818,7 @@ impl Studio {
             Action::OffsetPath => self.layout.offset_dialog = Some(1.0),
             Action::OutlineStroke => self.outline_stroke_selected(),
             Action::AddOutline => self.add_outline_selected(),
+            Action::BreakIntoColumns => self.break_into_columns_selected(),
             Action::RemoveOutline => self.remove_outline_selected(),
             Action::ReleaseCompound => self.release_compound_selected(),
             Action::SimplifyPath => self.open_simplify_dialog(),
