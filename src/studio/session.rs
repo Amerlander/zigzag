@@ -134,13 +134,42 @@ impl SessionState {
 /// Write `text` to `path` whole or not at all (a crash mid-write leaves the
 /// old file).
 pub(crate) fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    write_atomic_as(path, text, false)
+}
+
+/// `write_atomic`, for a file only this user may read (on Unix `0600`,
+/// whatever the umask; elsewhere the settings folder is the user's own).
+pub(crate) fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    write_atomic_as(path, text, true)
+}
+
+fn write_atomic_as(path: &Path, text: &str, private: bool) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if private {
+                open.mode(0o600);
+            }
+        }
+        let mut f = open.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            // (A leftover temporary file keeps its mode when opened again.)
+            use std::os::unix::fs::PermissionsExt;
+            if private {
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = private;
         f.write_all(text.as_bytes())?;
         // On disk before it takes the old file's place: a power cut or a
         // kernel panic right after the rename can't leave an empty file.

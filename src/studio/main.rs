@@ -63,7 +63,8 @@ mod update;
 mod view_tools;
 mod widgets;
 
-const USAGE: &str = "usage: zigzag-studio [design.svg ...] [--select N] [--mcp-port PORT | --no-mcp | --mcp-stdio]\n\n  --mcp-stdio  no window: serve the MCP tools over stdin/stdout (headless, for agents)
+const USAGE: &str = "usage: zigzag-studio [design.svg ...] [--select N] [--new-window] [--mcp-port PORT | --no-mcp | --mcp-stdio]\n\n  --mcp-stdio   no window: serve the MCP tools over stdin/stdout (headless, for agents)
+  --new-window  a window of its own, even with ZigZag running already (also ZIGZAG_NEW_WINDOW=1)
 
 With ZigZag running already, the files open as tabs in its window instead.";
 
@@ -86,10 +87,12 @@ fn main() -> eframe::Result {
         .map(Some)
         .unwrap_or_else(|| settings::Prefs::load().agent_port());
     let mut headless = false;
+    let mut new_window = std::env::var_os("ZIGZAG_NEW_WINDOW").is_some();
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         match a.to_str() {
             Some("--mcp-stdio") => headless = true,
+            Some("--new-window") => new_window = true,
             Some("--select") => {
                 select = args.next().and_then(|v| v.to_str()?.parse::<usize>().ok())
             }
@@ -106,11 +109,18 @@ fn main() -> eframe::Result {
     }
     // Only one window: with ZigZag running already, it opens these files
     // and this launch is done (see `instance`). Not without a window, nor
-    // for a script taking pictures, which wants a window of its own.
-    let scripted = std::env::var_os("ZIGZAG_CAPTURE_STILL").is_some()
-        || std::env::var_os("ZIGZAG_CAPTURE_SHOW").is_some();
+    // for a capture run (a recording, or a script taking pictures), which
+    // wants a window of its own, nor when asked for a window of its own
+    // (a dev build next to the installed app, say).
+    let capture = [
+        "ZIGZAG_CAPTURE",
+        "ZIGZAG_CAPTURE_STILL",
+        "ZIGZAG_CAPTURE_SHOW",
+    ]
+    .iter()
+    .any(|v| std::env::var_os(v).is_some());
     let mut inbox = None;
-    if !headless && !scripted {
+    if !headless && !capture && !new_window {
         let request = instance::Request {
             // (The one running may have been started somewhere else.)
             files: paths

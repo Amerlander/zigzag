@@ -16,8 +16,8 @@
 //! of its own, as it did before there was this.
 //!
 //! The address is only on this computer (127.0.0.1), and the token is in
-//! the user's own settings folder, so another user's program can't ask
-//! this ZigZag to open files.
+//! the user's own settings folder (on Unix in a file only they can read),
+//! so another user's program can't ask this ZigZag to open files.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -143,7 +143,9 @@ fn listen(dir: &Path, lock: std::fs::File) -> std::io::Result<Inbox> {
         "token": token,
         "pid": std::process::id(),
     });
-    crate::session::write_atomic(&dir.join(ADDRESS), &address.to_string())?;
+    // Only this user may read the token (`~/.config` is often readable
+    // by everyone on Linux).
+    crate::session::write_private(&dir.join(ADDRESS), &address.to_string())?;
     let (tx, rx) = mpsc::channel();
     let wake: Arc<Mutex<Option<Box<dyn Fn() + Send>>>> = Arc::default();
     let closing = Arc::new(AtomicBool::new(false));
@@ -440,5 +442,18 @@ mod tests {
         assert_eq!(reply, "");
         std::thread::sleep(Duration::from_millis(100));
         assert!(inbox.take().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_this_user_can_read_the_token() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("private");
+        let _inbox = first(&dir);
+        let mode = std::fs::metadata(dir.join(ADDRESS))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
