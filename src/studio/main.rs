@@ -24,6 +24,7 @@ mod file_dialog;
 mod flyout;
 mod gpu;
 mod icons;
+mod instance;
 mod kits;
 mod lasso;
 mod layout;
@@ -62,7 +63,9 @@ mod update;
 mod view_tools;
 mod widgets;
 
-const USAGE: &str = "usage: zigzag-studio [design.svg] [--select N] [--mcp-port PORT | --no-mcp | --mcp-stdio]\n\n  --mcp-stdio  no window: serve the MCP tools over stdin/stdout (headless, for agents)";
+const USAGE: &str = "usage: zigzag-studio [design.svg ...] [--select N] [--mcp-port PORT | --no-mcp | --mcp-stdio]\n\n  --mcp-stdio  no window: serve the MCP tools over stdin/stdout (headless, for agents)
+
+With ZigZag running already, the files open as tabs in its window instead.";
 
 fn main() -> eframe::Result {
     // A failure that stops ZigZag leaves a log to report (see `crash`).
@@ -72,7 +75,7 @@ fn main() -> eframe::Result {
     if std::env::var_os("ZIGZAG_CRASH_TEST").is_some() {
         panic!("a crash made on purpose, to test the crash log");
     }
-    let mut path = None;
+    let mut paths = Vec::new();
     let mut select = None;
     // The agent server's port: as the command line says, else the
     // environment, else Settings (which can also turn it off).
@@ -98,7 +101,28 @@ fn main() -> eframe::Result {
             }
             // Finder can pass a process serial number when launching the .app.
             Some(s) if s.starts_with("-psn_") => {}
-            _ => path = Some(std::path::PathBuf::from(a)),
+            _ => paths.push(std::path::PathBuf::from(a)),
+        }
+    }
+    // Only one window: with ZigZag running already, it opens these files
+    // and this launch is done (see `instance`). Not without a window, nor
+    // for a script taking pictures, which wants a window of its own.
+    let scripted = std::env::var_os("ZIGZAG_CAPTURE_STILL").is_some()
+        || std::env::var_os("ZIGZAG_CAPTURE_SHOW").is_some();
+    let mut inbox = None;
+    if !headless && !scripted {
+        let request = instance::Request {
+            // (The one running may have been started somewhere else.)
+            files: paths
+                .iter()
+                .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()))
+                .collect(),
+            select,
+        };
+        match instance::claim_in_config(&request) {
+            instance::Start::First(i) => inbox = Some(i),
+            instance::Start::HandedOver => return Ok(()),
+            instance::Start::Alone => {}
         }
     }
     // Scan the system fonts in the background: a design without text opens
@@ -108,7 +132,7 @@ fn main() -> eframe::Result {
     });
     if headless {
         // No window: the same tools, on a document only the agent sees.
-        let mut studio = app::Studio::with_file(path, select);
+        let mut studio = app::Studio::with_file(paths.into_iter().next(), select);
         studio.load_machines();
         studio.prefs = settings::Prefs::load();
         studio.apply_agent_log();
@@ -150,6 +174,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ZigZag",
         options,
-        Box::new(move |cc| Ok(Box::new(app::Studio::new(cc, path, select, mcp_port)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::Studio::new(
+                cc, paths, select, mcp_port, inbox,
+            )))
+        }),
     )
 }
