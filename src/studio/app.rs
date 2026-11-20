@@ -282,14 +282,14 @@ impl Studio {
         mcp_port: Option<u16>,
     ) -> Self {
         crate::theme::install(&cc.egui_ctx);
-        let reopen = path.is_none();
-        let mut s = Self::with_file(path, select);
+        // (A script taking pictures of a file shows just that file.)
+        let reopen = path.is_none() || std::env::var_os("ZIGZAG_CAPTURE").is_none();
+        let mut s = Self::with_file(None, None);
         s.load_machines();
-        // Kept from now on; reopened unless a file was asked for.
+        // Kept from now on: what was open comes back, and a file asked for
+        // opens on top of it.
         s.session = crate::session::SessionState::in_config();
-        if reopen {
-            s.restore_session();
-        }
+        s.start_with(path.as_deref(), select, reopen);
         // A job on the Skitch outlives the app: pick it up too.
         let resume = s.restore_sent() && s.session.resume_skitch;
         s.dock = crate::dock::DockState::load();
