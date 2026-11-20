@@ -1132,6 +1132,18 @@ impl Studio {
         })
     }
 
+    /// `run_tool`, with a panic inside it answered as a tool error rather
+    /// than taking the app (or the headless server) down with it — the
+    /// same guard the stitch planner has.
+    pub fn run_tool_caught(&mut self, name: &str, args: &Value) -> ToolResult {
+        zigzag::design::caught(|| self.run_tool(name, args)).unwrap_or_else(|e| {
+            ToolResult::error(format!(
+                "`{name}` panicked: {}",
+                crate::planner::panic_text(&e)
+            ))
+        })
+    }
+
     /// Run one MCP tool against the live document.
     pub fn run_tool(&mut self, name: &str, args: &Value) -> ToolResult {
         if let Err(e) = check_args(name, args) {
@@ -1429,6 +1441,9 @@ impl Studio {
             }
             "send_to_skitch" => self.tool_send_to_skitch(),
             "machine_status" => Ok(ToolResult::json(&self.machine_json())),
+            // Lets tests prove a panic in a tool is an error, not a crash.
+            #[cfg(test)]
+            "__panic__" => panic!("test-only panic"),
             other => Err(format!("unknown tool '{other}'")),
         };
         if !self.batching && self.dirty_needs_plan() {
@@ -1602,7 +1617,7 @@ impl Studio {
                 Err(format!("`{tool}` can't run inside an atomic batch."))
             } else {
                 resolve_refs(step.get("arguments").unwrap_or(&json!({})), &results)
-                    .map(|a| self.run_tool(tool, &a))
+                    .map(|a| self.run_tool_caught(tool, &a))
             };
             let r = outcome.unwrap_or_else(ToolResult::error);
             if r.is_error {
@@ -4633,5 +4648,19 @@ mod tests {
         assert_eq!(r["id"], 7);
         assert_eq!(r["result"]["isError"], false);
         assert_eq!(s.doc.shapes.len(), 4);
+    }
+
+    /// A panic inside a tool is a tool error, not a crash: the same guard
+    /// the stitch planner has, on the agent boundary too.
+    #[test]
+    fn a_panicking_tool_is_an_error_not_a_crash() {
+        let mut s = Studio::with_file(None, None);
+        let r = s.run_tool_caught("__panic__", &json!({}));
+        assert!(r.is_error, "{r:?}");
+        assert!(text_of(&r).contains("panicked"), "{}", text_of(&r));
+        // And through the dispatch agents actually use.
+        let r = s.run_mcp_call("__panic__", &json!({}));
+        assert!(r.is_error, "{r:?}");
+        assert!(text_of(&r).contains("panicked"), "{}", text_of(&r));
     }
 }

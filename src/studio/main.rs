@@ -118,7 +118,7 @@ fn main() -> eframe::Result {
         );
         mcp::serve_stdio(&tools::tool_specs(), &instructions, |name, args| {
             let at = std::time::Instant::now();
-            let result = studio.run_tool(name, args);
+            let result = studio.run_tool_caught(name, args);
             studio.log_call(name, args, at, &result);
             result
         });
