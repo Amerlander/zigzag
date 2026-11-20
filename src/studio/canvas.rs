@@ -1056,3 +1056,111 @@ mod tests {
         assert!((far_copied - far_moved).abs() < 1.0);
     }
 }
+
+#[cfg(test)]
+mod stays_on_the_canvas {
+    use crate::app::{Studio, Tool};
+    use eframe::egui::{self, Rect, Vec2};
+    use egui_kittest::Harness;
+
+    /// What's drawn over the canvas and on past its left or right edge, over
+    /// a dock, and isn't cut off there. (Not what lies under the whole
+    /// canvas: the window's background.)
+    fn over_the_docks(h: &Harness<'_, Studio>) -> Vec<Rect> {
+        let c = h.state().canvas_rect;
+        h.output()
+            .shapes
+            .iter()
+            .filter(|s| {
+                let r = s.shape.visual_bounding_rect();
+                let clip = s.clip_rect;
+                r.is_finite()
+                    && r.intersects(c.shrink(1.0))
+                    && !r.contains_rect(c)
+                    && ((r.left() < c.left() - 1.0 && clip.left() < c.left() - 0.5)
+                        || (r.right() > c.right() + 1.0 && clip.right() > c.right() + 0.5))
+            })
+            .map(|s| s.shape.visual_bounding_rect())
+            .collect()
+    }
+
+    #[test]
+    fn nothing_on_the_canvas_is_drawn_over_the_docks() {
+        // An iPad-sized window with both docks open: a narrow canvas, the
+        // tools' option bars wider than it.
+        let badge = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/badge.svg");
+        let mut s = Studio::with_file(Some(badge), Some(2));
+        s.dock.toggle(crate::dock::PanelId::Agent);
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1000.0, 760.0))
+            .build_ui_state(|ui, s: &mut Studio| s.frame(ui), s);
+        h.run_steps(3);
+        let c = h.state().canvas_rect;
+        assert!(c.width() < 320.0, "a narrow canvas: {c:?}");
+        // The selection's task bar.
+        let over = over_the_docks(&h);
+        assert!(over.is_empty(), "with a selection: {over:?}");
+        for tool in [
+            Tool::Brush,
+            Tool::Blob,
+            Tool::Smooth,
+            Tool::Shape,
+            Tool::Pen,
+            Tool::Text,
+            Tool::Rotate,
+        ] {
+            h.state_mut().set_tool(tool);
+            h.run_steps(3);
+            let over = over_the_docks(&h);
+            assert!(over.is_empty(), "{tool:?}: {over:?}");
+        }
+    }
+
+    /// The bars floating over the canvas, and any part of one that's past
+    /// its edges (cut off).
+    fn bars_cut_off(h: &Harness<'_, Studio>) -> Vec<Rect> {
+        let c = h.state().canvas_rect;
+        h.ctx.memory(|m| {
+            m.areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|l| matches!(l.order, egui::Order::Middle | egui::Order::Foreground))
+                .filter_map(|l| m.area_rect(l.id))
+                .filter(|r| r.intersects(c) && !c.expand(0.5).contains_rect(*r))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn the_bars_on_a_narrow_canvas_wrap_to_fit_it() {
+        let badge = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/badge.svg");
+        let mut s = Studio::with_file(Some(badge), Some(2));
+        s.dock.toggle(crate::dock::PanelId::Agent);
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1000.0, 760.0))
+            .build_ui_state(|ui, s: &mut Studio| s.frame(ui), s);
+        h.run_steps(4);
+        let cut = bars_cut_off(&h);
+        assert!(
+            cut.is_empty(),
+            "the task bar: {cut:?} on {:?}",
+            h.state().canvas_rect
+        );
+        for tool in [
+            Tool::Brush,
+            Tool::Blob,
+            Tool::Smooth,
+            Tool::Shape,
+            Tool::Pen,
+        ] {
+            h.state_mut().set_tool(tool);
+            h.run_steps(4);
+            let cut = bars_cut_off(&h);
+            assert!(
+                cut.is_empty(),
+                "{tool:?}: {cut:?} on {:?}",
+                h.state().canvas_rect
+            );
+        }
+    }
+}

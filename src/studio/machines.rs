@@ -334,12 +334,6 @@ impl Studio {
                 .response
                 .labelled_by(lid)
                 .on_hover_text(about);
-            if crate::theme::icon_button(ui, crate::icons::Icon::Gear, "Machine Settings", false, 22.0)
-                .on_hover_text("Hoops, file format, shortest stitch and locks for your machines")
-                .clicked()
-            {
-                settings = true;
-            }
         });
         if let Some(note) = self.stitch_rules_note() {
             fm.wide(|ui| {
@@ -574,7 +568,8 @@ mod tests {
         h.run_steps(4);
         assert_eq!(h.state().hoop_dims(), (140.0, 140.0));
         // The panel chooses machines; making and changing them is in
-        // Settings, a gear away. Nothing of that is in the panel itself.
+        // Settings, from the end of the machine menu. Nothing of that is in
+        // the panel itself.
         for gone in ["Min stitch", "Locks", "Reads", "Stitch Rules"] {
             assert!(
                 h.query_by_label(gone).is_none(),
@@ -582,7 +577,10 @@ mod tests {
             );
         }
         assert!(!h.state().settings_ui.open);
-        h.get_by_label("Machine Settings").click();
+        assert!(h.query_by_label("Machine Settings").is_none(), "no gear");
+        h.get_by_label("Machine").click();
+        h.run_steps(3);
+        h.get_by_label("Machine Settings…").click();
         h.run_steps(4);
         assert!(h.state().settings_ui.open);
         assert_eq!(

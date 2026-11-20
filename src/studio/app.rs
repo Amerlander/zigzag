@@ -318,6 +318,7 @@ impl Studio {
                 Ok("settings-general") => s.open_settings(Section::General),
                 Ok("settings-agent") => s.open_settings(Section::Agent),
                 Ok("select") => s.select_index(Some(0)),
+                Ok("issues") => s.open_issues = true,
                 // (A selection box, part way through being dragged out.)
                 Ok("marquee") => s.marquee = Some((P::new(-220.0, -120.0), P::new(60.0, 90.0))),
                 // The windows about ZigZag itself.
@@ -1361,7 +1362,7 @@ impl Studio {
             .frame(
                 egui::Frame::new()
                     .fill(pal.toolbar)
-                    .inner_margin(egui::Margin::symmetric(10, 0)),
+                    .inner_margin(egui::Margin::symmetric(crate::chrome::TITLEBAR_PAD, 0)),
             )
             .show(ui, |ui| self.titlebar(ui));
         egui::Panel::bottom("statusbar")
@@ -1381,6 +1382,9 @@ impl Studio {
         // The docks: full panels, or collapsed to a strip of icons.
         self.tidy_agent_dock();
         use crate::dock::Place;
+        // The docks' resizable edges, for their grabbers (painted after the
+        // canvas, which would cover the half of each over it).
+        let mut grabbers = Vec::new();
         for side in [Place::Left, Place::Right] {
             if !self.dock_shown(side) {
                 continue;
@@ -1397,16 +1401,48 @@ impl Studio {
             } else {
                 egui::Panel::right(id)
             };
-            panel = if self.dock_iconic(side) {
+            let resizable = !self.dock_iconic(side);
+            panel = if !resizable {
                 panel.exact_size(crate::dock::ICON_STRIP_W).resizable(false)
             } else if side == Place::Left {
                 panel.default_size(340.0).min_size(240.0).max_size(560.0)
             } else {
-                panel.default_size(300.0).min_size(270.0).max_size(460.0)
+                // (Room for the stitch types in one row, and the Transform
+                // panel's rows side by side; narrower, they wrap.)
+                panel.default_size(364.0).min_size(270.0).max_size(460.0)
             };
-            panel
+            // A wider band to take hold of the edge in (a finger's, on a
+            // touch screen) than egui's few points; the contents keep theirs.
+            let grab = ui.style().interaction.resize_grab_radius_side;
+            ui.style_mut().interaction.resize_grab_radius_side =
+                crate::dock::grab_radius(&ctx, grab);
+            let shown = panel
                 .frame(egui::Frame::new().fill(pal.dock))
-                .show(ui, |ui| self.dock_column(ui, side));
+                .show(ui, |ui| {
+                    ui.style_mut().interaction.resize_grab_radius_side = grab;
+                    // The dock is as wide as it's been made, and what's in it
+                    // is laid out in that width. (Not left to widen it: egui
+                    // keeps a panel as wide as its contents have ever been,
+                    // so a wider row, shown once, would widen it for good.)
+                    let rect = ui.max_rect();
+                    let mut inner =
+                        ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
+                    inner.set_clip_rect(rect.intersect(ui.clip_rect()));
+                    self.dock_column(&mut inner, side);
+                    ui.advance_cursor_after_rect(rect);
+                });
+            ui.style_mut().interaction.resize_grab_radius_side = grab;
+            if resizable {
+                let r = shown.response.rect;
+                let edge = if side == Place::Left {
+                    r.right()
+                } else {
+                    r.left()
+                };
+                // (egui's id for the panel's resize handle.)
+                let handle = ui.scope_id().with(id).with("__resize");
+                grabbers.push((edge, r.y_range(), handle));
+            }
         }
         crate::profile::mark("chrome+docks");
         // The open documents' tabs, over the canvas between the docks.
@@ -1423,6 +1459,9 @@ impl Studio {
                 self.canvas(ui);
             }
         });
+        for (x, ys, handle) in grabbers {
+            crate::dock::paint_grabber(ui, x, ys, handle);
+        }
         crate::profile::mark("canvas");
         self.floating_panels(&ctx);
         self.torn_toolbars(&ctx);
@@ -1744,7 +1783,9 @@ impl Studio {
         egui::Area::new(id)
             .order(egui::Order::Foreground)
             .fixed_pos(rect.left_top() + Vec2::new(12.0, 10.0))
+            .constrain_to(rect)
             .show(ctx, |ui| {
+                ui.set_max_width(crate::theme::canvas_bar_width(rect));
                 let p = crate::theme::pal_ui(ui);
                 egui::Frame::new()
                     .fill(p.toolbar)
@@ -1755,7 +1796,7 @@ impl Studio {
                         crate::theme::space::XS as i8,
                     ))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = crate::theme::space::XS;
                             if ui
                                 .add(egui::Button::new("Exit Group").small())
@@ -2156,7 +2197,7 @@ impl Studio {
                     (A::Paste, "Paste", RowIcon::None),
                     (A::SelectAll, "Select All", RowIcon::Icon(Icon::Select)),
                     (A::AddText, "Add Text…", RowIcon::Icon(Icon::Text)),
-                    (A::Place, "Place SVG…", RowIcon::Icon(Icon::Plus)),
+                    (A::Place, "Place…", RowIcon::Icon(Icon::Plus)),
                     (A::ZoomFit, "Zoom to Fit", RowIcon::Icon(Icon::ZoomFit)),
                 ] {
                     self.action_row(ui, a, label, icon);

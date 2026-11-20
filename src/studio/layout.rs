@@ -213,11 +213,17 @@ pub fn reference_point(b: &Bounds, r: (i8, i8)) -> P {
     P::new(pick(b.min.x, b.max.x, r.0), pick(b.min.y, b.max.y, r.1))
 }
 
+/// The width of the Transform panel's X, Y, W and H fields.
+const FIELD_W: f32 = 88.0;
+
 /// Illustrator's reference point locator: nine squares, the chosen one
 /// filled. Returns a newly clicked point.
 fn reference_locator(ui: &mut egui::Ui, current: (i8, i8)) -> Option<(i8, i8)> {
     let p = crate::theme::pal_ui(ui);
-    let (r, resp) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::click());
+    // (In a slot as wide as the proportions lock under it.)
+    let (slot, resp) =
+        ui.allocate_exact_size(Vec2::splat(crate::theme::PANEL_ICON), egui::Sense::click());
+    let r = Rect::from_center_size(slot.center(), Vec2::splat(22.0));
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Reference point"));
     let resp =
         resp.on_hover_text("Reference point: X and Y show this point; resizing keeps it in place");
@@ -1801,7 +1807,7 @@ impl Studio {
     /// Position, size, rotation and mirror for the selection (Transform panel).
     pub fn layout_panel(&mut self, ui: &mut egui::Ui) {
         use crate::icons::Icon;
-        use crate::theme::{form, icon_button};
+        use crate::theme::{PANEL_ICON, icon_button, panel_form};
         let b = self.selection_bounds();
         if b.is_empty() {
             return;
@@ -1820,7 +1826,13 @@ impl Studio {
         let lock = self.layout.lock_aspect;
         let mut toggle_lock = false;
         let field = |ui: &mut egui::Ui, label: &str, v: &mut f64, min: f64| {
-            let r = ui.add(crate::units::drag_mm(v, min..=500.0, 0.1).prefix(format!("{label}  ")));
+            // (All four as wide, so W and H line up under X and Y.)
+            let size = Vec2::new(FIELD_W, ui.spacing().interact_size.y);
+            let r = ui.add(
+                crate::units::drag_mm(v, min..=500.0, 0.1)
+                    .prefix(format!("{label}  "))
+                    .min_size(size),
+            );
             r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::SpinButton, true, label));
             (
                 r.changed(),
@@ -1834,20 +1846,21 @@ impl Studio {
         let mut rotate: Option<f64> = None;
         let mut flip: Option<(f64, f64)> = None;
         let mut center = false;
-        form(ui, "transform-form", |fm| {
+        panel_form(ui, "transform-form", |fm| {
+            // The fields first, in line with the labels; after them the
+            // reference point, over the proportions lock.
             let (x, y) = fm.row("Position", |ui, _| {
+                let xy = (
+                    field(ui, "X", &mut f[0], -500.0),
+                    field(ui, "Y", &mut f[1], -500.0),
+                );
                 if let Some(r) = reference_locator(ui, refp) {
                     new_ref = Some(r);
                 }
-                (
-                    field(ui, "X", &mut f[0], -500.0),
-                    field(ui, "Y", &mut f[1], -500.0),
-                )
+                xy
             });
             let (old_w, old_h) = (f[2], f[3]);
             let (w, h) = fm.row("Size", |ui, _| {
-                // Line W/H up under X/Y (the reference point sits before X).
-                ui.add_space(22.0 + ui.spacing().item_spacing.x);
                 let w = field(ui, "W", &mut f[2], 0.5);
                 let h = field(ui, "H", &mut f[3], 0.5);
                 if icon_button(
@@ -1859,7 +1872,7 @@ impl Studio {
                         "Keep proportions"
                     },
                     lock,
-                    22.0,
+                    PANEL_ICON,
                 )
                 .clicked()
                 {
@@ -1895,28 +1908,31 @@ impl Studio {
                 {
                     rotate = Some(self.layout.rotate_by);
                 }
-                if icon_button(ui, Icon::RotateLeft, "Rotate Left 90°", false, 22.0).clicked() {
+                if icon_button(ui, Icon::RotateLeft, "Rotate Left 90°", false, PANEL_ICON).clicked()
+                {
                     rotate = Some(-90.0);
                 }
-                if icon_button(ui, Icon::RotateRight, "Rotate Right 90°", false, 22.0).clicked() {
+                if icon_button(ui, Icon::RotateRight, "Rotate Right 90°", false, PANEL_ICON)
+                    .clicked()
+                {
                     rotate = Some(90.0);
                 }
             });
             fm.row("Flip", |ui, _| {
-                if icon_button(ui, Icon::FlipH, "Flip Horizontal", false, 22.0).clicked() {
+                if icon_button(ui, Icon::FlipH, "Flip Horizontal", false, PANEL_ICON).clicked() {
                     flip = Some((-1.0, 1.0));
                 }
-                if icon_button(ui, Icon::FlipV, "Flip Vertical", false, 22.0).clicked() {
+                if icon_button(ui, Icon::FlipV, "Flip Vertical", false, PANEL_ICON).clicked() {
                     flip = Some((1.0, -1.0));
                 }
                 ui.add_space(8.0);
-                if icon_button(ui, Icon::Target, "Center in Hoop", false, 22.0).clicked() {
+                if icon_button(ui, Icon::Target, "Center in Hoop", false, PANEL_ICON).clicked() {
                     center = true;
                 }
-                if icon_button(ui, Icon::ZoomFit, "Fit to Hoop", false, 22.0).clicked() {
+                if icon_button(ui, Icon::ZoomFit, "Fit to Hoop", false, PANEL_ICON).clicked() {
                     self.fit_to_hoop(false);
                 }
-                if icon_button(ui, Icon::Duplicate, "Duplicate", false, 22.0).clicked() {
+                if icon_button(ui, Icon::Duplicate, "Duplicate", false, PANEL_ICON).clicked() {
                     self.duplicate_selected();
                 }
             });
@@ -1929,7 +1945,7 @@ impl Studio {
                         (PathOp::Intersect, Icon::PathIntersect, "Intersect"),
                         (PathOp::Exclude, Icon::PathExclude, "Exclude"),
                     ] {
-                        if icon_button(ui, icon, label, false, 22.0)
+                        if icon_button(ui, icon, label, false, PANEL_ICON)
                             .on_hover_text(label)
                             .clicked()
                         {

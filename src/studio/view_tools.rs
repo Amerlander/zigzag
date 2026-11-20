@@ -514,12 +514,14 @@ impl Studio {
                 egui::Area::new(ui.make_persistent_id("pen-options"))
                     .pivot(egui::Align2::CENTER_TOP)
                     .fixed_pos(rect.center_top() + Vec2::new(0.0, crate::theme::space::M))
+                    .constrain_to(rect)
                     .show(ui.ctx(), |ui| {
+                        ui.set_max_width(crate::theme::canvas_bar_width(rect));
                         egui::Frame::popup(ui.style())
                             .corner_radius(9)
                             .inner_margin(egui::Margin::same(crate::theme::space::XS as i8))
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = crate::theme::space::XS;
                                     for (m, icon, name) in [
                                         (

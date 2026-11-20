@@ -314,6 +314,14 @@ pub(crate) fn font_list(
     changed
 }
 
+/// Where the caret and the typing frame are drawn: on the canvas, over the
+/// letters, and only there (not over the docks beside it when the letters
+/// are zoomed in past its edges, nor over a panel or menu on top of it).
+fn caret_painter(ctx: &egui::Context, canvas: egui::Rect) -> egui::Painter {
+    ctx.layer_painter(egui::LayerId::background())
+        .with_clip_rect(canvas)
+}
+
 impl Studio {
     pub(crate) fn fonts(&mut self) -> Vec<String> {
         if self.lettering.fonts.is_empty() {
@@ -564,7 +572,8 @@ impl Studio {
                     ),
                     (Align::Right, crate::icons::Icon::AlignRight, "Align Right"),
                 ] {
-                    if icon_button(ui, icon, name, spec.align == a, 24.0).clicked()
+                    if icon_button(ui, icon, name, spec.align == a, crate::theme::PANEL_ICON)
+                        .clicked()
                         && spec.align != a
                     {
                         spec.align = a;
@@ -1301,10 +1310,7 @@ impl Studio {
             // Just the caret and a thin frame, where the letters were.
             if let Some((x0, y0, y1)) = t.empty_frame {
                 let p = crate::theme::pal(ctx);
-                let painter = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::unique("typing-caret"),
-                ));
+                let painter = caret_painter(ctx, rect);
                 let (top, bottom) = (
                     self.view.to_screen(rect, P::new(x0, y0)),
                     self.view.to_screen(rect, P::new(x0, y1)),
@@ -1321,10 +1327,7 @@ impl Studio {
             }
         } else if !b.is_empty() {
             let p = crate::theme::pal(ctx);
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::unique("typing-caret"),
-            ));
+            let painter = caret_painter(ctx, rect);
             // The caret between the letters where the cursor is (following
             // the baseline on arcs); after the last letter while the
             // placeholder shows.
@@ -1525,6 +1528,56 @@ mod tests {
     use eframe::egui::Vec2;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn the_typing_frame_stays_on_the_canvas() {
+        // Text placed at the canvas's right edge runs on past it, under the
+        // dock: the caret and the frame round it are cut off at the edge,
+        // not drawn over the dock.
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 1000.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        h.run_steps(2);
+        h.key_press(eframe::egui::Key::T);
+        h.run_steps(1);
+        let canvas = h.state().canvas_rect;
+        let at = eframe::egui::Pos2::new(canvas.right() - 40.0, canvas.center().y);
+        h.hover_at(at);
+        h.run_steps(1);
+        h.drag_at(at);
+        h.run_steps(1);
+        h.drop_at(at);
+        h.run_steps(3);
+        for ch in ["C", "A", "M", "P", "S"] {
+            h.event(eframe::egui::Event::Text(ch.into()));
+            h.run_steps(1);
+        }
+        h.run_steps(2);
+        assert!(h.state().lettering.typing.is_some());
+        let b = crate::app::shape_bounds(&h.state().doc.shapes[0]);
+        let right = h.state().view.to_screen(canvas, P::new(b.max.x, b.min.y)).x;
+        assert!(right > canvas.right() + 20.0, "the text runs past the edge");
+        // Whatever reaches from the canvas over the dock beside it.
+        let over: Vec<_> = h
+            .output()
+            .shapes
+            .iter()
+            .filter(|c| {
+                let r = c.shape.visual_bounding_rect();
+                r.min.x > canvas.left()
+                    && r.min.x < canvas.right() - 1.0
+                    && r.max.x > canvas.right() + 1.0
+                    && r.min.y < canvas.bottom()
+                    && r.max.y > canvas.top()
+                    && c.clip_rect.right() > canvas.right() + 0.5
+            })
+            .map(|c| c.shape.visual_bounding_rect())
+            .collect();
+        assert!(over.is_empty(), "drawn over the dock: {over:?}");
+    }
 
     #[test]
     fn the_type_tool_places_text_where_you_click_and_types_into_it() {

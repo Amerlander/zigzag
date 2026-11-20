@@ -235,6 +235,12 @@ fn login_path() -> Option<String> {
     Some(s[a..b].to_string())
 }
 
+/// Held by a test that points `ZIGZAG_CLAUDE` at a stand-in, for as long as
+/// it's set: the environment is the whole process's, and tests run side by
+/// side.
+#[cfg(test)]
+pub(crate) static AGENT_ENV: Mutex<()> = Mutex::new(());
+
 /// Where `kind`'s program is: $ZIGZAG_<NAME> (for tests), the login PATH,
 /// this process's PATH, then the usual install places.
 fn locate(kind: AgentKind, login: Option<&str>) -> Option<PathBuf> {
@@ -1274,6 +1280,45 @@ impl Studio {
         self.agent.focus = true;
     }
 
+    /// The issues popover's Fix: the design's issues to the agent, as a
+    /// message in its chat (the panel opened to show it), with the objects
+    /// they're about selected for it to start on. A message being written
+    /// there is kept for after, and so are the notes pinned on the canvas.
+    pub fn fix_issues_with_agent(&mut self, ctx: &egui::Context) {
+        if self.issues.is_empty() || self.agent.running() {
+            return;
+        }
+        let mut lines = Vec::new();
+        let mut objects = Vec::new();
+        for (k, issue) in self.issues.iter().enumerate() {
+            let what = match issue.shape {
+                Some(i) => {
+                    if !objects.contains(&i) {
+                        objects.push(i);
+                    }
+                    self.names.get(i).cloned().unwrap_or_default()
+                }
+                None => "The design".to_string(),
+            };
+            lines.push(format!("{}. {what}: {}", k + 1, issue.message));
+        }
+        let prompt = format!(
+            "Fix these problems the studio found in the design (its Issues list):\n\n{}\n\nChange only what each one needs, and keep the design looking as it does.",
+            lines.join("\n")
+        );
+        if !objects.is_empty() {
+            self.set_selection(&objects);
+        }
+        let draft = std::mem::replace(&mut self.agent.prompt, prompt);
+        self.ask_agent();
+        // (On their own: notes pinned on the canvas wait for a message of
+        // the user's.)
+        self.agent_send_with(ctx, false);
+        // What was being written goes back in the box, sent or not (an
+        // agent that didn't start says so in the chat).
+        self.agent.prompt = draft;
+    }
+
     /// Whether the Agent panel is out where you can use it.
     pub fn agent_showing(&self) -> bool {
         use crate::dock::{PanelId, Place};
@@ -1619,18 +1664,32 @@ impl Studio {
     /// notes pinned on the canvas go with it; and the document as it is
     /// now is kept, to compare with what the agent makes of it.
     pub fn agent_send(&mut self, ctx: &egui::Context) {
+        self.agent_send_with(ctx, true);
+    }
+
+    /// Send the prompt, with the canvas's notes or (`notes` false) on its
+    /// own, the notes left open for a later message.
+    fn agent_send_with(&mut self, ctx: &egui::Context, notes: bool) {
         let here = self.session.rec;
-        let has_notes = self.review.pending(here) > 0;
+        let has_notes = notes && self.review.pending(here) > 0;
         if (self.agent.prompt.trim().is_empty() && !has_notes) || self.agent.running() {
             return;
         }
         let addr = self.mcp.as_ref().map(|m| m.addr);
-        let (shown, extra) = self.notes_for_prompt();
+        let (shown, extra) = if notes {
+            self.notes_for_prompt()
+        } else {
+            (Vec::new(), String::new())
+        };
         let prompt = self.agent.prompt.trim().to_string();
         let start = self.agent.log.len();
         self.agent.send_with(addr, ctx, shown, &extra);
         if self.agent.running() {
-            self.begin_turn(prompt, start);
+            if notes {
+                self.begin_turn(prompt, start);
+            } else {
+                self.begin_turn_without_notes(prompt, start);
+            }
             let sel: Vec<usize> = self
                 .sel_indices()
                 .iter()
@@ -2265,6 +2324,7 @@ mod tests {
 
     #[test]
     fn runs_an_agent_program_and_streams_its_output() {
+        let _env = AGENT_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // A stand-in for `claude`: echoes stream-json and checks its stdin.
         let dir = std::env::temp_dir().join(format!("tl-agent-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2316,6 +2376,7 @@ mod tests {
             a.log
         );
         assert!(matches!(a.log.last(), Some(Entry::Done(_))));
+        unsafe { std::env::remove_var("ZIGZAG_CLAUDE") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 

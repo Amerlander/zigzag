@@ -56,8 +56,6 @@ pub enum Icon {
     Eye,
     /// A padlock: locked.
     Lock,
-    /// Settings.
-    Gear,
     /// Panels, for the icon strip: stacked layers, a zigzag, a transform
     /// box, swatches, a page.
     Layers,
@@ -144,7 +142,9 @@ pub enum Icon {
 /// screen pixels, so that every line of every icon is as heavy as the next
 /// (a line a fraction of a pixel wide is drawn soft, and looks thinner).
 pub fn line_width(side: f32, pixels_per_point: f32) -> f32 {
-    ((side / 11.0).clamp(1.1, 1.8) * pixels_per_point)
+    // (11.5: the tool strip's, the toolbar's and the panels' icons, ~15–17
+    // points, all come out the same, at 1× and on a Retina screen.)
+    ((side / 11.5).clamp(1.1, 1.8) * pixels_per_point)
         .round()
         .max(1.0)
         / pixels_per_point
@@ -856,18 +856,25 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
         Icon::ChevronRight => line(&[(0.38, 0.2), (0.66, 0.5), (0.38, 0.8)]),
         Icon::ChevronLeft => line(&[(0.62, 0.2), (0.34, 0.5), (0.62, 0.8)]),
         Icon::Link => {
-            p.rect_stroke(
-                Rect::from_min_max(at(0.08, 0.36), at(0.58, 0.64)),
-                side * 0.14,
-                s,
-                eframe::egui::StrokeKind::Middle,
-            );
-            p.rect_stroke(
-                Rect::from_min_max(at(0.42, 0.36), at(0.92, 0.64)),
-                side * 0.14,
-                s,
-                eframe::egui::StrokeKind::Middle,
-            );
+            // Two links of a chain, on the diagonal.
+            let d = Vec2::new(1.0, -1.0).normalized();
+            let n = d.rot90();
+            let (half, rad) = (0.13 * side, 0.15 * side);
+            let link = |cx: f32, cy: f32| {
+                let c = at(cx, cy);
+                let k = 10;
+                let mut v = Vec::with_capacity(2 * (k + 1));
+                for end in [1.0f32, -1.0] {
+                    let e = c + d * (half * end);
+                    for i in 0..=k {
+                        let a = PI * i as f32 / k as f32;
+                        v.push(e + (n * a.cos() + d * a.sin()) * (rad * end));
+                    }
+                }
+                p.add(Shape::closed_line(v, s));
+            };
+            link(0.36, 0.64);
+            link(0.64, 0.36);
         }
         Icon::FlipH => {
             line(&[(0.5, 0.05), (0.5, 0.95)]);
@@ -900,26 +907,6 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
             pts.push(at(0.125, 0.333));
             p.add(Shape::line(pts, s));
             line(&[(0.125, 0.125), (0.125, 0.333), (0.333, 0.333)]);
-        }
-        Icon::Gear => {
-            // Six broad teeth round a ring, and the hole for the shaft:
-            // few enough, and with room enough round the hole, to read as
-            // a gear at the size of a button (eight narrow ones crowded
-            // it). Its teeth stop short of the box's edge, as the other
-            // icons' lines do.
-            let (teeth, outer, inner) = (6, 0.46, 0.33);
-            let step = std::f32::consts::TAU / teeth as f32;
-            let mut rim = Vec::with_capacity(teeth * 4);
-            for k in 0..teeth {
-                // (A tooth straight up, so it sits level in its box.)
-                let a = k as f32 * step - std::f32::consts::FRAC_PI_2;
-                for (da, rad) in [(-0.3, inner), (-0.19, outer), (0.19, outer), (0.3, inner)] {
-                    let b = a + da * step;
-                    rim.push(at(0.5 + rad * b.cos(), 0.5 + rad * b.sin()));
-                }
-            }
-            p.add(Shape::closed_line(rim, s));
-            p.circle_stroke(at(0.5, 0.5), side * 0.11, s);
         }
         Icon::Target => {
             p.circle_stroke(at(0.5, 0.5), side * 0.3, s);

@@ -721,6 +721,13 @@ impl Studio {
             }
         }
         self.review.queued = false;
+        self.begin_turn_without_notes(prompt, start);
+    }
+
+    /// A prompt went to the agent on its own (the issues popover's Fix):
+    /// the design is kept as it is, and the open notes stay open.
+    pub(crate) fn begin_turn_without_notes(&mut self, prompt: String, start: usize) {
+        let tab = self.session.rec;
         let before = self.version("Original");
         self.review.next_turn += 1;
         let id = self.review.next_turn;
@@ -894,7 +901,7 @@ impl Studio {
     }
 
     /// Pin a note at `at` (a box to `to`) and start writing it.
-    fn add_note(&mut self, at: P, to: Option<P>) {
+    pub(crate) fn add_note(&mut self, at: P, to: Option<P>) {
         let tab = self.session.rec;
         // (A pin goes with the object under it.)
         let on = if to.is_none() {
@@ -1320,7 +1327,8 @@ impl Studio {
         egui::Area::new(egui::Id::unique("note-editor"))
             .order(egui::Order::Foreground)
             .fixed_pos(head.right_top() + Vec2::new(8.0, -(BUTTON + 2.0 * space::S - BUBBLE) / 2.0))
-            .constrain(true)
+            // (On the canvas with its marker, never over the docks.)
+            .constrain_to(rect)
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(pal.dock)
@@ -1335,7 +1343,12 @@ impl Studio {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = space::S;
-                            let w = 220.0;
+                            // (Narrower on a narrow canvas, beside its button.)
+                            let w = (crate::theme::canvas_bar_width(rect)
+                                - BUTTON
+                                - 3.0 * space::S
+                                - space::XS)
+                                .clamp(120.0, 220.0);
                             let r = ui.add(
                                 egui::TextEdit::multiline(text)
                                     .id(egui::Id::unique("note-text"))

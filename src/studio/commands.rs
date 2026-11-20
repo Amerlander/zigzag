@@ -229,7 +229,7 @@ pub fn menus() -> Vec<(&'static str, Vec<Entry>)> {
             vec![
                 Item(Action::New, "New", cmd(Key::N)),
                 Item(Action::Open, "Open…", cmd(Key::O)),
-                Item(Action::Place, "Place SVG…", cmd_shift(Key::P)),
+                Item(Action::Place, "Place…", cmd_shift(Key::P)),
                 Sep,
                 Item(Action::CloseTab, "Close", cmd(Key::W)),
                 Item(Action::Save, "Save", cmd(Key::S)),

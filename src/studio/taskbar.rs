@@ -128,12 +128,14 @@ impl Studio {
         egui::Area::new(id)
             .order(egui::Order::Middle)
             .fixed_pos(at)
+            .constrain_to(canvas)
             .show(ctx, |ui| {
+                ui.set_max_width(crate::theme::canvas_bar_width(canvas));
                 egui::Frame::popup(ui.style())
                     .corner_radius(9)
                     .inner_margin(egui::Margin::same(space::XS as i8))
                     .show(ui, |ui| {
-                        let top = ui.horizontal(|ui| {
+                        let top = ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = space::XS;
                             let p = pal_ui(ui);
                             moved = grip(ui);
@@ -452,7 +454,7 @@ impl Studio {
                     ui.add_space(space::S);
                     let default_width = zigzag::design::default_satin_width(&self.doc.shapes[o]);
                     let row = ui
-                        .horizontal(|ui| {
+                        .horizontal_wrapped(|ui| {
                             // In the top row's columns: how it's sewn under
                             // the shape's stitch type, its thread under the
                             // shape's.
