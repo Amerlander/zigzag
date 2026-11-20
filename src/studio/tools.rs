@@ -1147,16 +1147,22 @@ impl Studio {
             self.selected,
             self.modified,
         );
+        // A tool that switched tabs swapped the live document out from
+        // under the snapshot: putting it back would give two tabs the
+        // same file, so only `batching` is restored then.
+        let tabs0 = (self.tabs.active, self.tab_count());
         zigzag::design::caught(|| self.run_tool(name, args)).unwrap_or_else(|e| {
-            self.doc = doc0;
-            self.undo.truncate(undo0);
-            self.redo = redo0;
-            self.stable = self.doc.clone();
-            self.selected = sel0;
-            self.modified = modified0;
+            if (self.tabs.active, self.tab_count()) == tabs0 {
+                self.doc = doc0;
+                self.undo.truncate(undo0);
+                self.redo = redo0;
+                self.stable = self.doc.clone();
+                self.selected = sel0;
+                self.modified = modified0;
+                self.dirty = true;
+                self.replan();
+            }
             self.batching = was_batching;
-            self.dirty = true;
-            self.replan();
             ToolResult::error(format!(
                 "`{name}` panicked: {}",
                 crate::planner::panic_text(&e)
@@ -1471,6 +1477,9 @@ impl Studio {
                     self.undo.push(self.doc.clone());
                     self.redo.push(self.doc.clone());
                     self.doc.name = "panicked".into();
+                }
+                if args.get("switch_tab").and_then(Value::as_bool) == Some(true) {
+                    self.new_tab();
                 }
                 panic!("test-only panic");
             }
@@ -4731,5 +4740,23 @@ mod tests {
         s.batching = false;
         let _ = s.run_tool_caught("__panic__", &json!({}));
         assert!(!s.batching);
+    }
+
+    /// A tool that switched tabs before panicking can't be rolled back:
+    /// the snapshot's document belongs to the other tab. Only `batching`
+    /// is put back, and each tab keeps its own file.
+    #[test]
+    fn a_panicking_tab_switch_is_not_rolled_onto_the_wrong_doc() {
+        let mut s = Studio::with_file(None, None);
+        s.run_tool("add_svg", &json!({ "svg": BADGE }));
+        s.replan();
+        let r = s.run_tool_caught("__panic__", &json!({ "switch_tab": true }));
+        assert!(r.is_error, "{r:?}");
+        // The new tab is in front with its own empty document; the badge
+        // stayed in the first tab's husk — the snapshot wasn't copied in.
+        assert_eq!(s.tab_count(), 2);
+        assert_eq!(s.active_tab(), 1);
+        assert!(s.doc.shapes.is_empty(), "live doc is the new tab's");
+        assert_eq!(s.tabs.list[0].doc.shapes.len(), 4);
     }
 }
