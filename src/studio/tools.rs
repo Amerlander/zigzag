@@ -1134,9 +1134,29 @@ impl Studio {
 
     /// `run_tool`, with a panic inside it answered as a tool error rather
     /// than taking the app (or the headless server) down with it — the
-    /// same guard the stitch planner has.
+    /// same guard the stitch planner has. What the tool changed before
+    /// it panicked is put back, like an atomic batch's rollback, and
+    /// `batching` goes back to what it was so a panicking batch can't
+    /// leave it set.
     pub fn run_tool_caught(&mut self, name: &str, args: &Value) -> ToolResult {
+        let was_batching = self.batching;
+        let (undo0, doc0, redo0, sel0, modified0) = (
+            self.undo.len(),
+            self.doc.clone(),
+            self.redo.clone(),
+            self.selected,
+            self.modified,
+        );
         zigzag::design::caught(|| self.run_tool(name, args)).unwrap_or_else(|e| {
+            self.doc = doc0;
+            self.undo.truncate(undo0);
+            self.redo = redo0;
+            self.stable = self.doc.clone();
+            self.selected = sel0;
+            self.modified = modified0;
+            self.batching = was_batching;
+            self.dirty = true;
+            self.replan();
             ToolResult::error(format!(
                 "`{name}` panicked: {}",
                 crate::planner::panic_text(&e)
@@ -1441,9 +1461,19 @@ impl Studio {
             }
             "send_to_skitch" => self.tool_send_to_skitch(),
             "machine_status" => Ok(ToolResult::json(&self.machine_json())),
-            // Lets tests prove a panic in a tool is an error, not a crash.
+            // Lets tests prove a panic in a tool is an error, not a crash —
+            // and that what it changed first is put back.
             #[cfg(test)]
-            "__panic__" => panic!("test-only panic"),
+            "__panic__" => {
+                if args.get("mutate").and_then(Value::as_bool) == Some(true) {
+                    self.modified = true;
+                    self.selected = Some(usize::MAX);
+                    self.undo.push(self.doc.clone());
+                    self.redo.push(self.doc.clone());
+                    self.doc.name = "panicked".into();
+                }
+                panic!("test-only panic");
+            }
             other => Err(format!("unknown tool '{other}'")),
         };
         if !self.batching && self.dirty_needs_plan() {
@@ -4662,5 +4692,44 @@ mod tests {
         let r = s.run_mcp_call("__panic__", &json!({}));
         assert!(r.is_error, "{r:?}");
         assert!(text_of(&r).contains("panicked"), "{}", text_of(&r));
+    }
+
+    /// What a panicking tool changed is rolled back, like an atomic
+    /// batch's: the agent is told the call failed, so nothing it did
+    /// should be left behind.
+    #[test]
+    fn a_panicking_tool_rolls_back_what_it_changed() {
+        let mut s = Studio::with_file(None, None);
+        s.run_tool("add_svg", &json!({ "svg": BADGE }));
+        s.replan();
+        let (name0, undo0, redo0, sel0, modified0) = (
+            s.doc.name.clone(),
+            s.undo.len(),
+            s.redo.len(),
+            s.selected,
+            s.modified,
+        );
+        let r = s.run_tool_caught("__panic__", &json!({ "mutate": true }));
+        assert!(r.is_error, "{r:?}");
+        assert_eq!(s.doc.name, name0);
+        assert_eq!(s.undo.len(), undo0);
+        assert_eq!(s.redo.len(), redo0);
+        assert_eq!(s.selected, sel0);
+        assert_eq!(s.modified, modified0);
+        // And the plan was rebuilt from the restored document.
+        assert_eq!(s.names.len(), s.doc.shapes.len());
+    }
+
+    /// A panic can't leave `batching` set: it's put back to what it was,
+    /// so a panicking batch doesn't break every later replan check.
+    #[test]
+    fn a_panicking_tool_restores_batching() {
+        let mut s = Studio::with_file(None, None);
+        s.batching = true;
+        let _ = s.run_tool_caught("__panic__", &json!({}));
+        assert!(s.batching, "restored to the pre-call value");
+        s.batching = false;
+        let _ = s.run_tool_caught("__panic__", &json!({}));
+        assert!(!s.batching);
     }
 }
