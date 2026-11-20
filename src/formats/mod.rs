@@ -887,9 +887,8 @@ mod step_tests {
         let cmds = steps(&d);
         assert!(cmds.len() < 1_000_000, "{} commands", cmds.len());
         assert!(
-            cmds.windows(2).all(|w| {
-                (w[1].x - w[0].x).abs() <= 121.0 && (w[1].y - w[0].y).abs() <= 121.0
-            }),
+            cmds.windows(2)
+                .all(|w| { (w[1].x - w[0].x).abs() <= 121.0 && (w[1].y - w[0].y).abs() <= 121.0 }),
             "every step fits the format"
         );
     }
