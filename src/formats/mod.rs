@@ -29,13 +29,15 @@ pub const MACHINE_FORMATS: [(&str, &str); 7] = [
 pub const READABLE_FORMATS: [&str; 5] = ["pes", "pec", "dst", "exp", "jef"];
 
 /// The furthest a stitch coordinate may be from the origin, in units
-/// (0.1 mm: a hundred metres — far past any hoop). Further out, a move
-/// would need more steps than a file should hold, so it's clamped here.
-const COORD_LIMIT: f64 = 1_000_000.0;
+/// (0.1 mm: ±1 m — far past any hoop). Clamped here so the widest a
+/// design can be stays inside every writer's fields: PES and PEC write
+/// the extent as `i16` (2 × this must fit), and DST's header fields are
+/// five digits.
+const COORD_LIMIT: f64 = 10_000.0;
 
-/// The most pieces one move is split into. With [`COORD_LIMIT`], the
-/// longest possible move needs tens of thousands at the smallest
-/// `max_step`; this only guards against a bad one.
+/// The most pieces one move is split into. With [`COORD_LIMIT`] and the
+/// smallest `max_step` a format uses, the longest possible move needs
+/// hundreds of steps; this only guards against a bad one.
 const MAX_SPLIT_STEPS: usize = 1 << 18;
 
 /// Encode a design in the machine format for `ext` (no preview formats),
@@ -266,36 +268,36 @@ pub fn commands_owned(d: &Design, opt: &StreamOptions) -> (Vec<Cmd>, Vec<Option<
     // The shape the last stitches were for.
     let mut owner: Option<usize> = None;
     let mut out: Vec<Cmd> = Vec::new();
-    // Coordinates are rounded to whole units, clamped to what the writers
-    // can still encode as steps, and non-finite ones taken as the origin:
-    // a malformed design can't make the splitter allocate or loop without
-    // bound, or a writer's fields overflow.
-    let r = |p: P| {
-        let c = |v: f64| {
-            if v.is_finite() {
-                v.round().clamp(-COORD_LIMIT, COORD_LIMIT)
-            } else {
-                0.0
-            }
-        };
-        P::new(c(p.x), c(p.y))
+    // Coordinates are rounded to whole units and clamped to what the
+    // writers can still encode; a non-finite one is skipped rather than
+    // stitched to the origin: a malformed design can't make the splitter
+    // allocate or loop without bound, wrap a writer's fields, or draw a
+    // line to the hoop's centre.
+    let rnd = |p: P| {
+        P::new(
+            p.x.round().clamp(-COORD_LIMIT, COORD_LIMIT),
+            p.y.round().clamp(-COORD_LIMIT, COORD_LIMIT),
+        )
     };
+    let r = |p: P| (p.x.is_finite() && p.y.is_finite()).then(|| rnd(p));
     let mut pos: Option<P> = None;
     let mut prev_dir = P::new(1.0, 0.0);
 
     // Split long moves so no single step exceeds `max_step` on either axis,
     // measured between rounded points (what the encoder actually sees).
-    let push_line = |out: &mut Vec<Cmd>, from: P, to: P, op: Op| {
+    // False when the move is too long to split within MAX_SPLIT_STEPS:
+    // nothing is emitted and the caller keeps its position.
+    let push_line = |out: &mut Vec<Cmd>, from: P, to: P, op: Op| -> bool {
         let d = to - from;
         let mut n = (d.x.abs().max(d.y.abs()) / opt.max_step).ceil().max(1.0) as usize;
         loop {
-            // (Coordinates are clamped, so a move needs thousands of steps
+            // (Coordinates are clamped, so a move needs hundreds of steps
             // at most; this guards only against a bad `max_step`.)
             if n > MAX_SPLIT_STEPS {
-                return;
+                return false;
             }
             let pts: Vec<P> = (1..=n)
-                .map(|i| r(from.lerp(to, i as f64 / n as f64)))
+                .map(|i| rnd(from.lerp(to, i as f64 / n as f64)))
                 .collect();
             let mut prev = from;
             let ok = pts.iter().all(|&q| {
@@ -306,7 +308,7 @@ pub fn commands_owned(d: &Design, opt: &StreamOptions) -> (Vec<Cmd>, Vec<Option<
             });
             if ok {
                 out.extend(pts.into_iter().map(|q| Cmd { x: q.x, y: q.y, op }));
-                return;
+                return true;
             }
             n += 1;
         }
@@ -343,7 +345,18 @@ pub fn commands_owned(d: &Design, opt: &StreamOptions) -> (Vec<Cmd>, Vec<Option<
             if run.pts.is_empty() {
                 continue;
             }
-            let start = r(run.pts[0]);
+            // Non-finite points are skipped, keeping each point's index
+            // for the ownership spans below.
+            let pts: Vec<(usize, P)> = run
+                .pts
+                .iter()
+                .enumerate()
+                .filter_map(|(k, &q)| r(q).map(|q| (k, q)))
+                .collect();
+            if pts.is_empty() {
+                continue;
+            }
+            let start = pts[0].1;
             if ri > 0
                 && run.trim_before
                 && let Some(p) = pos
@@ -364,11 +377,16 @@ pub fn commands_owned(d: &Design, opt: &StreamOptions) -> (Vec<Cmd>, Vec<Option<
                 .map_or(&[], |s| s.as_slice());
             let mut span = 0;
             owner = spans.first().map(|s| s.1);
-            match pos {
+            // (A jump too long to split within the step cap can't be
+            // made: the run is skipped rather than sewn from nowhere.)
+            let reached = match pos {
                 // Machines start at the origin; the first move is a jump from there.
                 None => push_line(&mut out, P::default(), start, Op::Jump),
                 Some(p) if p != start => push_line(&mut out, p, start, Op::Jump),
-                _ => {}
+                _ => true,
+            };
+            if !reached {
+                continue;
             }
             out.push(Cmd {
                 x: start.x,
@@ -376,30 +394,32 @@ pub fn commands_owned(d: &Design, opt: &StreamOptions) -> (Vec<Cmd>, Vec<Option<
                 op: Op::Stitch,
             });
             owners.resize(out.len(), owner);
-            let first_dir = run
-                .pts
+            let first_dir = pts
                 .iter()
-                .map(|&q| r(q) - start)
+                .map(|&(_, q)| q - start)
                 .find(|v| v.len() > 0.5)
                 .map(|v| v.norm())
                 .unwrap_or(P::new(1.0, 0.0));
             tie(&mut out, start, first_dir);
             owners.resize(out.len(), owner);
             let mut cur = start;
-            for (k, &q) in run.pts.iter().enumerate().skip(1) {
+            for &(k, q) in pts.iter().skip(1) {
                 while spans.get(span + 1).is_some_and(|s| s.0 <= k) {
                     span += 1;
                     owner = Some(spans[span].1);
                 }
-                let q = r(q);
                 // (Rounded onto the last point, or too near it for a stitch.)
                 if q == cur || q.dist(cur) < opt.min_stitch {
                     continue;
                 }
-                prev_dir = (cur - q).norm();
-                push_line(&mut out, cur, q, Op::Stitch);
+                // (A move too long to split is skipped: `cur` stays where
+                // the stream actually is, so the next point still stitches
+                // from a place the file reached.)
+                if push_line(&mut out, cur, q, Op::Stitch) {
+                    prev_dir = (cur - q).norm();
+                    cur = q;
+                }
                 owners.resize(out.len(), owner);
-                cur = q;
             }
             pos = Some(cur);
         }
@@ -822,10 +842,10 @@ mod step_tests {
         assert_eq!(xs, [0.0, 100.0, 200.0, 300.0, 400.0, 500.0]);
     }
 
-    /// NaN and infinite points can't hang the splitter: they're taken as
-    /// the origin, and everything written stays finite.
+    /// NaN and infinite points can't hang the splitter: they're skipped,
+    /// not stitched to the origin, and everything written stays finite.
     #[test]
-    fn non_finite_points_cant_hang_the_splitter() {
+    fn non_finite_points_are_skipped_not_drawn() {
         let d = design(vec![
             P::new(0.0, 0.0),
             P::new(f64::NAN, f64::NAN),
@@ -838,6 +858,21 @@ mod step_tests {
             cmds.iter().all(|c| c.x.is_finite() && c.y.is_finite()),
             "{cmds:?}"
         );
+        // The pen goes 0 → 50 → 60; taken as the origin, the bad points
+        // would have drawn a stitch back through (0, 0) on the way.
+        let xs: Vec<f64> = cmds
+            .iter()
+            .filter(|c| c.op == Op::Stitch)
+            .map(|c| c.x)
+            .collect();
+        assert_eq!(xs, [0.0, 50.0, 60.0]);
+    }
+
+    /// A run with nothing finite in it stitches nothing at all.
+    #[test]
+    fn a_run_of_only_non_finite_points_is_skipped() {
+        let d = design(vec![P::new(f64::NAN, 0.0), P::new(0.0, f64::INFINITY)]);
+        assert!(steps(&d).is_empty());
     }
 
     /// Coordinates too large to count steps for are clamped instead of
@@ -857,6 +892,23 @@ mod step_tests {
             }),
             "every step fits the format"
         );
+    }
+
+    /// A move too long to split within the step cap is dropped without
+    /// the stream claiming to have reached it.
+    #[test]
+    fn an_unsplittable_move_is_dropped_not_drawn() {
+        // A thousand units at a thousandth-of-a-unit step is past the cap.
+        let d = design(vec![P::new(0.0, 0.0), P::new(1000.0, 0.0)]);
+        let cmds = commands(
+            &d,
+            &StreamOptions {
+                lock: Lock::new(LockStyle::None, 0.4, 4),
+                min_stitch: 0.0,
+                max_step: 0.001,
+            },
+        );
+        assert!(cmds.iter().all(|c| c.x == 0.0), "{cmds:?}");
     }
 }
 
