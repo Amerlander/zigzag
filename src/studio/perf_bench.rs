@@ -867,3 +867,135 @@ fn stepping_through_fonts() {
         slowest.1, slowest.0
     );
 }
+
+/// Scrolling a long chat in the Agent panel, on a traced logo: what each
+/// frame costs while the chat scrolls, with its earlier turns folded and
+/// shown, beside a frame that only redraws.
+///
+/// `cargo test --release --features gui --bin zigzag-studio perf_bench::scrolling -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn scrolling_the_agent_chat() {
+    use crate::agent::Entry;
+    let mut h = studio_with_logo();
+    settle(&mut h);
+    h.state_mut().dock.reveal(crate::dock::PanelId::Agent);
+    {
+        let a = &mut h.state_mut().agent;
+        a.config = None;
+        for k in 0..40 {
+            a.log.push(Entry::You(format!("Turn {k}: make the bear more detailed, with shading on the flank and a lighter muzzle")));
+            for s in 0..6 {
+                a.log.push(Entry::Tool(
+                    [
+                        "get_design",
+                        "render_preview",
+                        "trace_image",
+                        "batch",
+                        "set_object",
+                        "check_design",
+                    ][s]
+                        .into(),
+                    "object: Bear body, kind: fill, color: #c8b88e".into(),
+                    Some(s != 3),
+                ));
+            }
+            a.log.push(Entry::Said("I'm refining the bear's silhouette and paws, then tracing it back into embroidery shapes at the same size. The tan shading sits on the flank and the far legs, and the muzzle is a lighter cream so the face reads at 35 mm. ".repeat(2)));
+            a.log.push(Entry::Done(format!("{} turns · 40 s", k + 1)));
+        }
+    }
+    h.run_steps(6);
+    // Where the chat is: just above the prompt.
+    let over = {
+        use egui_kittest::kittest::Queryable;
+        let r = h.get_by_label("Prompt").rect();
+        egui::pos2(r.center().x, r.top() - 150.0)
+    };
+    println!(
+        "{} lines in the chat, the pointer at {over:?}",
+        h.state().agent.log.len()
+    );
+    let wheel = |h: &mut Harness<'static, Studio>, dy: f32| {
+        h.event(egui::Event::PointerMoved(over));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, dy),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: egui::Modifiers::NONE,
+        });
+    };
+    times(&mut h, "redraw, nothing scrolling", 30, &mut |h, _| {
+        h.event(egui::Event::PointerMoved(over));
+    });
+    times(
+        &mut h,
+        "scroll, last turns (rest folded)",
+        30,
+        &mut |h, k| wheel(h, if k < 15 { 40.0 } else { -40.0 }),
+    );
+    h.state_mut().agent.show_earlier = true;
+    h.run_steps(3);
+    times(&mut h, "scroll, whole chat (40 turns)", 30, &mut |h, k| {
+        wheel(h, if k < 15 { 60.0 } else { -60.0 })
+    });
+}
+
+/// Pressing Send in the Agent panel on a traced logo, with a stand-in for
+/// Codex that only waits: how long that frame holds the window up, and
+/// where the time goes.
+///
+/// `cargo test --release --features gui --bin zigzag-studio perf_bench::sending -- --ignored --nocapture`
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn sending_a_prompt() {
+    use egui_kittest::kittest::Queryable;
+    let dir = std::env::temp_dir().join(format!("zz-send-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join("codex");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ncase \"$1\" in debug|mcp) echo '[]'; exit 0;; -c) echo '[]'; exit 0;; esac\nsleep 30\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe { std::env::set_var("ZIGZAG_CODEX", &fake) };
+    let mut h = studio_with_logo();
+    settle(&mut h);
+    // A server for the agent to reach, as the app has.
+    h.state_mut().mcp =
+        Some(crate::mcp::start(0, crate::tools::tool_specs(), String::new(), || {}).unwrap());
+    h.state_mut().dock.reveal(crate::dock::PanelId::Agent);
+    h.state_mut().agent.config = None;
+    h.state_mut().agent.kind = crate::agent::AgentKind::Codex;
+    h.state_mut().agent.found = [None, None];
+    h.run_steps(5);
+    for round in 0..4 {
+        h.state_mut().agent.prompt = format!("make it greener {round}");
+        h.run_steps(2);
+        let t = std::time::Instant::now();
+        h.get_by_label("Send").click();
+        h.step();
+        let click = t.elapsed().as_secs_f64() * 1000.0;
+        let mut frames = 0;
+        while !h.state().agent.running() && frames < 50 {
+            h.step();
+            frames += 1;
+        }
+        let shown = t.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "send {round}: click frame {click:.0} ms, running after {frames} more frames ({shown:.0} ms); stop shown: {}",
+            h.query_by_label("Stop").is_some()
+        );
+        h.state_mut().agent.started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        h.state_mut().agent.stop();
+        h.run_steps(3);
+    }
+    unsafe { std::env::remove_var("ZIGZAG_CODEX") };
+    let _ = std::fs::remove_dir_all(&dir);
+}

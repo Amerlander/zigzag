@@ -1070,6 +1070,70 @@ impl Studio {
             {
                 self.agent.new_chat();
             }
+            // Beside it, the clock: this design's earlier chats.
+            let hrect = Rect::from_center_size(
+                Pos2::new(rect.right() - 64.0 - inset, rect.center().y),
+                Vec2::new(22.0, 20.0),
+            );
+            let hresp = ui.interact(
+                hrect,
+                ui.make_persistent_id("agent-history"),
+                Sense::click(),
+            );
+            hresp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, "Chat History")
+            });
+            let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&hresp));
+            if hresp.hovered() || open {
+                ui.painter().rect_filled(hrect, 4.0, p.hover);
+            }
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(hrect.center(), Vec2::splat(12.0)),
+                Icon::History,
+                if hresp.hovered() || open {
+                    p.text
+                } else {
+                    p.secondary
+                },
+            );
+            let hresp = hresp.on_hover_text("Earlier chats about this design");
+            let mut pick: Option<String> = None;
+            egui::Popup::menu(&hresp)
+                .align(egui::RectAlign::BOTTOM_END)
+                .show(|ui| {
+                    ui.set_min_width(280.0);
+                    ui.spacing_mut().button_padding = Vec2::new(12.0, 4.0);
+                    let chats = self.doc_chats();
+                    if chats.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No earlier chats about this design yet.")
+                                .color(p.secondary),
+                        );
+                    }
+                    for m in &chats {
+                        let current = self.agent.hist_id.as_deref() == Some(m.id.as_str());
+                        let title = if m.title.is_empty() {
+                            "Untitled chat"
+                        } else {
+                            &m.title
+                        };
+                        let text = format!("{title}  ·  {}", m.ago());
+                        if ui
+                            .add(egui::Button::new(text).selected(current).truncate())
+                            .on_hover_text(format!("{} · {} lines", m.agent.name(), m.entries))
+                            .clicked()
+                        {
+                            pick = Some(m.id.clone());
+                            ui.close();
+                        }
+                    }
+                });
+            if let Some(id) = pick
+                && self.agent.hist_id.as_deref() != Some(id.as_str())
+            {
+                self.open_chat(&id);
+            }
         }
         egui::Popup::menu(&mresp)
             .align(egui::RectAlign::BOTTOM_END)
@@ -3702,7 +3766,10 @@ impl Studio {
             // than cut. A bar to drag, the cuts it saves beside it, and what
             // it sews lit up on the canvas meanwhile.
             let mut peek = false;
-            if fm.advanced(self.doc.settings.connect_mm != usual.connect_mm) {
+            if fm.advanced(
+                self.doc.settings.connect_mm != usual.connect_mm
+                    || self.doc.settings.blend_mm != usual.blend_mm,
+            ) {
                 fm.row("Connect", |ui, lid| {
                     let mm = &mut self.doc.settings.connect_mm;
                     ui.spacing_mut().slider_width = 100.0;
@@ -3732,6 +3799,46 @@ impl Studio {
                         connect_note(self.doc.settings.connect_mm, cuts, bridged),
                     );
                 });
+                // Blend: further across, where the thread is near in color
+                // to what it crosses (and what it sews lit up likewise).
+                fm.row("Blend", |ui, lid| {
+                    let mm = &mut self.doc.settings.blend_mm;
+                    ui.spacing_mut().slider_width = 100.0;
+                    let bar = ui
+                        .add(
+                            egui::Slider::new(mm, 0.0..=zigzag::document::BLEND_MM_MOST)
+                                .show_value(false)
+                                .step_by(0.5),
+                        )
+                        .labelled_by(lid)
+                        .on_hover_text(
+                            "Sew across gaps up to this long where the thread is close in color to what it crosses: the same thread, a lighter or darker one, or cloth of its own color. The plainer it would show, the less far it goes (light red on red a bit over half this; white on black not at all). Judged against Preview on for bare cloth, so set that to the cloth's color.",
+                        );
+                    bar.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::Role::Slider, true, "Blend gaps")
+                    });
+                    let field = ui.add(crate::units::drag_mm(
+                        mm,
+                        0.0..=zigzag::document::BLEND_MM_MOST,
+                        0.1,
+                    ));
+                    peek |= [&bar, &field]
+                        .iter()
+                        .any(|r| r.hovered() || r.dragged() || r.has_focus() || r.changed());
+                });
+                let blended = self.design.blends.len();
+                if self.doc.settings.blend_mm > 0.0 {
+                    fm.wide(|ui| {
+                        caption(
+                            ui,
+                            match blended {
+                                0 => "No gaps where the thread blends in".to_string(),
+                                1 => "1 more cut saved where the thread blends in".to_string(),
+                                n => format!("{n} more cuts saved where the thread blends in"),
+                            },
+                        );
+                    });
+                }
             }
             if peek {
                 self.bridges_peek =

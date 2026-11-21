@@ -202,6 +202,12 @@ pub struct Params {
     pub sett: Option<Vec<([u8; 3], f64)>>,
     /// Cross-stitch cell size, mm.
     pub cell: Option<f64>,
+    /// The way the thread comes to this object from the one sewn before
+    /// it in the same thread, drawn by hand: points (mm, the design's
+    /// coordinates) it's sewn through with running stitches, in place of
+    /// a cut or the planner's own way. None of them: straight there.
+    /// `via=X:Y+X:Y` in an id (`via=direct` for none).
+    pub via: Option<Vec<(f64, f64)>>,
     /// Cut the thread after this object, whatever comes next.
     pub trim: Option<bool>,
     /// Hidden: not shown and not sewn (its stitch settings are kept for
@@ -511,6 +517,8 @@ impl Params {
             colors: child.colors.clone().or_else(|| self.colors.clone()),
             sett: child.sett.clone().or_else(|| self.sett.clone()),
             cell: child.cell.or(self.cell),
+            // (An object's own: not every object of a group it's set on.)
+            via: child.via.clone(),
             trim: child.trim.or(self.trim),
             hide: child.hide.or(self.hide),
             lock: child.lock.or(self.lock),
@@ -642,6 +650,20 @@ impl Params {
                 self.sett = st.filter(|s| !s.is_empty());
             }
             "cell" => self.cell = num.filter(|v| *v >= 1.0),
+            "via" => {
+                self.via = if v == "direct" {
+                    Some(Vec::new())
+                } else {
+                    v.split('+')
+                        .map(|part| {
+                            let (x, y) = part.split_once(':')?;
+                            let n = |t: &str| t.parse::<f64>().ok().filter(|v| v.is_finite());
+                            Some((n(x)?, n(y)?))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .filter(|pts| !pts.is_empty())
+                };
+            }
             "stop" => self.stop = flag,
             _ => {}
         }
@@ -729,6 +751,19 @@ impl Params {
                     .join("+")
             ));
         }
+        if let Some(via) = &self.via {
+            t.push(if via.is_empty() {
+                "via=direct".to_string()
+            } else {
+                format!(
+                    "via={}",
+                    via.iter()
+                        .map(|(x, y)| format!("{}:{}", fmt_num(*x), fmt_num(*y)))
+                        .collect::<Vec<_>>()
+                        .join("+")
+                )
+            });
+        }
         if let Some(u) = self.underlay {
             t.push(format!("u={}", u as u8));
         }
@@ -804,6 +839,22 @@ pub fn decode_illustrator_id(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_thread_route_is_kept_in_the_name() {
+        let mut p = Params::default();
+        for t in ["via=12.5:-3+20:0"] {
+            p.apply_token(t);
+        }
+        assert_eq!(p.via, Some(vec![(12.5, -3.0), (20.0, 0.0)]));
+        let back = p.tokens().join("_");
+        assert!(back.contains("via=12.5:-3+20:0"), "{back}");
+        let mut q = Params::default();
+        q.apply_token("via=direct");
+        assert_eq!(q.via, Some(Vec::new()));
+        assert!(q.tokens().iter().any(|t| t == "via=direct"));
+        assert!(is_param_token("via=1:2"));
+    }
+
     use super::*;
 
     #[test]

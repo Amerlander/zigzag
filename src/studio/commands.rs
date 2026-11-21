@@ -11,6 +11,10 @@ use zigzag::params::Kind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
+    /// Object › Route Thread Along Path, Edit Thread Route, Clear Thread Route.
+    RouteThread,
+    EditRoute,
+    ClearRoute,
     New,
     Open,
     /// File › Close: the tab in front (asks first if it has unsaved changes).
@@ -336,6 +340,14 @@ pub fn menus() -> Vec<(&'static str, Vec<Entry>)> {
                         Item(Action::GroupColors, "Group Colors", None),
                     ],
                 ),
+                Sub(
+                    "Thread Route",
+                    vec![
+                        Item(Action::RouteThread, "Route Thread Along Path", None),
+                        Item(Action::EditRoute, "Edit Thread Route as Path", None),
+                        Item(Action::ClearRoute, "Clear Thread Route", None),
+                    ],
+                ),
                 Item(Action::SimplifyDesign, "Simplify Design…", None),
                 Sep,
                 Item(Action::TestSwatches, "Test Swatches…", None),
@@ -623,6 +635,11 @@ impl Studio {
                         .count()
                         == 1
             }
+            Action::RouteThread => self.route_pair().is_some(),
+            Action::EditRoute | Action::ClearRoute => self
+                .sel_indices()
+                .iter()
+                .any(|&i| self.doc.shapes[i].params.via.is_some()),
             Action::Paste => !self.layout.clipboard.is_empty(),
             Action::SelectAll
             | Action::GroupColors
@@ -747,7 +764,7 @@ impl Studio {
             }
             Action::Save => {
                 if self.doc.path.is_some() {
-                    self.save(None)
+                    self.save(None);
                 } else {
                     self.save_as_dialog()
                 }
@@ -794,6 +811,9 @@ impl Studio {
             Action::BringForward => self.move_selected(1),
             Action::SendBackward => self.move_selected(-1),
             Action::GroupColors => self.group_colors(),
+            Action::RouteThread => self.route_along_selected(),
+            Action::EditRoute => self.edit_route_as_path(),
+            Action::ClearRoute => self.clear_routes(),
             Action::AddText => self.open_text_window(),
             Action::Tool(t) => self.set_tool(t),
             Action::ToggleGrid => self.view_tools.grid = !self.view_tools.grid,

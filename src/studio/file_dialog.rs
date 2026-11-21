@@ -182,7 +182,9 @@ impl Studio {
         match p.then {
             Then::Open => self.load(&path),
             Then::Place => self.place_svg(&path),
-            Then::SaveAs => self.save(Some(&path)),
+            Then::SaveAs => {
+                self.save(Some(&path));
+            }
             Then::Export(ext) => {
                 self.status = match self.export_to(ext, &path) {
                     Ok(()) => format!("Exported {}", path.display()),

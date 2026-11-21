@@ -22,13 +22,14 @@ enum PostError {
     Failed(std::io::Error),
 }
 
-fn post(port: u16, body: &str) -> Result<(u16, String), PostError> {
+fn post(port: u16, panel: bool, body: &str) -> Result<(u16, String), PostError> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|_| PostError::NotRunning)?;
     let mut exchange = || -> std::io::Result<(u16, String)> {
         s.set_read_timeout(Some(Duration::from_secs(180)))?;
         write!(
             s,
-            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /mcp{} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            if panel { "?panel=1" } else { "" },
             body.len()
         )?;
         let mut raw = Vec::new();
@@ -103,9 +104,13 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7878);
+    let mut panel = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        if a == "--port" {
+        if a == "--panel" {
+            // (Started by the studio's own Agent panel.)
+            panel = true;
+        } else if a == "--port" {
             port = args.next().and_then(|v| v.parse().ok()).unwrap_or(port);
         } else if a == "--headless" {
             let name = format!("zigzag-studio{}", std::env::consts::EXE_SUFFIX);
@@ -133,7 +138,7 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        let reply = match post(port, &line) {
+        let reply = match post(port, panel, &line) {
             Ok((200, body)) if !body.trim().is_empty() => Some(body.trim().to_string()),
             Ok((202, _)) | Ok((200, _)) => None,
             Ok((code, body)) => error_reply(

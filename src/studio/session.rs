@@ -42,6 +42,9 @@ pub struct SessionState {
     dir: Option<PathBuf>,
     /// When the next write is due (egui time), if something changed.
     due: Option<f64>,
+    /// A document that isn't in front was changed (an agent working on
+    /// it): that's to be written too.
+    pub(crate) behind: bool,
     /// When the change that's waiting to be written was noticed.
     since: Option<f64>,
     /// The document in front as last written to its recovery file.
@@ -252,7 +255,8 @@ impl Studio {
         self.restore_survived();
         // (The tabs not in front can only have changed on their way to the
         // back, and that changes which one is in front.)
-        let changed = self.doc_unsaved_changed()
+        let changed = std::mem::take(&mut self.session.behind)
+            || self.doc_unsaved_changed()
             || self.session.saved_meta.as_ref() != Some(&self.session_meta(self.modified));
         if changed && self.session.due.is_none() {
             self.session.due = Some(now + SETTLE_S);

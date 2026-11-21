@@ -66,7 +66,7 @@ fn rasterize(svg: &str, max: Vec2) -> Option<egui::ColorImage> {
 }
 
 /// A smaller copy of the image for showing it (box-filtered).
-fn thumbnail(img: &Image, max: Vec2) -> egui::ColorImage {
+pub(crate) fn thumbnail(img: &Image, max: Vec2) -> egui::ColorImage {
     let (w, h) = img.size();
     let s = ((max.x * 2.0) / w as f32)
         .min((max.y * 2.0) / h as f32)

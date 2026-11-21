@@ -53,6 +53,15 @@ pub struct Design {
     /// gaps that short (from, to): each would be a cut without it. (Travel
     /// that's out of sight, under a fill or what's sewn on top, isn't here.)
     pub bridges: Vec<(P, P)>,
+    /// Gaps sewn across where the thread blends into what it lies on (the
+    /// document's Blend), each a cut without it: the way taken, straight
+    /// or round by what it's like in color, from where the thread was to
+    /// where the next piece begins.
+    pub blends: Vec<Vec<P>>,
+    /// The ways sewn as drawn by hand (an object's `via`): the input
+    /// shape each leads to, and the way, from where the thread was to
+    /// where that object begins.
+    pub routes: Vec<(usize, Vec<P>)>,
     /// Which input shape each stitch is for: per block and run (as
     /// `blocks`), the places in the run where another shape's stitches
     /// begin, as (index of the first such point, shape index), in order.
@@ -82,6 +91,251 @@ pub enum TravelHow {
     Under,
     /// Straight across open cloth (the document's Connect).
     Open,
+    /// Straight across what the thread is close enough in color to that
+    /// it doesn't show as a line (the document's Blend): another object's
+    /// stitches in a like thread, or cloth of its own color.
+    Blend,
+    /// The way drawn for it by hand (the object's `via`).
+    Routed,
+}
+
+/// How much a thread of color `a` stands out lying on color `b`, from 0
+/// (can't be told apart) to 1 (as plain as it gets): from how different
+/// they look (CIEDE2000), a shade apart counting for a little, a lighter
+/// or darker thread of the same color for something under half, and
+/// another color altogether in full.
+pub fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
+    /// Nearer than this, a difference isn't seen in thread.
+    const SAME: f64 = 3.0;
+    /// This far apart it's as plain as it gets (white on black is 100;
+    /// a light red on red, or navy on royal blue, 20 to 30).
+    const OTHER: f64 = 60.0;
+    ((crate::formats::perceptual_distance(a, b) - SAME) / (OTHER - SAME)).clamp(0.0, 1.0)
+}
+
+/// What a thread sewn across the open lies on: the objects sewn before
+/// (the last first: their bounds, what each covers and its thread), the
+/// cloth, and the shape it's being sewn to (whose own stitches are the
+/// document's Sew Over's to say, not Blend's).
+pub struct Backdrop<'a> {
+    pub under: &'a [(Bounds, Vec<Polyline>, FillRule, [u8; 3])],
+    pub own: Option<&'a (Vec<Polyline>, FillRule)>,
+    pub cloth: [u8; 3],
+    pub thread: [u8; 3],
+}
+
+impl Backdrop<'_> {
+    /// The color under point `q`: the last-sewn object there, or the cloth.
+    pub fn color_at(&self, q: P) -> [u8; 3] {
+        self.under
+            .iter()
+            .find(|(b, rings, rule, _)| {
+                q.x >= b.min.x
+                    && q.x <= b.max.x
+                    && q.y >= b.min.y
+                    && q.y <= b.max.y
+                    && crate::geom::point_inside(rings, *rule, q)
+            })
+            .map_or(self.cloth, |u| u.3)
+    }
+
+    /// How much the thread stands out at `q` (see [`contrast`]), on the
+    /// way to `start` (the last few points of it are the shape's own
+    /// edge, where it's about to sew).
+    pub fn shows_at(&self, q: P, start: P) -> f64 {
+        let own = q.dist(start) > 6.0
+            && self
+                .own
+                .is_some_and(|(rings, rule)| crate::geom::point_inside(rings, *rule, q));
+        if own {
+            1.0
+        } else {
+            contrast(self.thread, self.color_at(q))
+        }
+    }
+
+    /// What sewing along `line` (to its last point) spends of a budget of
+    /// 1: each stretch as a share of how far it could go there (`reach`,
+    /// units, by how much it shows). `None`: it crosses somewhere it
+    /// can't go at all.
+    pub fn spends(&self, line: &[P], reach: &dyn Fn(f64) -> f64) -> Option<f64> {
+        let start = *line.last()?;
+        let mut spent = 0.0;
+        for w in line.windows(2) {
+            let len = w[0].dist(w[1]);
+            let n = (len / 5.0).ceil().max(1.0) as usize;
+            for k in 0..n {
+                let q = w[0].lerp(w[1], (k as f64 + 0.5) / n as f64);
+                let r = reach(self.shows_at(q, start));
+                if r <= 0.0 {
+                    return None;
+                }
+                spent += len / n as f64 / r;
+            }
+        }
+        Some(spent)
+    }
+
+    /// The way from `prev` to `start` that shows least: round by what the
+    /// thread is like in color where straight across isn't, no longer
+    /// than `most` (units) and spending no more than `budget` (see
+    /// [`Backdrop::spends`]). With what it spends.
+    pub fn least_seen(
+        &self,
+        prev: P,
+        start: P,
+        reach: &dyn Fn(f64) -> f64,
+        most: f64,
+        budget: f64,
+    ) -> Option<(Vec<P>, f64)> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let gap = prev.dist(start);
+        if gap > most {
+            return None;
+        }
+        if let Some(c) = self.spends(&[prev, start], reach)
+            && c <= budget
+        {
+            return Some((vec![prev, start], c));
+        }
+        // A grid of places to go through, from `prev`; fine enough to
+        // follow an edge, and no more of it than the length allows.
+        let step = (gap / 50.0).clamp(5.0, 12.0);
+        let best_reach = reach(0.0).max(1e-9);
+        let at = |c: (i32, i32)| prev + P::new(c.0 as f64 * step, c.1 as f64 * step);
+        let fixed = |x: f64| (x * 1e7) as u64;
+        // (Nodes: grid places, and the end itself.)
+        const END: (i32, i32) = (i32::MAX, i32::MAX);
+        let place = |c: (i32, i32)| if c == END { start } else { at(c) };
+        let mut cost: HashMap<(i32, i32), f64> = HashMap::new();
+        let mut from: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
+        let mut heap = BinaryHeap::new();
+        cost.insert((0, 0), 0.0);
+        heap.push(Reverse((fixed(gap / best_reach), 0u64, (0, 0))));
+        let mut found = None;
+        let mut looked = 0;
+        while let Some(Reverse((_, g, c))) = heap.pop() {
+            let g = g as f64 / 1e7;
+            if cost.get(&c).is_some_and(|&best| g > best + 1e-6) {
+                continue;
+            }
+            if c == END {
+                found = Some(g);
+                break;
+            }
+            looked += 1;
+            if looked > 20_000 {
+                break;
+            }
+            let p = at(c);
+            let mut next: Vec<(i32, i32)> = Vec::with_capacity(9);
+            if p.dist(start) <= step * 1.5 {
+                next.push(END);
+            }
+            for (dx, dy) in [
+                (1, 0),
+                (-1, 0),
+                (0, 1),
+                (0, -1),
+                (1, 1),
+                (1, -1),
+                (-1, 1),
+                (-1, -1),
+            ] {
+                next.push((c.0 + dx, c.1 + dy));
+            }
+            for n in next {
+                let q = place(n);
+                if n != END && prev.dist(q) + q.dist(start) > most {
+                    continue;
+                }
+                let len = p.dist(q);
+                let r = reach(self.shows_at(p.lerp(q, 0.5), start));
+                if r <= 0.0 {
+                    continue;
+                }
+                let ng = g + len / r;
+                if ng > budget + 1e-9 || cost.get(&n).is_some_and(|&best| ng >= best - 1e-9) {
+                    continue;
+                }
+                cost.insert(n, ng);
+                from.insert(n, c);
+                heap.push(Reverse((
+                    fixed(ng + q.dist(start) / best_reach),
+                    fixed(ng),
+                    n,
+                )));
+            }
+        }
+        found?;
+        let mut line = vec![start];
+        let mut c = END;
+        while let Some(&p) = from.get(&c) {
+            line.push(at(p));
+            c = p;
+        }
+        line.reverse();
+        // In as few points as go the same way, if that's still within it.
+        let tidy = simplify_line(&line, step * 0.75);
+        for l in [tidy, line] {
+            if let Some(c) = self.spends(&l, reach)
+                && c <= budget + 1e-6
+            {
+                return Some((l, c));
+            }
+        }
+        None
+    }
+}
+
+/// A line with the points that don't change where it goes (within `tol`)
+/// left out (Douglas–Peucker).
+pub fn simplify_line(pts: &[P], tol: f64) -> Vec<P> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let (a, b) = (pts[0], pts[pts.len() - 1]);
+    let len = a.dist(b);
+    let off = |q: P| {
+        if len < 1e-9 {
+            a.dist(q)
+        } else {
+            ((b.x - a.x) * (a.y - q.y) - (a.x - q.x) * (b.y - a.y)).abs() / len
+        }
+    };
+    let (k, far) = pts[1..pts.len() - 1]
+        .iter()
+        .enumerate()
+        .map(|(k, &q)| (k + 1, off(q)))
+        .fold((0, 0.0), |m, x| if x.1 > m.1 { x } else { m });
+    if far <= tol {
+        return vec![a, b];
+    }
+    let mut out = simplify_line(&pts[..=k], tol);
+    out.pop();
+    out.extend(simplify_line(&pts[k..], tol));
+    out
+}
+
+/// Running stitches along `line`, from its first point (not given) to
+/// just short of its last (the first of what's sewn next).
+fn sewn_along(line: &[P]) -> Vec<P> {
+    let mut way = Vec::new();
+    for w in line.windows(2) {
+        let n = (w[0].dist(w[1]) / 30.0).ceil().max(1.0) as usize;
+        way.extend((1..=n).map(|k| w[0].lerp(w[1], k as f64 / n as f64)));
+    }
+    way.pop();
+    way
+}
+
+/// How far (units) a gap may be sewn across where the thread stands out
+/// `w` (see [`contrast`]) from what it lies on: the document's Connect
+/// where it shows in full, its Blend where it can't be seen, and
+/// evenly in between.
+pub fn blend_reach(opt: &PlanOptions, w: f64) -> f64 {
+    opt.connect + (opt.blend - opt.connect).max(0.0) * (1.0 - w)
 }
 
 /// One stretch of travel in a [`Design`]: `blocks[block].runs[run].pts`
@@ -122,6 +376,13 @@ pub struct PlanOptions {
     /// (Ink/Stitch's "jump to stroke"), where there's no way round out of
     /// sight. These show: [`Design::bridges`] lists them.
     pub connect: f64,
+    /// Gaps up to this long (units) are sewn across where the thread is
+    /// close in color to what it would lie on (stitches sewn before, or
+    /// the cloth), and less far the more it would stand out, down to
+    /// `connect` where it shows in full (see [`blend_reach`]). 0: off.
+    pub blend: f64,
+    /// The cloth's color, for what a thread in the open lies on.
+    pub cloth: [u8; 3],
     /// Where the way from one part of an object to the next can't be out
     /// of sight, sew it over the stitches already there (round the inside
     /// of the fill's edge, or across it) instead of cutting the thread:
@@ -135,6 +396,10 @@ pub struct PlanOptions {
     /// checks: how narrow a column still sews cleanly depends on the fabric
     /// and thread, so the document says. (Stitches don't depend on it.)
     pub narrow_satin: f64,
+    /// Sew each stretch of objects that follow one another in the same
+    /// thread in a short travelling order rather than strictly as listed
+    /// (see [`shorten_travel`]). What's sewn on top of what never changes.
+    pub short_travel: bool,
 }
 
 impl Default for PlanOptions {
@@ -149,8 +414,11 @@ impl Default for PlanOptions {
             hat_order: false,
             over_sewn: false,
             connect: 0.0,
+            blend: 0.0,
+            cloth: [244, 241, 234],
             travel_route: 500.0,
             narrow_satin: 1.0,
+            short_travel: true,
         }
     }
 }
@@ -2460,24 +2728,28 @@ fn overlaps(a: &Bounds, b: &Bounds) -> bool {
 /// The shapes from `pos` in `order` that are, and the one satin they
 /// make: their subpaths one after another, [`Shape::joined`] saying how
 /// many are each's. `None` if fewer than two are.
-fn joined_satin(shapes: &[Shape], order: &[usize], pos: usize) -> Option<(Vec<usize>, Shape)> {
-    fn column(s: &Shape) -> Option<(&Vec<(Polyline, bool)>, f64)> {
-        let p = &s.params;
-        match &s.geometry {
-            Geometry::Stroke { lines, width }
-                if p.kind == Some(Kind::Satin)
-                    && !s.outline
-                    && !s.groups.is_empty()
-                    && p.start.is_none()
-                    && p.end.is_none()
-                    && p.colors.as_ref().is_none_or(|c| c.len() < 2)
-                    && satin::rails_from_subpaths(lines, p.satin_rails()).is_some() =>
-            {
-                Some((lines, *width))
-            }
-            _ => None,
+/// A two-rail satin column that may be sewn as one satin with the columns
+/// next to it (see [`joined_satin`]): its subpaths and width.
+fn satin_column(s: &Shape) -> Option<(&Vec<(Polyline, bool)>, f64)> {
+    let p = &s.params;
+    match &s.geometry {
+        Geometry::Stroke { lines, width }
+            if p.kind == Some(Kind::Satin)
+                && !s.outline
+                && !s.groups.is_empty()
+                && p.start.is_none()
+                && p.end.is_none()
+                && p.colors.as_ref().is_none_or(|c| c.len() < 2)
+                && satin::rails_from_subpaths(lines, p.satin_rails()).is_some() =>
+        {
+            Some((lines, *width))
         }
+        _ => None,
     }
+}
+
+fn joined_satin(shapes: &[Shape], order: &[usize], pos: usize) -> Option<(Vec<usize>, Shape)> {
+    let column = satin_column;
     let first = &shapes[*order.get(pos)?];
     let (_, width) = column(first)?;
     // (Settings but for what happens after: that's the last one's to say.)
@@ -2530,7 +2802,11 @@ fn joined_satin(shapes: &[Shape], order: &[usize], pos: usize) -> Option<(Vec<us
 fn sew_order(shapes: &[Shape], opt: &PlanOptions) -> Vec<usize> {
     let n = shapes.len();
     if !opt.hat_order {
-        return (0..n).collect();
+        let mut order: Vec<usize> = (0..n).collect();
+        if opt.short_travel {
+            shorten_travel(shapes, &mut order);
+        }
+        return order;
     }
     let bounds: Vec<Bounds> = shapes
         .iter()
@@ -2573,6 +2849,228 @@ fn sew_order(shapes: &[Shape], opt: &PlanOptions) -> Vec<usize> {
         order.push(pick);
     }
     order
+}
+
+/// The gap between two boxes (0 where they touch or overlap).
+fn box_gap(a: &Bounds, b: &Bounds) -> f64 {
+    let dx = (a.min.x - b.max.x).max(b.min.x - a.max.x).max(0.0);
+    let dy = (a.min.y - b.max.y).max(b.min.y - a.max.y).max(0.0);
+    dx.hypot(dy)
+}
+
+/// How far `p` is from the segment `a`–`b`.
+fn dist_to_segment(p: P, a: P, b: P) -> f64 {
+    let ab = b - a;
+    let len2 = ab.dot(ab);
+    let t = if len2 > 0.0 {
+        ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    a.lerp(b, t).dist(p)
+}
+
+/// How far apart two segments are (0 where they cross).
+fn segment_gap((a, b): (P, P), (c, d): (P, P)) -> f64 {
+    use crate::geom::cross;
+    let (d1, d2) = (cross(b - a, c - a), cross(b - a, d - a));
+    let (d3, d4) = (cross(d - c, a - c), cross(d - c, b - c));
+    if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+        return 0.0;
+    }
+    dist_to_segment(a, c, d)
+        .min(dist_to_segment(b, c, d))
+        .min(dist_to_segment(c, a, b))
+        .min(dist_to_segment(d, a, b))
+}
+
+/// A geometry's edges: a fill's outlines, a stroke's lines; and how far
+/// its stitches reach either side of them (half a stroke's width).
+fn edges(g: &Geometry) -> (Vec<(P, P)>, f64) {
+    let mut out = Vec::new();
+    let mut add = |l: &[P], closed: bool| {
+        out.extend(l.windows(2).map(|w| (w[0], w[1])));
+        if closed && l.len() > 2 {
+            out.push((l[l.len() - 1], l[0]));
+        }
+        if l.len() == 1 {
+            out.push((l[0], l[0]));
+        }
+    };
+    match g {
+        Geometry::Fill { rings, .. } => {
+            rings.iter().for_each(|r| add(r, true));
+            (out, 0.0)
+        }
+        Geometry::Stroke { lines, width } => {
+            lines.iter().for_each(|(l, closed)| add(l, *closed));
+            (out, width / 2.0)
+        }
+    }
+}
+
+/// How far apart two objects' stitches are: 0 where one is over the
+/// other (edges crossing, or one inside a fill).
+fn object_gap(a: &Geometry, b: &Geometry) -> f64 {
+    let inside = |f: &Geometry, o: &Geometry| match f {
+        Geometry::Fill { rings, rule } => {
+            let (e, _) = edges(o);
+            e.first()
+                .is_some_and(|&(p, _)| crate::geom::point_inside(rings, *rule, p))
+        }
+        Geometry::Stroke { .. } => false,
+    };
+    if inside(a, b) || inside(b, a) {
+        return 0.0;
+    }
+    let ((ea, wa), (eb, wb)) = (edges(a), edges(b));
+    let mut best = f64::INFINITY;
+    for &x in &ea {
+        for &y in &eb {
+            best = best.min(segment_gap(x, y));
+            if best == 0.0 {
+                return 0.0;
+            }
+        }
+    }
+    (best - wa - wb).max(0.0)
+}
+
+/// Objects nearer than this (units) may be over one another once sewn
+/// (pull compensation, underlay, a fill's edge stitches): their order is
+/// kept.
+const LAYERED: f64 = 5.0;
+
+/// Objects whose boxes are further apart than this (units) are told apart
+/// by their boxes alone: the exact gap matters only to choose among near
+/// ones.
+const NEAR: f64 = 100.0;
+
+/// Stretches longer than this are ordered by their boxes alone, without
+/// the exact gaps or 2-opt's passes, which grow with the square of the
+/// stretch.
+const TOUR_MAX: usize = 300;
+
+/// Reorder each stretch of `order` that's objects one after another in the
+/// same thread so the thread travels less between them: the open-path
+/// travelling-salesman heuristics, a nearest-neighbour tour (as the pieces
+/// of one object are chosen, in [`plan_shown`]) improved by 2-opt (Croes,
+/// 1958: reverse a stretch of the tour wherever that shortens it), the
+/// distance between two objects the gap between their stitches.
+///
+/// Only where nothing visible can change: two objects of a stretch that
+/// are over one another, or nearly (see [`LAYERED`]), keep their order
+/// (which is on top, and so what overlap removal cuts out of what), as
+/// [`sew_order`]'s cap order does; and the first of a stretch stays first.
+/// An object that says where it begins or ends, cuts or stops after it,
+/// sews more than one thread, is a satin column sewn as one satin with its
+/// neighbours, is turned off or has no geometry stays where it is and
+/// ends the stretch. Traced artwork lists a color's small pieces in the
+/// tracer's order, which jumps between them.
+fn shorten_travel(shapes: &[Shape], order: &mut [usize]) {
+    let bounds: Vec<Bounds> = shapes
+        .iter()
+        .map(|s| geometry_bounds(&s.geometry))
+        .collect();
+    let movable = |i: usize| {
+        let s = &shapes[i];
+        let p = &s.params;
+        p.kind != Some(Kind::Skip)
+            && p.start.is_none()
+            && p.end.is_none()
+            && p.trim != Some(true)
+            && p.stop != Some(true)
+            && p.colors.as_ref().is_none_or(|c| c.len() < 2)
+            && satin_column(s).is_none()
+            && !bounds[i].is_empty()
+    };
+    let mut at = 0;
+    while at < order.len() {
+        let mut end = at + 1;
+        if movable(order[at]) {
+            while end < order.len()
+                && movable(order[end])
+                && shapes[order[end]].color == shapes[order[at]].color
+            {
+                end += 1;
+            }
+        }
+        if end - at >= 3 {
+            short_tour(shapes, &bounds, &mut order[at..end]);
+        }
+        at = end;
+    }
+}
+
+/// [`shorten_travel`] for one stretch.
+fn short_tour(shapes: &[Shape], bounds: &[Bounds], stretch: &mut [usize]) {
+    let m = stretch.len();
+    let b: Vec<Bounds> = stretch.iter().map(|&i| bounds[i]).collect();
+    let exact = m <= TOUR_MAX;
+    // The gap between each two, and whether they must keep their order.
+    let mut gap = vec![vec![0.0; m]; m];
+    let mut over = vec![vec![false; m]; m];
+    for x in 0..m {
+        for y in x + 1..m {
+            let boxes = box_gap(&b[x], &b[y]);
+            let g = if !exact {
+                boxes
+            } else if boxes > NEAR.max(LAYERED) {
+                boxes
+            } else {
+                object_gap(&shapes[stretch[x]].geometry, &shapes[stretch[y]].geometry)
+            };
+            gap[x][y] = g;
+            gap[y][x] = g;
+            let o = if exact {
+                g <= LAYERED
+            } else {
+                boxes <= LAYERED
+            };
+            over[x][y] = o;
+            over[y][x] = o;
+        }
+    }
+    // Nearest neighbour, among those whose layered earlier ones are sewn.
+    let mut done = vec![false; m];
+    let mut tour = vec![0];
+    done[0] = true;
+    while tour.len() < m {
+        let here = *tour.last().unwrap();
+        let next = (0..m)
+            .filter(|&j| !done[j] && (0..j).all(|i| !over[i][j] || done[i]))
+            .min_by(|&x, &y| gap[here][x].total_cmp(&gap[here][y]).then(x.cmp(&y)))
+            .expect("layering only holds back later objects, so one is free");
+        done[next] = true;
+        tour.push(next);
+    }
+    // 2-opt: reverse tour[i..=k] where that's shorter, and where no two of
+    // those are layered (reversing would swap them).
+    if exact {
+        for _ in 0..m {
+            let mut better = false;
+            for i in 1..m - 1 {
+                for k in i + 1..m {
+                    let after_k = |x: usize| if k + 1 < m { gap[x][tour[k + 1]] } else { 0.0 };
+                    let before = gap[tour[i - 1]][tour[i]] + after_k(tour[k]);
+                    let after = gap[tour[i - 1]][tour[k]] + after_k(tour[i]);
+                    if after < before - 1e-6
+                        && !(i..=k).any(|x| (x + 1..=k).any(|y| over[tour[x]][tour[y]]))
+                    {
+                        tour[i..=k].reverse();
+                        better = true;
+                    }
+                }
+            }
+            if !better {
+                break;
+            }
+        }
+    }
+    let was: Vec<usize> = stretch.to_vec();
+    for (slot, &t) in stretch.iter_mut().zip(&tour) {
+        *slot = was[t];
+    }
 }
 
 /// Geometry each shape is actually stitched with, after overlap removal.
@@ -2867,6 +3365,8 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
             })
             .collect(),
         bridges: Vec::new(),
+        blends: Vec::new(),
+        routes: Vec::new(),
         stitch_shapes: Vec::new(),
         travels: Vec::new(),
         satin_columns: Vec::new(),
@@ -3083,6 +3583,63 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
         // them; and whether they're a bridge in the open.
         // (Which way the last travel it found was.)
         let how = std::cell::Cell::new(TravelHow::Across);
+        // What's been sewn before this shape, the last first: what a
+        // thread sewn across the open here would lie on (see `blends`).
+        let sewn_under: std::cell::OnceCell<Vec<(Bounds, Vec<Polyline>, FillRule, [u8; 3])>> =
+            std::cell::OnceCell::new();
+        // The way a gap can be sewn across because the thread blends into
+        // what it crosses: straight if that fits, or else round by what
+        // it's like in color (each stretch let go as far as its color
+        // allows, and the whole way within that). Remembered: orders are
+        // tried out from the same places over and over.
+        let blend_ways: RefCell<HashMap<[i64; 5], Option<Vec<P>>>> = RefCell::new(HashMap::new());
+        let blend_taken: RefCell<Option<Vec<P>>> = RefCell::new(None);
+        let blends = |prev: P, start: P, same_shape: bool| -> Option<Vec<P>> {
+            let gap = prev.dist(start);
+            if opt.blend <= 0.0 || gap > opt.blend.max(opt.connect) {
+                return None;
+            }
+            let key = [prev.x, prev.y, start.x, start.y, same_shape as u8 as f64]
+                .map(|v| (v * 4.0).round() as i64);
+            if let Some(hit) = blend_ways.borrow().get(&key) {
+                return hit.clone();
+            }
+            let under = sewn_under.get_or_init(|| {
+                order[..pos]
+                    .iter()
+                    .rev()
+                    .filter(|&&j| shapes[j].params.kind != Some(Kind::Skip))
+                    .filter_map(|&j| {
+                        let cover = covers.borrow_mut()[j]
+                            .get_or_insert_with(|| kept.coverage(&shapes[j]))
+                            .clone();
+                        let (rings, rule) = cover?;
+                        let mut b = Bounds::empty();
+                        rings.iter().flatten().for_each(|&q| b.add(q));
+                        Some((b, rings, rule, shapes[j].color))
+                    })
+                    .collect()
+            });
+            let ground = Backdrop {
+                under,
+                // (Coming to it from another object, none of it is sewn
+                // yet: there's nothing of its own to sew over.)
+                own: sr.area.as_ref().filter(|_| same_shape),
+                cloth: opt.cloth,
+                thread: shape.color,
+            };
+            let way = ground
+                .least_seen(
+                    prev,
+                    start,
+                    &|w| blend_reach(opt, w),
+                    opt.blend.max(opt.connect),
+                    1.0,
+                )
+                .map(|(line, _)| line);
+            blend_ways.borrow_mut().insert(key, way.clone());
+            way
+        };
         let mut connect =
             |prev: P, start: P, force_trim: bool, same_shape: bool| -> (Option<Vec<P>>, bool) {
                 let gap = prev.dist(start);
@@ -3324,6 +3881,15 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
                 if across.is_none() && gap <= opt.connect {
                     how.set(TravelHow::Open);
                     return (Some(straight()), true);
+                }
+                // Or where the thread doesn't show against what it crosses.
+                if across.is_none()
+                    && let Some(line) = blends(prev, start, same_shape)
+                {
+                    how.set(TravelHow::Blend);
+                    let way = sewn_along(&line);
+                    *blend_taken.borrow_mut() = Some(line);
+                    return (Some(way), false);
                 }
                 (across, false)
             };
@@ -3856,9 +4422,29 @@ fn plan_shown(name: &str, shapes: &[Shape], opt: &PlanOptions, cache: &mut PlanC
                 let mut trim_before = false;
                 let (travel_block, travel_run) = (block_index, block.runs.len().saturating_sub(1));
                 if let (Some(prev), Some(run)) = (cursor, block.runs.last_mut()) {
-                    let (mut across, bridged) = connect(prev, start, force_trim, same_shape);
+                    let (mut across, mut bridged) = connect(prev, start, force_trim, same_shape);
+                    // The way drawn for it by hand, from the object before:
+                    // sewn as drawn, whatever the planner would have done
+                    // (but a cut that's asked for is made).
+                    if !same_shape
+                        && !force_trim
+                        && let Some(via) = &shape.params.via
+                    {
+                        let mut line = vec![prev];
+                        line.extend(via.iter().map(|&(x, y)| P::new(x * 10.0, y * 10.0)));
+                        line.push(start);
+                        let way = sewn_along(&line);
+                        design.routes.push((si, line));
+                        across = Some(way);
+                        bridged = false;
+                        how.set(TravelHow::Routed);
+                    }
                     if bridged {
                         design.bridges.push((prev, start));
+                    } else if across.is_some() && how.get() == TravelHow::Blend {
+                        design
+                            .blends
+                            .push(blend_taken.take().unwrap_or_else(|| vec![prev, start]));
                     }
                     if across.is_none()
                         && !force_trim
@@ -5387,6 +5973,12 @@ impl Design {
         for (a, b) in &mut self.bridges {
             (*a, *b) = (*a - c, *b - c);
         }
+        for q in self.blends.iter_mut().flatten() {
+            *q = *q - c;
+        }
+        for q in self.routes.iter_mut().flat_map(|r| &mut r.1) {
+            *q = *q - c;
+        }
     }
 
     pub fn stitch_count(&self) -> usize {
@@ -6279,6 +6871,173 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_is_sewn_across_where_the_thread_blends_in() {
+        let red = [200, 0, 0];
+        // Two red squares 2 mm apart, on a backdrop sewn first. (The
+        // thread leaves the first at its far side: 10 mm back over its own
+        // red, then 2 mm of backdrop.)
+        let on = |backdrop: [u8; 3], opt: &PlanOptions| {
+            let under = shape(fill(sq(-50.0, -50.0, 400.0)), Kind::Fill, backdrop);
+            let a = shape(fill(sq(0.0, 0.0, 100.0)), Kind::Fill, red);
+            let b = shape(fill(sq(120.0, 0.0, 100.0)), Kind::Fill, red);
+            plan("p", &[under, a, b], opt)
+        };
+        let blend = PlanOptions {
+            blend: 150.0,
+            ..PlanOptions::default()
+        };
+        // Light red under it: the red thread goes across, and nothing
+        // says it shows.
+        let d = on([255, 120, 120], &blend);
+        let trims_light = d.trim_count();
+        assert_eq!(d.blends.len(), 1, "sewn across where it blends");
+        assert!(d.bridges.is_empty(), "not a bridge in plain view");
+        assert_eq!(crate::checks::exposed_travel(&d), []);
+        // Black under it: cut, as without.
+        let d = on([0, 0, 0], &blend);
+        assert!(d.blends.is_empty());
+        assert_eq!(d.trim_count(), trims_light + 1);
+        // And off, it's cut on anything.
+        let d = on([255, 120, 120], &PlanOptions::default());
+        assert!(d.blends.is_empty());
+        assert_eq!(d.trim_count(), trims_light + 1);
+        // How far it reaches falls off with how plainly it would show.
+        let reach = |a, b| blend_reach(&blend, contrast(a, b));
+        assert_eq!(reach(red, red), 150.0);
+        assert_eq!(reach([255; 3], [0; 3]), 0.0);
+        let (light, navy) = (
+            reach([255, 120, 120], red),
+            reach([20, 30, 90], [30, 80, 200]),
+        );
+        assert!((75.0..105.0).contains(&light), "{light}");
+        assert!(
+            navy > light,
+            "a darker shade of the same blue is nearer still"
+        );
+        // On bare cloth it's the cloth's color that counts.
+        let apart = |cloth: [u8; 3], thread: [u8; 3]| {
+            let a = shape(fill(sq(0.0, 0.0, 100.0)), Kind::Fill, thread);
+            let b = shape(fill(sq(120.0, 0.0, 100.0)), Kind::Fill, thread);
+            plan(
+                "p",
+                &[a, b],
+                &PlanOptions {
+                    cloth,
+                    ..blend.clone()
+                },
+            )
+            .blends
+            .len()
+        };
+        assert_eq!(
+            apart([250, 250, 250], [255, 255, 255]),
+            1,
+            "white on a white shirt"
+        );
+        assert_eq!(apart([250, 250, 250], [0, 0, 0]), 0, "black on white");
+    }
+
+    #[test]
+    fn a_gap_is_sewn_round_by_what_the_thread_is_like() {
+        let red = [200, 0, 0];
+        // Two small red squares 6 mm apart on a backdrop of nearly the
+        // same red, with a black bar lying between them, past both
+        // their tops and bottoms.
+        let bar = |x: f64, y: f64, w: f64, h: f64| {
+            fill(vec![
+                P::new(x, y),
+                P::new(x + w, y),
+                P::new(x + w, y + h),
+                P::new(x, y + h),
+            ])
+        };
+        let shapes = vec![
+            shape(fill(sq(-100.0, -100.0, 300.0)), Kind::Fill, [210, 10, 10]),
+            shape(bar(55.0, -30.0, 30.0, 90.0), Kind::Fill, [0, 0, 0]),
+            shape(fill(sq(0.0, 0.0, 40.0)), Kind::Fill, red),
+            shape(fill(sq(100.0, 0.0, 40.0)), Kind::Fill, red),
+        ];
+        let off = plan("p", &shapes, &PlanOptions::default());
+        let blend = PlanOptions {
+            blend: 150.0,
+            ..PlanOptions::default()
+        };
+        let d = plan("p", &shapes, &blend);
+        assert_eq!(d.trim_count() + 1, off.trim_count(), "one cut saved");
+        assert_eq!(d.blends.len(), 1);
+        let way = &d.blends[0];
+        assert!(way.len() > 2, "not straight across: {way:?}");
+        // Round the bar, not over it: no stitch of the way on the black.
+        let on_bar = |q: P| q.x > 56.0 && q.x < 84.0 && q.y > -29.0 && q.y < 59.0;
+        for w in way.windows(2) {
+            for k in 0..=10 {
+                let q = w[0].lerp(w[1], k as f64 / 10.0);
+                assert!(!on_bar(q), "{q:?} of {way:?}");
+            }
+        }
+        let len: f64 = way.windows(2).map(|w| w[0].dist(w[1])).sum();
+        assert!(len <= 150.0 + 1e-6, "{len}");
+        assert_eq!(crate::checks::exposed_travel(&d), []);
+        // With the backdrop black too there's no way round: cut.
+        let mut dark = shapes.clone();
+        dark[0].color = [0, 0, 0];
+        let d = plan("p", &dark, &blend);
+        assert!(
+            !d.blends
+                .iter()
+                .any(|w| w.last().is_some_and(|q| (q.x - 100.0).abs() < 1.0)),
+            "{:?}",
+            d.blends
+        );
+    }
+
+    #[test]
+    fn the_thread_goes_the_way_its_drawn_by_hand() {
+        let a = shape(fill(sq(0.0, 0.0, 100.0)), Kind::Fill, [0; 3]);
+        let mut b = shape(fill(sq(400.0, 0.0, 100.0)), Kind::Fill, [0; 3]);
+        // 30 mm apart: cut.
+        let d = plan("p", &[a.clone(), b.clone()], &PlanOptions::default());
+        assert_eq!(d.trim_count(), 1);
+        // Drawn a way round, through two points: sewn through them, no cut.
+        b.params.via = Some(vec![(20.0, 30.0), (40.0, 30.0)]);
+        let d = plan("p", &[a.clone(), b.clone()], &PlanOptions::default());
+        assert_eq!(d.trim_count(), 0);
+        assert_eq!(d.routes.len(), 1);
+        assert_eq!(d.routes[0].0, 1);
+        let pts: Vec<P> = d.blocks[0]
+            .runs
+            .iter()
+            .flat_map(|r| r.pts.clone())
+            .collect();
+        for q in [P::new(200.0, 300.0), P::new(400.0, 300.0)] {
+            assert!(pts.iter().any(|p| p.dist(q) < 1.0), "through {q:?}");
+        }
+        // No stitch of it longer than a running stitch.
+        let i = pts
+            .iter()
+            .position(|p| p.dist(P::new(200.0, 300.0)) < 1.0)
+            .unwrap();
+        assert!(pts[i].dist(pts[i + 1]) <= 30.0 + 1e-6);
+        assert_eq!(
+            crate::checks::exposed_travel(&d),
+            [],
+            "the person's own way"
+        );
+        // None given: straight there. And a trim asked for is still made.
+        b.params.via = Some(Vec::new());
+        assert_eq!(
+            plan("p", &[a.clone(), b.clone()], &PlanOptions::default()).trim_count(),
+            0
+        );
+        let mut cut = a.clone();
+        cut.params.trim = Some(true);
+        assert_eq!(
+            plan("p", &[cut, b.clone()], &PlanOptions::default()).trim_count(),
+            1
+        );
+    }
+
+    #[test]
     fn trim_stop_and_connect_between_objects() {
         let a = shape(fill(sq(0.0, 0.0, 100.0)), Kind::Fill, [0; 3]);
         let b = shape(fill(sq(130.0, 0.0, 100.0)), Kind::Fill, [0; 3]);
@@ -6882,6 +7641,81 @@ mod tests {
             .flat_map(|r| &r.pts)
             .any(|p| p.x > 52.0 && p.x < 56.0 && p.y > 80.0 && p.y < 120.0);
         assert!(near_edge);
+    }
+
+    /// Two clusters of small same-thread pieces 20 mm apart, listed
+    /// alternately (as a tracer lists them): three 3 mm runs 1.5 mm apart
+    /// and a small fill in each.
+    fn two_clusters() -> Vec<Shape> {
+        let piece = |cluster: f64, k: usize| -> Shape {
+            if k == 3 {
+                return shape(fill(sq(cluster + 50.0, 0.0, 30.0)), Kind::Fill, [0, 0, 0]);
+            }
+            let x = cluster + 15.0 * k as f64;
+            stroke(&[(x, 0.0), (x, 30.0)], 1.0, Kind::Run)
+        };
+        (0..4)
+            .flat_map(|k| [piece(0.0, k), piece(200.0, k)])
+            .collect()
+    }
+
+    #[test]
+    fn small_pieces_of_one_thread_sew_cluster_by_cluster() {
+        let shapes = two_clusters();
+        let opt = PlanOptions {
+            connect: 30.0,
+            ..PlanOptions::default()
+        };
+        let listed = PlanOptions {
+            short_travel: false,
+            ..opt.clone()
+        };
+        let before = plan("t", &shapes, &listed);
+        let after = plan("t", &shapes, &opt);
+        assert_eq!(before.sew_order, (0..8).collect::<Vec<_>>());
+        assert!(before.trim_count() >= 6, "{} trims", before.trim_count());
+        assert_eq!(after.sew_order, vec![0, 2, 4, 6, 1, 3, 5, 7]);
+        assert_eq!(after.trim_count(), 1, "one jump between the clusters");
+    }
+
+    #[test]
+    fn same_thread_objects_over_one_another_keep_their_order() {
+        // Each cluster's pieces overlap: fills stacked a little apart, the
+        // second cluster 20 mm away. Every overlapping pair keeps its
+        // order; only which cluster comes when changes.
+        let shapes: Vec<Shape> = (0..3)
+            .flat_map(|k| {
+                let o = 10.0 * k as f64;
+                [0.0, 200.0].map(|x| shape(fill(sq(x + o, o, 40.0)), Kind::Fill, [0, 0, 0]))
+            })
+            .collect();
+        let d = plan("t", &shapes, &PlanOptions::default());
+        assert_eq!(d.sew_order, vec![0, 2, 4, 1, 3, 5]);
+        let pos = |i: usize| d.sew_order.iter().position(|&x| x == i).unwrap();
+        assert!(pos(0) < pos(2) && pos(2) < pos(4), "{:?}", d.sew_order);
+        assert!(pos(1) < pos(3) && pos(3) < pos(5), "{:?}", d.sew_order);
+        // All over one another: as listed, stitch for stitch.
+        let stack: Vec<Shape> = (0..4)
+            .map(|k| shape(fill(sq(10.0 * k as f64, 0.0, 40.0)), Kind::Fill, [0, 0, 0]))
+            .collect();
+        let off = PlanOptions {
+            short_travel: false,
+            ..PlanOptions::default()
+        };
+        let a = plan("t", &stack, &PlanOptions::default());
+        assert_eq!(a.sew_order, vec![0, 1, 2, 3]);
+        assert!(same_stitches(&a, &plan("t", &stack, &off)));
+    }
+
+    #[test]
+    fn an_object_that_cuts_or_stops_after_it_stays_where_it_is() {
+        let mut shapes = two_clusters();
+        shapes[3].params.trim = Some(true);
+        let d = plan("t", &shapes, &PlanOptions::default());
+        assert_eq!(d.sew_order[3], 3, "{:?}", d.sew_order);
+        // Each side of it is a stretch of its own, shortened.
+        assert_eq!(&d.sew_order[..3], &[0, 2, 1]);
+        assert_eq!(&d.sew_order[4..], &[4, 6, 5, 7]);
     }
 
     #[test]

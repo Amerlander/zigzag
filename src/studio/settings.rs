@@ -73,6 +73,12 @@ pub struct Prefs {
     pub folds: std::collections::BTreeMap<String, bool>,
     /// Keep a log of the tool calls agents make (see `agent_log`).
     pub agent_log: bool,
+    /// Keep the prompt the Agent panel's agent was given with each object
+    /// it makes, in the design (see `Document::set_prompt`).
+    pub agent_prompts: bool,
+    /// Keep each document's chats with the agent on this computer (see
+    /// `history`).
+    pub agent_history: bool,
     /// Look for a newer ZigZag when it opens (and once a day).
     pub auto_update: bool,
     /// The font text was last set in: what new text starts in.
@@ -96,6 +102,8 @@ impl Default for Prefs {
             agent_port: crate::mcp::DEFAULT_PORT,
             folds: Default::default(),
             agent_log: true,
+            agent_prompts: true,
+            agent_history: true,
             auto_update: true,
             last_font: None,
             advanced: true,
@@ -155,6 +163,12 @@ impl Prefs {
         if let Some(on) = v["agent_log"].as_bool() {
             p.agent_log = on;
         }
+        if let Some(on) = v["agent_prompts"].as_bool() {
+            p.agent_prompts = on;
+        }
+        if let Some(on) = v["agent_history"].as_bool() {
+            p.agent_history = on;
+        }
         if let Some(on) = v["auto_update"].as_bool() {
             p.auto_update = on;
         }
@@ -181,6 +195,8 @@ impl Prefs {
             "agent_port": self.agent_port,
             "sections": self.folds,
             "agent_log": self.agent_log,
+            "agent_prompts": self.agent_prompts,
+            "agent_history": self.agent_history,
             "auto_update": self.auto_update,
             "last_font": self.last_font,
             "advanced": self.advanced,
@@ -919,6 +935,85 @@ impl Studio {
             ui,
             "The agent the Agent panel talks to. Changing it starts a new chat.",
         );
+        // Its model and effort (also /model and /effort in its prompt).
+        let ctx = ui.ctx().clone();
+        let models = self.agent.models(&ctx);
+        let efforts = self.agent.efforts(&ctx);
+        let mut model = self.agent.model().map(str::to_string);
+        let mut effort = self.agent.effort().map(str::to_string);
+        let name_of = |m: &Option<String>| match m {
+            None => "Default".to_string(),
+            Some(id) => models
+                .iter()
+                .find(|x| x.id.eq_ignore_ascii_case(id))
+                .map_or(id.clone(), |x| x.name.clone()),
+        };
+        row(ui, "Model", |ui, lid| {
+            egui::ComboBox::from_id_salt("settings-agent-model")
+                .selected_text(name_of(&model))
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut model, None, "Default");
+                    for m in &models {
+                        ui.selectable_value(&mut model, Some(m.id.clone()), &m.name)
+                            .on_hover_text(&m.about);
+                    }
+                })
+                .response
+                .labelled_by(lid);
+        });
+        row(ui, "Effort", |ui, lid| {
+            egui::ComboBox::from_id_salt("settings-agent-effort")
+                .selected_text(effort.clone().unwrap_or_else(|| "Default".into()))
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut effort, None, "Default");
+                    for e in &efforts {
+                        ui.selectable_value(&mut effort, Some(e.clone()), e);
+                    }
+                })
+                .response
+                .labelled_by(lid);
+        });
+        note(
+            ui,
+            "Default is what the agent uses on its own. A change applies from the next message. Each agent keeps its own.",
+        );
+        row(ui, "Prompts", |ui, _| {
+            ui.checkbox(
+                &mut prefs.agent_prompts,
+                "Keep the prompt with what the agent makes",
+            );
+        });
+        note(
+            ui,
+            "Saved in the design with each object the agent adds, so it can look back at what was asked for. Shared files carry them too.",
+        );
+        let mut clear = false;
+        row(ui, "History", |ui, _| {
+            ui.checkbox(&mut prefs.agent_history, "Keep chats on this computer");
+            clear = ui
+                .add_enabled(self.agent.store.kept(), egui::Button::new("Clear History"))
+                .on_hover_text("Forget every kept chat")
+                .clicked();
+        });
+        note(
+            ui,
+            "Each design's chats with the agent, kept in ZigZag's settings folder (not in the file). A design's last chat comes back with it for a day; older ones are under the clock in the Agent panel.",
+        );
+        if clear {
+            self.agent.store.clear();
+            self.agent.forget_kept();
+            for t in &mut self.tabs.list {
+                t.chat.forget_kept();
+            }
+        }
+        if model.as_deref() != self.agent.model() {
+            self.agent.set_model(model, &ctx);
+        }
+        if effort.as_deref() != self.agent.effort() {
+            self.agent.set_effort(effort);
+        }
 
         group(ui, "Agent Server", false);
         row(ui, "Connections", |ui, _| {
@@ -998,6 +1093,7 @@ mod tests {
         assert!(p.advanced, "every setting, unless it's turned off");
         assert_eq!(p.appearance, Appearance::System);
         assert!(p.gpu && p.agent_server && p.agent_log && p.auto_update);
+        assert!(p.agent_prompts, "prompts kept unless it's turned off");
         assert!(p.fold_open("before-you-sew", true) && !p.fold_open("machine-details", false));
         assert_eq!(p.agent_port(), Some(crate::mcp::DEFAULT_PORT));
         assert_eq!(p.ui_size, 100);
@@ -1006,6 +1102,7 @@ mod tests {
         p.gpu = false;
         p.agent_port = 9000;
         p.agent_log = false;
+        p.agent_prompts = false;
         p.auto_update = false;
         p.set_fold("before-you-sew", false);
         p.set_fold("machine-details", true);

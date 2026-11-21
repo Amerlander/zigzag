@@ -163,6 +163,15 @@ pub fn exposed_travel(design: &Design) -> Vec<Exposed> {
     };
     let mut out = Vec::new();
     for t in &design.travels {
+        // (Sewn across what its thread blends into, by the document's
+        // leave: chosen for not showing, as the colors go.)
+        // (Or as drawn by hand: the person's own way for it.)
+        if matches!(
+            t.how,
+            crate::design::TravelHow::Blend | crate::design::TravelHow::Routed
+        ) {
+            continue;
+        }
         let Some(pts) = design
             .blocks
             .get(t.block)

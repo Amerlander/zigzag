@@ -139,7 +139,12 @@ impl AgentKind {
             AgentKind::Codex => "codex",
         }
     }
-    fn key(self) -> &'static str {
+    /// The agent a key ([`AgentKind::key`]) names.
+    pub fn from_key(k: &str) -> Option<AgentKind> {
+        AgentKind::ALL.into_iter().find(|a| a.key() == k)
+    }
+
+    pub fn key(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
@@ -158,12 +163,39 @@ pub enum Entry {
     Done(String),
     /// The notes pinned on the canvas that went with the prompt above.
     Notes(Vec<String>),
+    /// What a slash command did (or why it couldn't), in a quiet line.
+    Info(String),
+    /// Images that went with the prompt above (kept files).
+    Images(Vec<PathBuf>),
+    /// Optional changes the agent offered (`offer_choices`): ticked and
+    /// applied by the person. `applied`: what was, once it's been (an
+    /// earlier chat's card comes back closed, with none).
+    Choices {
+        title: String,
+        /// What the person is asked ("Which of these should I apply?").
+        question: String,
+        choices: Vec<Choice>,
+        applied: Option<Vec<String>>,
+    },
+}
+
+/// One of the changes on a card of choices.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Choice {
+    pub label: String,
+    /// What it gains and what it costs.
+    pub detail: String,
+    /// The tool calls that make it ([{tool, arguments}]).
+    pub steps: Value,
+    pub picked: bool,
 }
 
 /// Something the agent process reported.
 enum Event {
     Line(String),
     Stderr(String),
+    /// Everything it printed has been read.
+    Eof,
     Exit(Option<i32>),
 }
 
@@ -171,7 +203,41 @@ struct Run {
     child: Arc<Mutex<Child>>,
     rx: Receiver<Event>,
     stderr: Vec<String>,
+    /// How it ended, and when that was heard (its last lines may still be
+    /// on their way).
+    exit: Option<(Option<i32>, Instant)>,
+    /// Its output has been read to the end.
+    eof: bool,
+    /// Which agent it is (the one in use may be changed while it runs,
+    /// from another document).
+    kind: AgentKind,
+    /// It was started to carry on an earlier session.
+    resumed: bool,
 }
+
+/// An agent's words for "there's no such session to carry on".
+fn session_gone(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    let about = ["session", "conversation", "thread", "rollout", "resume"]
+        .iter()
+        .any(|w| m.contains(w));
+    let missing = [
+        "not found",
+        "no conversation found",
+        "no rollout",
+        "does not exist",
+        "no such",
+        "could not find",
+        "couldn't find",
+    ]
+    .iter()
+    .any(|w| m.contains(w));
+    about && missing
+}
+
+/// How long to wait for the last of its output once it has ended (something
+/// it started may be holding the pipe open).
+const LAST_WORDS: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub struct AgentState {
@@ -196,24 +262,549 @@ pub struct AgentState {
     pub open_steps: std::collections::HashSet<usize>,
     /// The user's login-shell PATH (GUI apps on macOS don't get it).
     path: Option<Option<String>>,
-    config: Option<PathBuf>,
+    pub(crate) config: Option<PathBuf>,
     /// Where each agent's program is (by [`AgentKind::index`]): `None`
     /// until looked up, then `Some(None)` if it isn't installed.
     pub found: [Option<Option<PathBuf>>; 2],
+    /// Images being made ready to attach, each for the prompt of the
+    /// document (a recovery number) it was dropped or pasted in.
+    pub(crate) attaching: Vec<(u32, Receiver<Result<PathBuf, String>>)>,
+    /// The document its calls go to (a recovery number), once it has
+    /// opened or switched to one itself while working.
+    pub follow: Option<u32>,
+    /// Stop was pressed (or the chat cleared) since the last frame: what
+    /// was waiting to go to the agent next doesn't.
+    pub stopped: bool,
     /// A lookup running off the UI thread: (login PATH, what was found).
     lookup: Option<Receiver<(Option<String>, [Option<PathBuf>; 2])>>,
+    /// The model chosen for each agent (by [`AgentKind::index`]); `None`
+    /// is the agent's own default.
+    pub model: [Option<String>; 2],
+    /// How hard each agent thinks; `None` is its own default.
+    pub effort: [Option<String>; 2],
+    /// Codex's models, as `codex debug models` lists them (once looked up).
+    /// What Codex says about itself (its models, the person's tool
+    /// servers), looked up off the UI thread once it's found.
+    codex_info: Option<CodexInfo>,
+    codex_rx: Option<Receiver<CodexInfo>>,
+    /// The slash command menu: the row picked, the prompt it was for, and
+    /// the prompt it was closed on (Esc) until that changes.
+    pub menu_sel: usize,
+    pub menu_for: String,
+    pub menu_closed: Option<String>,
+    /// The prompt of the turn running (what it makes is kept with it).
+    pub turn_prompt: Option<String>,
+    /// The agent `session` is with (a chat is continued only by that one).
+    session_kind: Option<AgentKind>,
+    /// Kept chats (see `history`).
+    pub store: crate::history::Store,
+    /// The id the document's chats are kept under, once known.
+    pub doc_key: Option<String>,
+    /// The kept chat this one is, and how many of its lines are written.
+    pub hist_id: Option<String>,
+    pub hist_saved: usize,
+    /// The session as last written to the index.
+    pub hist_session: Option<String>,
+    /// Its document's kept chats have been looked for.
+    pub hist_checked: bool,
+    /// The document's last chat, too old to come back by itself: offered.
+    pub earlier: Option<crate::history::Meta>,
+    /// Its turns before the last few are shown (else folded into a line).
+    pub show_earlier: bool,
+    /// Images attached to the prompt being written (kept files).
+    pub attach: Vec<PathBuf>,
+    /// The images going with the prompt being sent (for its command line).
+    sending_images: Vec<PathBuf>,
+    /// A prompt sent before what starting needs was looked up: it goes
+    /// once that's in (shown as working meanwhile).
+    deferred: Option<Deferred>,
+    /// Where the panel was last frame (an image dropped there is attached).
+    pub panel_rect: Option<Rect>,
 }
+
+/// A prompt waiting to start (see `AgentState::deferred`).
+struct Deferred {
+    addr: std::net::SocketAddr,
+    text: String,
+    images: Vec<PathBuf>,
+    ctx: egui::Context,
+}
+
+/// One document's conversation with the agent, parked with its tab while
+/// another is in front (see [`AgentState::swap_chat`]): what was said, the
+/// session to continue, a prompt being written, and a run still going.
+#[derive(Default)]
+pub struct Chat {
+    prompt: String,
+    log: Vec<Entry>,
+    session: Option<String>,
+    session_kind: Option<AgentKind>,
+    run: Option<Run>,
+    started: Option<Instant>,
+    work: Work,
+    calls: std::collections::HashMap<String, usize>,
+    open_steps: std::collections::HashSet<usize>,
+    turn_prompt: Option<String>,
+    deferred: Option<Deferred>,
+    doc_key: Option<String>,
+    hist_id: Option<String>,
+    hist_saved: usize,
+    hist_session: Option<String>,
+    hist_checked: bool,
+    earlier: Option<crate::history::Meta>,
+    show_earlier: bool,
+    attach: Vec<PathBuf>,
+}
+
+impl Chat {
+    /// An image attached while its document wasn't in front.
+    pub(crate) fn attach_later(&mut self, path: PathBuf) {
+        self.attach.push(path);
+    }
+
+    /// The kept chat it's showing, if it is one.
+    pub fn kept_id(&self) -> Option<&str> {
+        self.hist_id.as_deref()
+    }
+
+    /// History was cleared: it isn't a kept chat any more. What's on
+    /// screen stays but isn't written again; what's said after is kept.
+    pub fn forget_kept(&mut self) {
+        self.hist_id = None;
+        self.hist_saved = self.log.len();
+        self.earlier = None;
+    }
+
+    /// Its agent is working (or about to).
+    pub fn running(&self) -> bool {
+        self.run.is_some() || self.deferred.is_some()
+    }
+}
+
+/// A model an agent can run on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelInfo {
+    /// What its command line is given.
+    pub id: String,
+    pub name: String,
+    pub about: String,
+    /// The efforts it takes, least first.
+    pub efforts: Vec<String>,
+}
+
+/// Claude Code's efforts (`--effort`).
+const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// The efforts any Codex model takes (what's offered while its models,
+/// and theirs, aren't known).
+const CODEX_EFFORTS: [&str; 3] = ["low", "medium", "high"];
+
+/// Claude Code's model aliases: each the latest of its family.
+const CLAUDE_MODELS: [(&str, &str, &str); 4] = [
+    ("fable", "Fable", "The latest Fable model"),
+    ("opus", "Opus", "The latest Opus model"),
+    ("sonnet", "Sonnet", "The latest Sonnet model"),
+    ("haiku", "Haiku", "The latest Haiku model: the quickest"),
+];
+
+/// What Codex says about itself.
+#[derive(Clone, Debug, Default)]
+struct CodexInfo {
+    models: Vec<ModelInfo>,
+    /// The tool (MCP) servers it would start, from the person's own setup:
+    /// switched off for the panel's runs.
+    servers: Vec<String>,
+}
+
+/// The tool servers in `codex mcp list --json`, the ones switched on,
+/// by names that can be given on its command line.
+pub fn parse_codex_servers(json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["enabled"].as_bool() != Some(false))
+        .filter_map(|s| s["name"].as_str())
+        .filter(|n| {
+            !n.is_empty()
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The models in `codex debug models`'s JSON, those it lists for people.
+pub fn parse_codex_models(json: &str) -> Vec<ModelInfo> {
+    let Ok(v) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+    v["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["visibility"].as_str().is_none_or(|x| x == "list"))
+        .filter_map(|m| {
+            let id = m["slug"].as_str()?.to_string();
+            Some(ModelInfo {
+                name: m["display_name"].as_str().unwrap_or(&id).to_string(),
+                about: m["description"].as_str().unwrap_or("").to_string(),
+                efforts: m["supported_reasoning_levels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e["effort"].as_str().map(str::to_string))
+                    .collect(),
+                id,
+            })
+        })
+        .collect()
+}
+
+/// A prompt with images, as a line of Claude Code's streaming input: the
+/// text, then each image (PNG) inline.
+pub fn claude_message(text: &str, images: &[PathBuf]) -> String {
+    use base64::Engine;
+    let mut content = vec![serde_json::json!({ "type": "text", "text": text })];
+    for p in images {
+        if let Ok(bytes) = std::fs::read(p) {
+            content.push(serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                },
+            }));
+        }
+    }
+    let msg = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": content },
+    });
+    format!("{msg}\n")
+}
+
+/// End an agent's run and everything it started. The command it's run as
+/// may only launch the program that does the work (npm's `codex` is a Node
+/// script that starts Codex itself): ending just that would leave the work
+/// going, still connected to the studio and still holding its chat. So the
+/// run has a process group of its own (see `send_with`), and the whole
+/// group is asked to end, then made to a moment later. On Windows its
+/// process tree is ended.
+fn end_run(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    {
+        fn signal(group: &str, sig: &str) {
+            let _ = Command::new("kill")
+                .args([sig, "--", group])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let group = format!("-{pid}");
+        signal(&group, "-TERM");
+        let _ = child.kill();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            signal(&group, "-KILL");
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const NO_WINDOW: u32 = 0x0800_0000;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = child.kill();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pid, child.kill());
+    }
+}
+
+/// A card of choices (see [`Entry::Choices`]): the question asked, then a
+/// numbered row for each change (what it gains and costs under it),
+/// divided by lines. A click on a row is the choice, made at once (not
+/// while the agent works). Once made (or from an earlier chat), the one
+/// chosen keeps its mark and the rest fade. True when one is clicked (it's
+/// the one `picked`).
+fn choices_card(ui: &mut egui::Ui, e: &mut Entry, busy: bool) -> bool {
+    let Entry::Choices {
+        title,
+        question,
+        choices,
+        applied,
+    } = e
+    else {
+        return false;
+    };
+    let p = pal_ui(ui);
+    let open = applied.is_none();
+    let mut apply = false;
+    // One change on offer (and the way out): a question, and a button for
+    // each answer.
+    let keep = |c: &Choice| c.steps.as_array().is_none_or(|s| s.is_empty());
+    if choices.len() == 2 && keep(&choices[1]) && !keep(&choices[0]) {
+        egui::Frame::new()
+            .fill(p.hover)
+            .stroke(Stroke::new(1.0, p.separator))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::same(space::M as i8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let heading = if question.is_empty() {
+                    title.as_str()
+                } else {
+                    question.as_str()
+                };
+                clipped(ui, heading, PANEL_PT, p.text, 2);
+                if !choices[0].detail.is_empty() {
+                    ui.add_space(2.0);
+                    clipped(ui, &choices[0].detail, PANEL_PT - 1.0, p.secondary, 2);
+                }
+                ui.add_space(space::S);
+                match applied {
+                    Some(done) if done.is_empty() => {
+                        quiet(ui, "Offered earlier.");
+                    }
+                    Some(done) if done.first() == Some(&choices[1].label) => {
+                        quiet(ui, "Kept it as it is.");
+                    }
+                    Some(done) => {
+                        quiet(ui, format!("Done: {}.", done.join(", ")));
+                    }
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = space::S;
+                            let button =
+                                |ui: &mut egui::Ui, label: &str, fill: Color32, ink: Color32| {
+                                    let b = ui.add_enabled(
+                                        !busy,
+                                        egui::Button::new(
+                                            egui::RichText::new(label).size(PANEL_PT).color(ink),
+                                        )
+                                        .fill(fill)
+                                        .corner_radius(8)
+                                        .min_size(Vec2::new(0.0, 30.0)),
+                                    );
+                                    b.on_disabled_hover_text("Once the agent is done").clicked()
+                                };
+                            let yes = choices[0].label.clone();
+                            if button(ui, &yes, p.text, p.dock) {
+                                choices[0].picked = true;
+                                apply = true;
+                            }
+                            if button(ui, "Not now", p.dock, p.text) {
+                                choices[1].picked = true;
+                                apply = true;
+                            }
+                        });
+                    }
+                }
+            });
+        return apply;
+    }
+    egui::Frame::new()
+        .fill(p.hover)
+        .stroke(Stroke::new(1.0, p.separator))
+        .corner_radius(10)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let w = ui.available_width();
+            // The question, as the heading.
+            egui::Frame::new()
+                .inner_margin(egui::Margin::same(space::M as i8))
+                .show(ui, |ui| {
+                    ui.set_width(w - 2.0 * space::M);
+                    let heading = if question.is_empty() {
+                        title.as_str()
+                    } else {
+                        question.as_str()
+                    };
+                    clipped(ui, heading, PANEL_PT, p.text, 2);
+                });
+            // A row for each change.
+            let done: Vec<String> = applied.clone().unwrap_or_default();
+            for (k, c) in choices.iter_mut().enumerate() {
+                let line = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover()).0;
+                ui.painter().hline(
+                    line.x_range(),
+                    line.center().y,
+                    Stroke::new(1.0, p.separator),
+                );
+                let marked = if open {
+                    c.picked
+                } else {
+                    done.contains(&c.label)
+                };
+                let faded = !open && !marked;
+                let bg = ui.painter().add(egui::Shape::Noop);
+                let row = ui
+                    .scope_builder(
+                        egui::UiBuilder::new().sense(if open && !busy {
+                            Sense::click()
+                        } else {
+                            Sense::hover()
+                        }),
+                        |ui| {
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin {
+                                    left: (space::M + BADGE + 12.0) as i8,
+                                    right: (space::M + 22.0) as i8,
+                                    top: (space::S + 3.0) as i8,
+                                    bottom: (space::S + 3.0) as i8,
+                                })
+                                .show(ui, |ui| {
+                                    ui.set_width(w - 2.0 * space::M - BADGE - 12.0 - 22.0);
+                                    let ink =
+                                        |c: Color32| if faded { c.gamma_multiply(0.5) } else { c };
+                                    clipped(ui, &c.label, PANEL_PT, ink(p.text), 1);
+                                    if !c.detail.is_empty() {
+                                        ui.add_space(2.0);
+                                        clipped(ui, &c.detail, PANEL_PT - 1.0, ink(p.secondary), 2);
+                                    }
+                                });
+                        },
+                    )
+                    .response;
+                row.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::Role::Button, open, marked, &c.label)
+                });
+                let r = row.rect;
+                if marked || (open && !busy && row.hovered()) {
+                    let fill = if marked {
+                        p.accent.gamma_multiply(0.18)
+                    } else {
+                        p.dock.gamma_multiply(0.6)
+                    };
+                    ui.painter().set(bg, egui::Shape::rect_filled(r, 0.0, fill));
+                }
+                // Its number, in a badge: filled when it's chosen.
+                let badge = Rect::from_min_size(
+                    egui::pos2(r.left() + space::M, r.center().y - BADGE / 2.0),
+                    Vec2::splat(BADGE),
+                );
+                let (fill, ink) = if marked && !faded {
+                    (p.accent, Color32::WHITE)
+                } else if faded {
+                    (p.dock, p.secondary.gamma_multiply(0.6))
+                } else {
+                    (p.dock, p.secondary)
+                };
+                ui.painter().rect_filled(badge, 6.0, fill);
+                ui.painter().text(
+                    badge.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}", k + 1),
+                    egui::FontId::proportional(PANEL_PT - 1.0),
+                    ink,
+                );
+                if marked {
+                    icons::paint(
+                        ui.painter(),
+                        Rect::from_center_size(
+                            egui::pos2(r.right() - space::M - 6.0, r.center().y),
+                            Vec2::splat(13.0),
+                        ),
+                        Icon::Check,
+                        if faded { p.secondary } else { p.accent },
+                    );
+                }
+                // A click is the choice: made at once.
+                if open && busy {
+                    row.on_hover_text("Once the agent is done");
+                } else if open
+                    && row
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                {
+                    c.picked = true;
+                    apply = true;
+                }
+            }
+        });
+    apply
+}
+
+/// Text wrapped to the room there is, `rows` lines at most (cut with an
+/// ellipsis, the whole of it on hover): a card of choices keeps short.
+fn clipped(ui: &mut egui::Ui, text: &str, size: f32, color: Color32, rows: usize) {
+    let mut job = egui::text::LayoutJob::simple(
+        text.to_string(),
+        egui::FontId::proportional(size),
+        color,
+        ui.available_width(),
+    );
+    job.wrap.max_rows = rows;
+    job.wrap.break_anywhere = false;
+    job.wrap.overflow_character = Some('…');
+    let galley = ui.painter().layout_job(job);
+    let cut = galley.elided;
+    let r = ui.add(egui::Label::new(galley).selectable(false));
+    if cut {
+        r.on_hover_text(text);
+    }
+}
+
+/// A choice's number badge, points square.
+const BADGE: f32 = 22.0;
+
+/// The turns a chat shows; earlier ones fold into a line.
+const SHOWN_TURNS: usize = 3;
 
 /// Extra instructions for the agent, on top of the MCP server's own.
 const BRIEF: &str = "You are the design agent inside ZigZag, a machine-embroidery editor. \
 The person is watching the canvas while you work. Make the design they ask for on the open document \
 using the ZigZag MCP tools (get_design first; add_svg for artwork you write as SVG, add_text for lettering, \
 transform_objects to size and place, set_object for stitch types and thread colors). Keep everything inside the hoop. \
-Embroidery wants bold, simple shapes: no gradients, no hairlines, few colors, nothing smaller than about 1.5 mm. \
-After making changes, call render_preview to look at the stitches and fix problems, then check_design. \
+Draw with as much detail as the subject needs and the size allows: thread sets minimums, not a style. \
+A filled detail needs to be at least about 1.5 mm across and a satin column 1 to 7 mm wide; finer lines \
+(features, creases, outlines) are thin strokes, which sew as running stitch. A gradient sews as one thread color, \
+so shade with separate shapes in a few related colors instead. Build a drawing in layers as an illustrator would: \
+base shapes, then shading and highlights laid on top, then lines; trace curves with real bezier curves, not a few \
+straight points. If a subject needs more detail than its size can hold, make it bigger rather than leave the detail out. \
+Pass terse: true on tools that change the design (the short answer names what was added and any new problems; get_design has the rest when you need it). \
+After making changes, call render_preview to look at the stitches, and with artwork true to see your drawing itself; \
+zoom in with region or object to check the details, refine what looks crude. \
+Before you finish, call review_design: it reviews the design as an embroiderer would (thread changes, trims and what \
+causes them, pieces too small to read, threads that won't show on the fabric or can't be told apart) and shows it at \
+about its real size. Fix what it finds that you can without taking out shading, highlights or features: try the stitch \
+types it suggests (a narrow band as satin) and the fill angles it suggests (rows along a piece's length for flow, \
+touching pieces set apart for dimension), keeping each change that reads better close up. Review again, \
+and say in your summary what it costs to sew (threads, trims). Ask the person to choose only when there really are different ways to go or a trade-off that's theirs to weigh (fewer stops to cut the thread against some thread showing, two looks that are both fine): most replies need no choice, and when one way is clearly better and costs nothing they'd see, just do it. An optional change worth their while is always offered, never only mentioned in your summary (not \"optional X could …; I left it unchanged\"): one such change is offered as one choice, which shows as a question with a button for it and one for Not now. Then, at most one question in a reply, it goes to them with offer_choices: your question and a few options, each with its exact steps; they click one and it's made (an option to do them all, and one to keep it as it is, are added for you). Keep it short, so it fits the panel: up to four options, each a few words with one short sentence under it. Write it so a beginner understands the impact: each option in everyday words, and what they'd see on the fabric and what it means for sewing (\"the machine stops to cut the thread 27 times instead of 89, so it sews faster, but a few short lines of thread will show on the trunk\"), no setting names or unexplained jargon. Don't make those changes yourself, and don't only describe them. \
+When they ask to clean up, refine, improve or add detail to something already there, work from what's there: \
+look at it close up first (render_preview with artwork and object), keep what's good about its shapes and improve them \
+(edit_path to reshape, set_object for its stitching) and add layers on top (shading, highlights, fur or feather lines, \
+small features); never replace it with a simpler version. Compare the artwork after with before: it should end with \
+at least as much detail as it began with, unless they asked for it simpler. \
 When they ask for options, alternatives or a few versions, make them with start_variants and save_variant: \
 the person sees them side by side with the original and picks one (show_comparison shows them again, or puts them away). \
 Don't save or export unless asked. Finish with one or two sentences on what you made.";
+
+/// For an agent that can generate images (Codex): draw pictures by
+/// generating one and tracing it, which often beats hand-written SVG.
+const IMAGE_BRIEF: &str = "For a pictorial subject (an animal, a person or character, a scene, a detailed object), generate an image and trace it rather than writing its SVG yourself: traced shapes are far more natural and detailed than hand-written ones. That goes for a picture already in the design that should be more detailed or more natural too: generate a new image that matches it (its pose, proportions and colors, from a close look at it), trace it at the old one's size and place, and delete the old one once the new one is in. Make the image for sewing, not for the screen. Every color is a thread change and every separate piece of a color is a jump the machine trims, so first read the design's threads (get_design) and ask for the picture in those exact colors, giving their hex values; add a new color only where the subject can't do without it, and then a shade near one already in the design where you can (a tan beside a cream, not a new brown). Shading and highlights are wanted: they're what makes a picture look drawn rather than cut out. Ask for them as solid shapes in darker and lighter shades of its base colors (a design thread a shade off where there is one), such as a shadow down a flank, a lighter muzzle or the far legs in a darker tone, each a clear shape of its own rather than a gradient, mottling or many small flecks. Ask for a flat illustration in solid colors, at most 6 to 8 in all, no gradients, textures, cast shadows, outlines in a color of their own or fine hatching; each color in clear shapes, not scattered specks; bold shapes with clean edges; the subject alone on a plain white background. Then call trace_image with the image's absolute path, palette \"design\" (so its colors become the design's threads), threads for the machine's thread chart (for any new color), lines true if it has line details, and width_mm, x_mm and y_mm for its size and place. Its answer gives new_colors and the trims before and after: recolor a piece in a color that isn't needed to the design thread it's nearest (set_object color). To bring trims down, delete only stray bits and specks too small to sew; never take out shading, highlights or features to save trims: a few more trims for a picture that reads well is the right trade. Change the document's connect_mm or over_sewn only as review_design's what_ifs say: one that saves trims without showing (shows false) you set, and say so; one whose thread shows is the person's to choose, so offer it with offer_choices, saying what it saves and what shows. Then look at it close up with render_preview's artwork and region, and fix what the trace got wrong (stray bits, colors, stitch types). Write SVG yourself for logos, badges, lettering and simple geometric shapes, where exact shapes matter.";
+
+impl AgentKind {
+    /// The brief for this agent: what it can do on top of the tools.
+    fn brief(self) -> String {
+        match self {
+            AgentKind::Claude => BRIEF.to_string(),
+            AgentKind::Codex => format!("{BRIEF} {IMAGE_BRIEF}"),
+        }
+    }
+}
 
 /// PATH from the login shell, so `claude` and `codex` (and node) are found
 /// even when the app is opened from Finder.
@@ -296,18 +887,27 @@ impl AgentState {
     /// The agent last used, remembered between launches.
     pub fn load() -> AgentState {
         let config = crate::dock::config_file("agent.json");
-        let kind = config
+        let v = config
             .as_ref()
             .and_then(|f| std::fs::read_to_string(f).ok())
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .map(|v| match v["agent"].as_str() {
-                Some("claude") => AgentKind::Claude,
-                _ => AgentKind::Codex,
+            .unwrap_or(Value::Null);
+        let kind = match v["agent"].as_str() {
+            Some("claude") => AgentKind::Claude,
+            _ => AgentKind::Codex,
+        };
+        let per = |key: &str| {
+            AgentKind::ALL.iter().fold([None, None], |mut out, k| {
+                out[k.index()] = v[key][k.key()].as_str().map(str::to_string);
+                out
             })
-            .unwrap_or_default();
+        };
         AgentState {
             kind,
             config,
+            model: per("model"),
+            effort: per("effort"),
+            store: crate::history::Store::usual(),
             ..Default::default()
         }
     }
@@ -317,14 +917,272 @@ impl AgentState {
         if let Some(dir) = f.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        let per = |v: &[Option<String>; 2]| {
+            let mut m = serde_json::Map::new();
+            for k in AgentKind::ALL {
+                if let Some(x) = &v[k.index()] {
+                    m.insert(k.key().into(), Value::String(x.clone()));
+                }
+            }
+            Value::Object(m)
+        };
         let _ = std::fs::write(
             f,
-            serde_json::json!({ "agent": self.kind.key() }).to_string(),
+            serde_json::json!({
+                "agent": self.kind.key(),
+                "model": per(&self.model),
+                "effort": per(&self.effort),
+            })
+            .to_string(),
         );
     }
 
+    /// The model chosen for the agent in use (`None`: its default).
+    pub fn model(&self) -> Option<&str> {
+        self.model[self.kind.index()].as_deref()
+    }
+
+    /// The effort chosen for the agent in use (`None`: its default).
+    pub fn effort(&self) -> Option<&str> {
+        self.effort[self.kind.index()].as_deref()
+    }
+
+    /// Choose the model for the agent in use (from the next message;
+    /// remembered). An effort it doesn't take goes back to the default.
+    /// What to say about it, if anything.
+    pub fn set_model(&mut self, model: Option<String>, ctx: &egui::Context) -> Option<String> {
+        self.model[self.kind.index()] = model;
+        let mut said = None;
+        if let Some(e) = self.effort().map(str::to_string)
+            && !self.efforts(ctx).contains(&e)
+        {
+            self.effort[self.kind.index()] = None;
+            said = Some(format!(
+                "This model doesn't take effort {e}: back to its default."
+            ));
+        }
+        self.save();
+        said
+    }
+
+    /// Choose the effort for the agent in use (remembered).
+    pub fn set_effort(&mut self, effort: Option<String>) {
+        self.effort[self.kind.index()] = effort;
+        self.save();
+    }
+
+    /// The models the agent in use can run on. Codex's are looked up from
+    /// it (off the UI thread): none until that's done, or if it can't say.
+    pub fn models(&mut self, ctx: &egui::Context) -> Vec<ModelInfo> {
+        match self.kind {
+            AgentKind::Claude => CLAUDE_MODELS
+                .iter()
+                .map(|&(id, name, about)| ModelInfo {
+                    id: id.into(),
+                    name: name.into(),
+                    about: about.into(),
+                    efforts: CLAUDE_EFFORTS.map(str::to_string).to_vec(),
+                })
+                .collect(),
+            AgentKind::Codex => {
+                self.codex_lookup(Some(ctx));
+                self.codex_info
+                    .as_ref()
+                    .map(|i| i.models.clone())
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// Look Codex's models and tool servers up (once, off the UI thread),
+    /// and take the answer if it's come.
+    fn codex_lookup(&mut self, ctx: Option<&egui::Context>) {
+        if let Some(rx) = &self.codex_rx
+            && let Ok(info) = rx.try_recv()
+        {
+            self.codex_info = Some(info);
+            self.codex_rx = None;
+        }
+        if self.codex_info.is_some() || self.codex_rx.is_some() {
+            return;
+        }
+        let Some(program) = self.find(AgentKind::Codex) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let path = self.shell_path();
+        let ctx = ctx.cloned();
+        std::thread::spawn(move || {
+            let run = |args: &[&str]| {
+                let mut cmd = Command::new(&program);
+                cmd.args(args).stdin(Stdio::null()).stderr(Stdio::null());
+                if let Some(p) = &path {
+                    cmd.env("PATH", p);
+                }
+                cmd.output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default()
+            };
+            // (The two side by side, each most of a second: models, then
+            // servers, as runs see them, plugins off: a plugin's own server
+            // named on the command line reads as a broken entry in the
+            // person's config, and Codex won't start.)
+            let servers = std::thread::scope(|sc| {
+                let servers = sc.spawn(|| {
+                    run(&[
+                        "-c",
+                        "features.plugins=false",
+                        "-c",
+                        "features.apps=false",
+                        "mcp",
+                        "list",
+                        "--json",
+                    ])
+                });
+                let models = run(&["debug", "models"]);
+                (models, servers.join().unwrap_or_default())
+            });
+            let info = CodexInfo {
+                models: parse_codex_models(&servers.0),
+                // (Listed as runs see them, plugins off: a plugin's own
+                // server named on the command line reads as a broken
+                // entry in the person's config, and Codex won't start.)
+                servers: parse_codex_servers(&servers.1),
+            };
+            let _ = tx.send(info);
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+        self.codex_rx = Some(rx);
+    }
+
+    /// The person's own Codex tool servers, to switch off for a run:
+    /// waited for (briefly) if the lookup hasn't answered yet.
+    fn codex_servers(&mut self) -> Vec<String> {
+        self.codex_lookup(None);
+        if self.codex_info.is_none()
+            && let Some(rx) = self.codex_rx.take()
+        {
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(info) => self.codex_info = Some(info),
+                Err(_) => self.codex_rx = Some(rx),
+            }
+        }
+        self.codex_info
+            .as_ref()
+            .map(|i| i.servers.clone())
+            .unwrap_or_default()
+    }
+
+    /// The efforts the agent in use takes, on its chosen model (or on any
+    /// of them, when it's on its default).
+    pub fn efforts(&mut self, ctx: &egui::Context) -> Vec<String> {
+        let models = self.models(ctx);
+        let chosen = self.model().map(str::to_string);
+        let mut out: Vec<String> = Vec::new();
+        for m in models.iter().filter(|m| {
+            chosen
+                .as_ref()
+                .is_none_or(|c| c.eq_ignore_ascii_case(&m.id))
+        }) {
+            for e in &m.efforts {
+                if !out.contains(e) {
+                    out.push(e.clone());
+                }
+            }
+        }
+        if out.is_empty() {
+            // (Not known yet, or a model named in full: the levels every
+            // model of that agent takes.)
+            out = match self.kind {
+                AgentKind::Claude => CLAUDE_EFFORTS.map(str::to_string).to_vec(),
+                AgentKind::Codex => CODEX_EFFORTS.map(str::to_string).to_vec(),
+            };
+        }
+        out
+    }
+
     pub fn running(&self) -> bool {
-        self.run.is_some()
+        self.run.is_some() || self.deferred.is_some()
+    }
+
+    /// Swap the conversation in front with a parked one (another
+    /// document's): the agent, its settings and the panel stay.
+    pub fn swap_chat(&mut self, c: &mut Chat) {
+        use std::mem::swap;
+        swap(&mut self.prompt, &mut c.prompt);
+        swap(&mut self.log, &mut c.log);
+        swap(&mut self.session, &mut c.session);
+        swap(&mut self.session_kind, &mut c.session_kind);
+        swap(&mut self.run, &mut c.run);
+        swap(&mut self.started, &mut c.started);
+        swap(&mut self.work, &mut c.work);
+        swap(&mut self.calls, &mut c.calls);
+        swap(&mut self.open_steps, &mut c.open_steps);
+        swap(&mut self.turn_prompt, &mut c.turn_prompt);
+        swap(&mut self.deferred, &mut c.deferred);
+        swap(&mut self.doc_key, &mut c.doc_key);
+        swap(&mut self.hist_id, &mut c.hist_id);
+        swap(&mut self.hist_saved, &mut c.hist_saved);
+        swap(&mut self.hist_session, &mut c.hist_session);
+        swap(&mut self.hist_checked, &mut c.hist_checked);
+        swap(&mut self.earlier, &mut c.earlier);
+        swap(&mut self.show_earlier, &mut c.show_earlier);
+        swap(&mut self.attach, &mut c.attach);
+    }
+
+    /// History was cleared: see [`Chat::forget_kept`].
+    pub fn forget_kept(&mut self) {
+        self.hist_id = None;
+        self.hist_saved = self.log.len();
+        self.earlier = None;
+    }
+
+    /// Continue `session` (an earlier chat's), with the agent it was with.
+    pub fn resume(&mut self, session: Option<String>, kind: AgentKind) {
+        self.session = session;
+        self.session_kind = Some(kind);
+    }
+
+    /// The document in front is another now (one opened into this tab):
+    /// its kept chats are looked for afresh.
+    pub fn forget_document(&mut self) {
+        self.doc_key = None;
+        self.hist_checked = false;
+        self.earlier = None;
+    }
+
+    /// The agent the session being carried on is with.
+    pub(crate) fn session_kind(&self) -> Option<AgentKind> {
+        self.session_kind
+    }
+
+    /// Stop the agent working in a document that isn't in front (its
+    /// chat says so when it comes forward).
+    pub fn stop_parked(&mut self, c: &mut Chat) {
+        let stopped = self.stopped;
+        self.swap_chat(c);
+        self.stop();
+        self.swap_chat(c);
+        // (Not the chat in front's Stop.)
+        self.stopped = stopped;
+    }
+
+    /// As if a prompt were running (a process that waits; `stop` ends it).
+    #[cfg(test)]
+    pub fn start_fake_run(&mut self) {
+        let child = Command::new("sleep").arg("30").spawn().expect("sleep");
+        let (_tx, rx) = mpsc::channel();
+        self.run = Some(Run {
+            child: Arc::new(Mutex::new(child)),
+            rx,
+            stderr: Vec::new(),
+            exit: None,
+            eof: false,
+            kind: self.kind,
+            resumed: false,
+        });
     }
 
     /// What it's doing now: the step of a tool call still running, else thinking.
@@ -336,11 +1194,26 @@ impl AgentState {
     }
 
     pub fn stop(&mut self) {
+        if self.deferred.take().is_some() {
+            self.log.push(Entry::Error("Stopped.".into()));
+        }
         if let Some(r) = self.run.take() {
             if let Ok(mut c) = r.child.lock() {
-                let _ = c.kill();
+                end_run(&mut c);
             }
+            self.settle(false);
             self.log.push(Entry::Error("Stopped.".into()));
+        }
+        self.stopped = true;
+    }
+
+    /// The run is over: a step still marked as running isn't (it would
+    /// spin for good). `ok`: how the run ended.
+    fn settle(&mut self, ok: bool) {
+        for e in &mut self.log {
+            if let Entry::Tool(_, _, state @ None) = e {
+                *state = Some(ok);
+            }
         }
     }
 
@@ -359,6 +1232,10 @@ impl AgentState {
         self.calls.clear();
         self.open_steps.clear();
         self.session = None;
+        self.hist_id = None;
+        self.hist_saved = 0;
+        self.earlier = None;
+        self.show_earlier = false;
     }
 
     /// PATH from the login shell (looked up once).
@@ -437,9 +1314,18 @@ impl AgentState {
                     .args(["--mcp-config", &config.to_string(), "--strict-mcp-config"])
                     // Only the design tools: no shell, no file edits.
                     .args(["--tools", "", "--allowedTools", "mcp__zigzag"])
-                    .args(["--append-system-prompt", BRIEF]);
+                    .args(["--append-system-prompt", &AgentKind::Claude.brief()]);
                 if let Some(s) = &self.session {
                     cmd.args(["--resume", s]);
+                }
+                if let Some(m) = self.model() {
+                    cmd.args(["--model", m]);
+                }
+                if let Some(e) = self.effort() {
+                    cmd.args(["--effort", e]);
+                }
+                if !self.sending_images.is_empty() {
+                    cmd.args(["--input-format", "stream-json"]);
                 }
             }
             AgentKind::Codex => {
@@ -448,6 +1334,33 @@ impl AgentState {
                     cmd.args(["resume", s]);
                 }
                 cmd.args(["--json", "--skip-git-repo-check"]);
+                // (Joined to their option, so none is taken for the prompt.)
+                for p in &self.sending_images {
+                    cmd.arg(format!("--image={}", p.display()));
+                }
+                // Only ZigZag's tools, as Claude Code is given: none of the
+                // person's own plugins, apps or tool servers (a browser, a
+                // JS runner…), which go off looking for things on the web
+                // and fail in ways that read as ZigZag's. (A setting this
+                // Codex doesn't know is ignored.)
+                for f in ["plugins", "apps", "browser_use", "computer_use"] {
+                    cmd.arg("-c").arg(format!("features.{f}=false"));
+                }
+                for name in self.codex_servers() {
+                    if name != "zigzag" {
+                        cmd.arg("-c")
+                            .arg(format!("mcp_servers.{name}.enabled=false"));
+                    }
+                }
+                if let Some(m) = self.model() {
+                    cmd.args(["-m", m]);
+                }
+                if let Some(e) = self.effort() {
+                    cmd.arg("-c").arg(format!(
+                        "model_reasoning_effort={}",
+                        Value::String(e.into())
+                    ));
+                }
                 // Codex starts MCP servers as commands: the stdio bridge.
                 match bridge {
                     Some(b) => {
@@ -455,8 +1368,9 @@ impl AgentState {
                             "mcp_servers.zigzag.command={}",
                             Value::String(b.to_string_lossy().into())
                         ));
-                        cmd.arg("-c")
-                            .arg(format!("mcp_servers.zigzag.args=[\"--port\", \"{port}\"]"));
+                        cmd.arg("-c").arg(format!(
+                            "mcp_servers.zigzag.args=[\"--port\", \"{port}\", \"--panel\"]"
+                        ));
                     }
                     None => {
                         cmd.arg("-c").arg(format!(
@@ -509,26 +1423,101 @@ impl AgentState {
         extra: &str,
     ) {
         let text = self.prompt.trim().to_string();
-        if (text.is_empty() && extra.is_empty()) || self.running() {
+        if (text.is_empty() && extra.is_empty() && self.attach.is_empty()) || self.running() {
             return;
         }
         if !text.is_empty() {
             self.log.push(Entry::You(text.clone()));
         }
+        let images = std::mem::take(&mut self.attach);
+        if !images.is_empty() {
+            self.log.push(Entry::Images(images.clone()));
+        }
         if !notes.is_empty() {
             self.log.push(Entry::Notes(notes));
         }
-        let text = match (text.is_empty(), extra.is_empty()) {
+        let mut text = match (text.is_empty(), extra.is_empty()) {
             (_, true) => text,
             (true, false) => extra.to_string(),
             (false, false) => format!("{text}\n\n{extra}"),
         };
+        // The images are seen, and named: trace_image takes a file.
+        if !images.is_empty() {
+            let files: Vec<String> = images.iter().map(|p| p.display().to_string()).collect();
+            text = format!(
+                "{text}{}The person attached {} (also saved as {}): you can see {}, and trace_image can trace {} into stitches.",
+                if text.is_empty() { "" } else { "\n\n" },
+                if images.len() == 1 {
+                    "an image".to_string()
+                } else {
+                    format!("{} images", images.len())
+                },
+                files.join(", "),
+                if images.len() == 1 { "it" } else { "them" },
+                if images.len() == 1 { "it" } else { "one" },
+            );
+        }
         let Some(addr) = mcp else {
             self.log.push(Entry::Error(
                 "The agent works through the studio's MCP server, which is off (started with --no-mcp).".into(),
             ));
             return;
         };
+        // A chat begun with the other agent (another document's, say): this
+        // one can't continue that session, so it starts its own.
+        if self.session_kind != Some(self.kind) {
+            self.session = None;
+            self.session_kind = Some(self.kind);
+        }
+        // Where its program is and (Codex) the person's tool servers are
+        // looked up off the UI thread (see `warm_up`): until they're in, the
+        // send waits, shown as working, and goes the moment they are.
+        self.prompt.clear();
+        self.started = Some(Instant::now());
+        if self.ready_to_start(ctx) {
+            self.launch(addr, text, images, ctx);
+        } else {
+            self.deferred = Some(Deferred {
+                addr,
+                text,
+                images,
+                ctx: ctx.clone(),
+            });
+        }
+    }
+
+    /// Look up, off the UI thread, what starting an agent needs: the login
+    /// PATH and where each agent's program is, then Codex's models and the
+    /// person's tool servers. Cheap once known; called every frame.
+    pub fn warm_up(&mut self, ctx: &egui::Context) {
+        let _ = self.installed(self.kind, ctx);
+        if self.found[AgentKind::Codex.index()]
+            .as_ref()
+            .is_some_and(|f| f.is_some())
+        {
+            self.codex_lookup(Some(ctx));
+        }
+    }
+
+    /// Everything starting the agent in use needs is known (or known not
+    /// to be there).
+    fn ready_to_start(&mut self, ctx: &egui::Context) -> bool {
+        self.warm_up(ctx);
+        let Some(found) = &self.found[self.kind.index()] else {
+            return false;
+        };
+        self.kind != AgentKind::Codex || found.is_none() || self.codex_info.is_some()
+    }
+
+    /// Start the agent on `text` (its prompt, ready to send), `images` with it.
+    fn launch(
+        &mut self,
+        addr: std::net::SocketAddr,
+        text: String,
+        images: Vec<PathBuf>,
+        ctx: &egui::Context,
+    ) {
+        self.sending_images = images;
         let Some(program) = self.find(self.kind) else {
             self.log
                 .push(Entry::Error(self.kind.not_installed_message(Os::CURRENT)));
@@ -541,11 +1530,18 @@ impl AgentState {
                     .map(|d| d.join(format!("zigzag-mcp{}", std::env::consts::EXE_SUFFIX)))
             })
             .filter(|p| p.is_file());
-        let url = format!("http://{addr}/mcp");
+        // (`panel`: these calls are this panel's agent's.)
+        let url = format!("http://{addr}/mcp?panel=1");
         let mut cmd = self.command(program, &url, bridge, addr.port());
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // A group of its own, so stopping it stops what it starts too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -559,15 +1555,28 @@ impl AgentState {
         // The prompt goes in on stdin (no shell quoting to worry about).
         let first = self.session.is_none();
         let prompt = if self.kind == AgentKind::Codex && first {
-            format!("{BRIEF}\n\n{text}")
+            format!("{}\n\n{text}", self.kind.brief())
         } else {
             text
         };
+        // (Claude is given images in a message of its streaming input.)
+        let payload = if self.kind == AgentKind::Claude && !self.sending_images.is_empty() {
+            claude_message(&prompt, &self.sending_images)
+        } else {
+            prompt
+        };
+        self.sending_images.clear();
+        // (Off this thread: with pictures it's megabytes, and the program
+        // reads it when it's ready to.)
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(prompt.as_bytes());
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(payload.as_bytes());
+            });
         }
         let (tx, rx) = mpsc::channel();
+        let mut eof = true;
         if let Some(out) = child.stdout.take() {
+            eof = false;
             let tx = tx.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
@@ -575,6 +1584,8 @@ impl AgentState {
                     let _ = tx.send(Event::Line(line));
                     ctx.request_repaint();
                 }
+                let _ = tx.send(Event::Eof);
+                ctx.request_repaint();
             });
         }
         let child = Arc::new(Mutex::new(child));
@@ -599,19 +1610,28 @@ impl AgentState {
                 ctx.request_repaint();
             });
         }
-        self.prompt.clear();
-        self.started = Some(Instant::now());
         self.run = Some(Run {
             child,
             rx,
             stderr: Vec::new(),
+            exit: None,
+            eof,
+            kind: self.kind,
+            resumed: self.session.is_some(),
         });
     }
 
     /// Take in what the agent printed since last frame.
     pub fn poll(&mut self) {
+        if let Some(d) = self.deferred.take() {
+            let ctx = d.ctx.clone();
+            if self.ready_to_start(&ctx) {
+                self.launch(d.addr, d.text, d.images, &ctx);
+            } else {
+                self.deferred = Some(d);
+            }
+        }
         let Some(run) = &mut self.run else { return };
-        let mut ended = None;
         let mut lines = Vec::new();
         while let Ok(ev) = run.rx.try_recv() {
             match ev {
@@ -622,14 +1642,22 @@ impl AgentState {
                         run.stderr.remove(0);
                     }
                 }
-                Event::Exit(code) => ended = Some(code),
+                Event::Eof => run.eof = true,
+                Event::Exit(code) => run.exit = Some((code, Instant::now())),
             }
         }
+        let (kind, resumed) = (run.kind, run.resumed);
+        // It has ended once its last lines are in too: the process can be
+        // gone before what it printed has been read.
+        let ended = run
+            .exit
+            .filter(|(_, at)| run.eof || at.elapsed() > LAST_WORDS)
+            .map(|(code, _)| code);
         for l in lines {
             let Ok(v) = serde_json::from_str::<Value>(&l) else {
                 continue;
             };
-            let entries = match self.kind {
+            let entries = match kind {
                 AgentKind::Claude => claude_event(&v, &mut self.session),
                 AgentKind::Codex => codex_event(&v, &mut self.session),
             };
@@ -640,6 +1668,7 @@ impl AgentState {
         if let Some(code) = ended {
             let stderr = self.run.take().map(|r| r.stderr).unwrap_or_default();
             let finished = matches!(self.log.last(), Some(Entry::Done(_) | Entry::Error(_)));
+            self.settle(code == Some(0));
             if !finished {
                 let tail = stderr
                     .iter()
@@ -651,11 +1680,34 @@ impl AgentState {
                     Entry::Done(String::new())
                 } else {
                     Entry::Error(if tail.is_empty() {
-                        format!("{} stopped (exit code {code:?}).", self.kind.name())
+                        format!("{} stopped (exit code {code:?}).", kind.name())
                     } else {
                         tail
                     })
                 });
+            }
+            // The session it was to carry on is gone (cleared away by the
+            // agent's own program, or made on another computer): every
+            // prompt would fail the same way. The next starts a new one.
+            let since: Vec<&Entry> = self
+                .log
+                .iter()
+                .rev()
+                .take_while(|e| !matches!(e, Entry::You(_) | Entry::Notes(_) | Entry::Images(_)))
+                .collect();
+            let did_nothing = !since
+                .iter()
+                .any(|e| matches!(e, Entry::Said(_) | Entry::Tool(..)));
+            let gone = since
+                .iter()
+                .any(|e| matches!(e, Entry::Error(m) if session_gone(m)));
+            if resumed && code != Some(0) && did_nothing && gone {
+                self.session = None;
+                self.session_kind = None;
+                self.log.push(Entry::Info(format!(
+                    "{} can't pick up the earlier session (it's no longer there). Send your message again to go on in a new one; it won't remember what was said before.",
+                    kind.name()
+                )));
             }
         }
     }
@@ -765,8 +1817,33 @@ fn claude_event(v: &Value, session: &mut Option<String>) -> Vec<(Option<String>,
     out
 }
 
-/// What to say when one of Codex's tool calls failed with `message`.
-fn codex_tool_error(tool: &str, message: &str) -> String {
+/// What to say when one of Codex's tool calls (to MCP server `server`)
+/// failed with `message`.
+fn codex_tool_error(server: &str, tool: &str, message: &str) -> String {
+    // Only ZigZag's tools are approved here: another server's failure (a
+    // tool of Codex's own, from the person's plugins) is said as it is,
+    // its first line, under its server's name. (Its words may well mention
+    // cancelling without being about approval.)
+    if !server.is_empty() && server != "zigzag" {
+        let first = message
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        let first: String = first.chars().take(200).collect();
+        return if first.is_empty() {
+            format!("{server} {tool} failed.")
+        } else {
+            format!("{server} {tool}: {first}")
+        };
+    }
+    // A tool's whole answer (batch's: its error and the steps before it):
+    // the error is what's said.
+    let parsed = serde_json::from_str::<Value>(message).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v["error"].as_str())
+        .unwrap_or(message);
     let m = message.to_ascii_lowercase();
     if m.contains("cancel") || m.contains("requires approval") {
         // Approval needed, and nobody to ask: Codex's exec refuses the call
@@ -779,6 +1856,15 @@ fn codex_tool_error(tool: &str, message: &str) -> String {
     } else {
         format!("{tool}: {message}")
     }
+}
+
+/// What to say when a Codex turn failed with `message`.
+fn codex_failure(message: &str) -> String {
+    if message.contains("active writer") {
+        // (Its chat is held by a run of it that's still going.)
+        return "Codex is still finishing an earlier run of this chat, so it can't carry on yet. Wait a moment and send again, or start a new chat with /new.".into();
+    }
+    message.to_string()
 }
 
 /// Codex's `exec --json` events.
@@ -841,13 +1927,14 @@ fn codex_event(v: &Value, session: &mut Option<String>) -> Vec<(Option<String>, 
                             .as_array()
                             .map(|c| c.iter().filter_map(|x| x["text"].as_str()).collect())
                             .unwrap_or_default();
-                        let said = said.join(" ");
+                        let said = said.join("\n");
                         let m = it["error"]["message"]
                             .as_str()
                             .map(str::trim)
                             .filter(|m| !m.is_empty())
                             .unwrap_or(said.trim());
-                        out.push((None, Entry::Error(codex_tool_error(&tool, m))));
+                        let server = it["server"].as_str().unwrap_or("");
+                        out.push((None, Entry::Error(codex_tool_error(server, &tool, m))));
                     }
                 }
                 Some("command_execution") => out.push((
@@ -864,17 +1951,14 @@ fn codex_event(v: &Value, session: &mut Option<String>) -> Vec<(Option<String>, 
         Some("turn.completed") => out.push((None, Entry::Done(String::new()))),
         Some("turn.failed") => out.push((
             None,
-            Entry::Error(
-                v["error"]["message"]
-                    .as_str()
-                    .unwrap_or("The turn failed.")
-                    .to_string(),
-            ),
+            Entry::Error(codex_failure(
+                v["error"]["message"].as_str().unwrap_or("The turn failed."),
+            )),
         )),
         Some("error") => {
             let m = v["message"].as_str().unwrap_or("");
             if !m.starts_with("Reconnecting") {
-                out.push((None, Entry::Error(m.to_string())));
+                out.push((None, Entry::Error(codex_failure(m))));
             }
         }
         _ => {}
@@ -900,11 +1984,6 @@ impl Work {
     pub(crate) fn pose(&mut self, uids: &[usize]) {
         self.note("set_object", uids);
         self.last = Some(Instant::now() + Duration::from_secs(3600));
-    }
-
-    /// Forget what it was working on (another document came forward).
-    pub fn clear(&mut self) {
-        self.touches.clear();
     }
 }
 
@@ -968,6 +2047,7 @@ impl Work {
 /// innermost group they're all in, or else the whole design. So there's
 /// one box, never a box round every piece.
 fn boxed(shapes: &[zigzag::svg::Shape], uids: &[usize]) -> Vec<usize> {
+    let uids: std::collections::HashSet<usize> = uids.iter().copied().collect();
     let mine: Vec<&zigzag::svg::Shape> = shapes.iter().filter(|s| uids.contains(&s.uid)).collect();
     let Some(first) = mine.first() else {
         return Vec::new();
@@ -1003,7 +2083,14 @@ pub fn activity(tool: &str) -> &'static str {
         "add_svg" => "Drawing",
         "add_text" | "edit_text" | "list_fonts" => "Lettering",
         "set_object" | "group_colors" => "Restyling",
-        "transform_objects" | "move_object" => "Placing",
+        "transform_objects" | "move_object" | "align_objects" => "Placing",
+        "combine_shapes" => "Combining shapes",
+        "rename_object" => "Naming",
+        "simplify" | "clean_up" => "Tidying",
+        "open_file" | "new_document" | "switch_document" | "list_documents" => "Opening",
+        "list_machines" | "machine_status" => "Checking the machine",
+        "send_to_skitch" => "Sending to the machine",
+        "redo" => "Redoing",
         "duplicate_objects" => "Duplicating",
         "delete_object" => "Removing",
         "round_corners" => "Rounding corners",
@@ -1014,8 +2101,11 @@ pub fn activity(tool: &str) -> &'static str {
         "simplify_design" => "Simplifying",
         "trace_image" => "Tracing",
         "render_preview" => "Looking",
-        "check_design" | "measure_stitching" => "Checking",
-        "get_design" | "get_svg" | "select" => "Reading",
+        "check_design" | "measure_stitching" | "get_cuts" => "Checking",
+        "offer_choices" => "Offering choices",
+        "review_design" => "Reviewing",
+        "get_design" | "get_svg" => "Reading",
+        "select" => "Selecting",
         "set_document" => "Setting up",
         "batch" => "Making changes",
         "undo" => "Undoing",
@@ -1070,7 +2160,46 @@ pub(crate) fn fingerprint(s: &zigzag::svg::Shape) -> u64 {
 impl Studio {
     /// Take in the agent's output; every frame, whether its panel shows or not.
     pub fn agent_tick(&mut self, ctx: &egui::Context) {
+        self.recall_chat();
         self.agent.poll();
+        // Find the agents' programs before they're wanted: the login shell
+        // can take a moment, and a first send shouldn't wait on it.
+        // (Not in tests: a login shell for every one of them.)
+        #[cfg(not(test))]
+        {
+            let kind = self.agent.kind;
+            let _ = self.agent.installed(kind, ctx);
+        }
+        if std::mem::take(&mut self.agent.stopped) && self.review.queued == Some(self.session.rec) {
+            self.review.queued = None;
+        }
+        if self.take_attached() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        // (Where its calls go once it has changed documents itself: only
+        // while it works.)
+        if self.agent_tab().is_none() {
+            self.agent.follow = None;
+        }
+        self.keep_chat();
+        // An agent working on a document that isn't in front: its chat goes
+        // on there, and its turn ends on that document.
+        if let Some(i) = self.agent_tab().filter(|&i| i != self.tabs.active) {
+            self.agent.swap_chat(&mut self.tabs.list[i].chat);
+            self.agent.poll();
+            self.keep_chat();
+            let done = !self.agent.running();
+            self.agent.swap_chat(&mut self.tabs.list[i].chat);
+            if done {
+                // (And a note that was waiting for it goes, to it.)
+                self.visit(i, |s| {
+                    s.end_turn();
+                    s.send_queued_notes(ctx);
+                });
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
         if !self.agent.running() {
             self.end_turn();
             self.send_queued_notes(ctx);
@@ -1116,6 +2245,11 @@ impl Studio {
             .filter(|s| !before.contains_key(&s.uid))
             .map(|s| s.uid)
             .collect();
+        // What the panel's agent made: kept with the prompt it was given.
+        // (Not what an undo or redo brings back: that was made before.)
+        if !matches!(name, "open_file" | "undo" | "redo") && !added.is_empty() {
+            self.keep_prompt(&added);
+        }
         let mut touched: Vec<usize> = if name == "open_file" {
             Vec::new()
         } else if !added.is_empty() {
@@ -1136,6 +2270,31 @@ impl Studio {
         self.agent.work.note(name, &touched);
         self.agent_changed();
         result
+    }
+
+    /// Keep the running turn's prompt with the objects `uids` it made
+    /// (unless that's turned off in Settings). Part of the tool call's
+    /// own undo step. (The calls that come while the panel's agent works
+    /// are taken to be its: they don't say who sent them.)
+    fn keep_prompt(&mut self, uids: &[usize]) {
+        if !self.prefs.agent_prompts || !self.agent.running() {
+            return;
+        }
+        let Some(prompt) = self.agent.turn_prompt.clone() else {
+            return;
+        };
+        let idx: Vec<usize> = self
+            .doc
+            .shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| uids.contains(&s.uid))
+            .map(|(i, _)| i)
+            .collect();
+        if self.doc.set_prompt(&idx, &prompt).is_ok() {
+            self.stable = self.doc.clone();
+            self.modified = true;
+        }
     }
 
     /// Draw the agent's work over the design: the pieces it's on get a
@@ -1179,13 +2338,13 @@ impl Studio {
                 k = k.max((fade_in * fade_out).clamp(0.0, 1.0));
             }
             let mut b = zigzag::geom::Bounds::empty();
-            for u in boxed(&self.doc.shapes, &uids) {
-                if let Some(s) = self.doc.shapes.iter().find(|s| s.uid == u) {
-                    let sb = crate::app::shape_bounds(s);
-                    if !sb.is_empty() {
-                        b.add(sb.min);
-                        b.add(sb.max);
-                    }
+            let held: std::collections::HashSet<usize> =
+                boxed(&self.doc.shapes, &uids).into_iter().collect();
+            for s in self.doc.shapes.iter().filter(|s| held.contains(&s.uid)) {
+                let sb = crate::app::shape_bounds(s);
+                if !sb.is_empty() {
+                    b.add(sb.min);
+                    b.add(sb.max);
                 }
             }
             if b.is_empty() {
@@ -1236,7 +2395,7 @@ impl Studio {
         );
         let secs = self.agent.started.map_or(0, |t| t.elapsed().as_secs());
         let right = painter.text(
-            egui::pos2(header.right() - 58.0, header.center().y),
+            egui::pos2(header.right() - 82.0, header.center().y),
             egui::Align2::RIGHT_CENTER,
             format!("{secs} s"),
             egui::FontId::proportional(11.0),
@@ -1380,6 +2539,11 @@ impl Studio {
 
     /// The Agent panel: which agent, the conversation, and the prompt.
     pub fn agent_body(&mut self, ui: &mut egui::Ui) {
+        // (Where it is, for an image dropped on it next frame.)
+        self.agent.panel_rect = Some(ui.max_rect());
+        // What starting the agent needs, looked up while the panel's open,
+        // before a prompt is sent.
+        self.agent.warm_up(ui.ctx());
         let p = pal_ui(ui);
         let h = self.agent_transcript_h();
         let mut send = false;
@@ -1388,6 +2552,9 @@ impl Studio {
         let review = &self.review;
         let here = self.session.rec;
         let mut act: Option<crate::review::TurnAction> = None;
+        let mut open_earlier: Option<String> = None;
+        let mut apply_choices: Option<usize> = None;
+        let busy = self.agent.running();
         let a = &mut self.agent;
         // The conversation: plain, on the panel itself.
         let transcript_h = egui::Frame::new()
@@ -1457,6 +2624,26 @@ impl Studio {
                             a.focus = true;
                         }
                     }
+                    // This design's last chat, too old to have come back by
+                    // itself.
+                    if let Some(m) = &a.earlier {
+                        child.add_space(space::S);
+                        let title: String = m.title.chars().take(40).collect();
+                        if child
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("Earlier chat · {} · “{title}”", m.ago()))
+                                        .size(PANEL_PT)
+                                        .color(p.secondary),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Open it, to read it or carry on")
+                            .clicked()
+                        {
+                            open_earlier = Some(m.id.clone());
+                        }
+                    }
                     return;
                 }
                 egui::ScrollArea::vertical()
@@ -1469,7 +2656,37 @@ impl Studio {
                         // (Room between the conversation's lines.)
                         ui.spacing_mut().item_spacing.y = FEED_GAP;
                         let time = ui.input(|i| i.time);
+                        // The turns before the last few fold into a line,
+                        // and aren't laid out until it's opened.
                         let mut k = 0;
+                        let prompts: Vec<usize> = a
+                            .log
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, e)| matches!(e, Entry::You(_)))
+                            .map(|(i, _)| i)
+                            .collect();
+                        if !a.show_earlier && prompts.len() > SHOWN_TURNS {
+                            let folded = prompts.len() - SHOWN_TURNS;
+                            k = prompts[folded];
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!(
+                                            "{folded} earlier turn{}",
+                                            if folded == 1 { "" } else { "s" }
+                                        ))
+                                        .size(PANEL_PT)
+                                        .color(p.secondary),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Show the whole chat")
+                                .clicked()
+                            {
+                                a.show_earlier = true;
+                            }
+                        }
                         while k < a.log.len() {
                             // Steps one after another are one line, opened
                             // out with a click (one alone is just itself).
@@ -1494,11 +2711,16 @@ impl Studio {
                                     });
                                 }
                                 k += run;
+                            } else if matches!(a.log[k], Entry::Choices { .. }) {
+                                if choices_card(ui, &mut a.log[k], busy) {
+                                    apply_choices = Some(k);
+                                }
+                                k += 1;
                             } else {
                                 // A turn that ended here: its before, after and
                                 // side by side, on its Done line (or under how
                                 // it ended, if it didn't finish).
-                                let ended = review.turn_ending_at(k);
+                                let ended = review.turn_ending_at(k, here);
                                 let done = match &a.log[k] {
                                     Entry::Done(t) => Some(t),
                                     _ => None,
@@ -1571,11 +2793,43 @@ impl Studio {
         );
         // The comments pinned on the canvas, as an attachment to the prompt.
         let notes_act = self.notes_list(ui);
-        let a = &mut self.agent;
         // The prompt: one line (it grows with Shift-Enter), Send beside it.
         let field_id = ui.make_persistent_id("agent-prompt");
+        // A slash command being typed: its menu, and the menu's keys
+        // (taken before the field sees them).
+        let prompt = self.agent.prompt.clone();
+        let rows = if ui.memory(|m| m.has_focus(field_id))
+            && self.agent.menu_closed.as_deref() != Some(prompt.as_str())
+        {
+            crate::slash::rows(self, &prompt, ui.ctx())
+        } else {
+            Vec::new()
+        };
+        let mut pick = self.slash_keys(ui, &rows);
+        // An image pasted into the prompt goes with it.
+        let pasted: Vec<std::sync::Arc<egui::ColorImage>> = if ui.memory(|m| m.has_focus(field_id))
+        {
+            ui.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::PasteImage(img) => Some(img.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        };
+        for img in pasted {
+            if !self.attach_pasted(&img) {
+                self.status = "Couldn't attach that image.".into();
+            }
+        }
+        let mut field_rect = None;
+        let a = &mut self.agent;
         // (Above it, its own space; below, the panel's padding is enough.)
-        egui::Frame::new()
+        let input = egui::Frame::new()
             .inner_margin(egui::Margin {
                 left: 0,
                 right: 0,
@@ -1584,6 +2838,40 @@ impl Studio {
             })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // The images going with it, each with a × to take it off.
+                if !a.attach.is_empty() {
+                    let mut gone = None;
+                    ui.horizontal(|ui| {
+                        ui.add_space(space::S);
+                        ui.spacing_mut().item_spacing.x = space::S;
+                        for (k, path) in a.attach.iter().enumerate() {
+                            let r = crate::attach::show(ui, path, crate::attach::THUMB);
+                            let x = Rect::from_center_size(
+                                r.rect.right_top() + Vec2::new(-5.0, 5.0),
+                                Vec2::splat(15.0),
+                            );
+                            let xr = ui.interact(x, ui.make_persistent_id(("attach-x", k)), Sense::click());
+                            xr.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::Role::Button, true, "Remove Image")
+                            });
+                            ui.painter().circle_filled(
+                                x.center(),
+                                7.5,
+                                if xr.hovered() { p.text } else { p.secondary },
+                            );
+                            icons::paint(ui.painter(), x.shrink(4.0), Icon::Close, p.dock);
+                            if xr.on_hover_text("Remove image").clicked() {
+                                gone = Some(k);
+                            }
+                        }
+                    });
+                    if let Some(k) = gone {
+                        // (The copy made to send goes with it.)
+                        let gone = a.attach.remove(k);
+                        let _ = std::fs::remove_file(gone);
+                    }
+                    ui.add_space(space::XS);
+                }
                 ui.horizontal(|ui| {
                     let button_w = crate::review::BUTTON;
                     let button_h = crate::review::BUTTON;
@@ -1606,11 +2894,17 @@ impl Studio {
                                 egui::RichText::new("Describe a design, or a change…")
                                     .color(crate::review::hint_color(p)),
                             )
-                            .return_key(None),
+                            // (Enter sends, below; Shift-Enter is the
+                            // field's own new line, at the caret.)
+                            .return_key(egui::KeyboardShortcut::new(
+                                egui::Modifiers::SHIFT,
+                                Key::Enter,
+                            )),
                     );
                     r.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Prompt")
                     });
+                    field_rect = Some(r.rect);
                     let r = r.on_hover_text("Enter sends · Shift-Enter for a new line");
                     if a.focus {
                         r.request_focus();
@@ -1622,11 +2916,7 @@ impl Studio {
                     {
                         send = true;
                     }
-                    if r.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && i.modifiers.shift)
-                    {
-                        a.prompt.push('\n');
-                    }
-                    let ok = !a.prompt.trim().is_empty() || has_notes;
+                    let ok = !a.prompt.trim().is_empty() || has_notes || !a.attach.is_empty();
                     let running = a.running();
                     // Beside Send: pin comments on the canvas.
                     if crate::review::annotate_button(ui, annotating)
@@ -1636,16 +2926,40 @@ impl Studio {
                         annotate = true;
                     }
                     if crate::review::send_button(ui, ok, running).clicked() {
-                        if running {
+                        // (A Stop in the first moment of a run is the second
+                        // click of a Send, not a change of mind.)
+                        let just_sent = a
+                            .started
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(900));
+                        if running && !just_sent {
                             a.stop();
-                        } else {
+                        } else if !running {
                             send = true;
                         }
                     }
                 });
-            });
+            })
+            .response
+            .rect;
         // Everything but the transcript, to size it next frame.
         a.chrome_h = (ui.cursor().top() - top - transcript_h).max(0.0);
+        // (Out of the top of the input area, as wide as it.)
+        if field_rect.is_some()
+            && !rows.is_empty()
+            && let Some(k) = crate::slash::menu(ui, &rows, self.agent.menu_sel, input)
+        {
+            pick = Some((k, true));
+        }
+        if let Some((k, run)) = pick {
+            self.slash_pick(&rows[k], run, ui.ctx());
+            // The caret at the end of what was filled in.
+            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), field_id) {
+                let end = egui::text::CCursor::new(self.agent.prompt.chars().count());
+                st.cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                st.store(ui.ctx(), field_id);
+            }
+        }
         if annotate {
             self.set_annotating(!annotating);
         }
@@ -1655,8 +2969,17 @@ impl Studio {
         if let Some(x) = act {
             self.turn_action(x);
         }
+        if let Some(id) = open_earlier {
+            self.open_chat(&id);
+        }
+        if let Some(k) = apply_choices {
+            self.apply_choices(k);
+        }
         if send {
             self.agent_send(ui.ctx());
+            // Drawn again at once: the button is Stop and the spinner turns
+            // now, not when something else wakes the window.
+            ui.ctx().request_repaint();
         }
     }
 
@@ -1667,24 +2990,75 @@ impl Studio {
         self.agent_send_with(ctx, true);
     }
 
+    /// The names of the selected objects (the first few dozen), as the
+    /// agent is told them.
+    pub(crate) fn selected_names(&self) -> Vec<String> {
+        self.sel_indices()
+            .iter()
+            .filter_map(|&i| self.names.get(i).cloned())
+            .take(40)
+            .collect()
+    }
+
     /// Send the prompt, with the canvas's notes or (`notes` false) on its
     /// own, the notes left open for a later message.
     fn agent_send_with(&mut self, ctx: &egui::Context, notes: bool) {
         let here = self.session.rec;
         let has_notes = notes && self.review.pending(here) > 0;
-        if (self.agent.prompt.trim().is_empty() && !has_notes) || self.agent.running() {
+        // A slash command runs here (it isn't sent), even while the agent works.
+        if self.agent.prompt.trim_start().starts_with('/') && Studio::is_slash(&self.agent.prompt) {
+            let text = self.agent.prompt.clone();
+            self.run_slash(&text, ctx);
+            return;
+        }
+        // The agent works on one document at a time: the prompt waits.
+        if let Some(i) = self.agent_tab().filter(|&i| i != self.tabs.active) {
+            let name = self.tab_infos()[i].name.clone();
+            self.agent.log.push(Entry::Info(format!(
+                "{} is working on {name}: it works on one document at a time. Send this when it's done, or type /stop to stop it.",
+                self.agent.kind.name()
+            )));
+            return;
+        }
+        if (self.agent.prompt.trim().is_empty() && !has_notes && self.agent.attach.is_empty())
+            || self.agent.running()
+        {
             return;
         }
         let addr = self.mcp.as_ref().map(|m| m.addr);
-        let (shown, extra) = if notes {
+        let (shown, mut extra) = if notes {
             self.notes_for_prompt()
         } else {
             (Vec::new(), String::new())
         };
+        // What's selected is what "this" means: the agent can't see the
+        // canvas's selection otherwise.
+        // What they chose from the versions it made, if they did.
+        if let Some((_, chose)) = self.review.chose.clone().filter(|(tab, _)| *tab == here) {
+            if !extra.is_empty() {
+                extra.push_str("\n\n");
+            }
+            extra.push_str(&format!(
+                "From the versions you made, the person chose {chose}: the design is that one now."
+            ));
+        }
+        let selected = self.selected_names();
+        if !selected.is_empty() {
+            if !extra.is_empty() {
+                extra.push_str("\n\n");
+            }
+            extra.push_str(&format!(
+                "Selected on the canvas (what \"this\" or \"these\" means): {}.",
+                selected.join(", ")
+            ));
+        }
         let prompt = self.agent.prompt.trim().to_string();
         let start = self.agent.log.len();
         self.agent.send_with(addr, ctx, shown, &extra);
+        self.keep_chat();
         if self.agent.running() {
+            self.review.chose = self.review.chose.take().filter(|(tab, _)| *tab != here);
+            self.agent.turn_prompt = (!prompt.is_empty()).then(|| prompt.clone());
             if notes {
                 self.begin_turn(prompt, start);
             } else {
@@ -1895,6 +3269,34 @@ fn entry(ui: &mut egui::Ui, e: &Entry, time: f64) {
         }
         Entry::Error(t) => crate::theme::callout(ui, p.warning, Icon::Warning, t),
         Entry::Done(t) => done_line(ui, t),
+        // A choice that was made reads like the steps the agent made: a dot.
+        Entry::Info(t) if t.starts_with("Applied ") => {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::XS;
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                ui.painter().circle_filled(r.center(), 3.5, p.accent);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(t).size(PANEL_PT).color(p.text)).wrap(),
+                );
+            });
+        }
+        Entry::Info(t) => {
+            quiet(ui, t.as_str());
+        }
+        // (Drawn as a card, with its boxes, where the chat is shown: see
+        // `choices_card`. Anywhere else, its title.)
+        Entry::Choices { title, .. } => {
+            quiet(ui, title.as_str());
+        }
+        // Under the prompt they went with, at its side.
+        Entry::Images(paths) => {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                ui.spacing_mut().item_spacing.x = space::XS;
+                for p in paths.iter().rev() {
+                    crate::attach::show(ui, p, 120.0);
+                }
+            });
+        }
     }
 }
 
@@ -2129,6 +3531,548 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn the_chosen_model_and_effort_go_on_the_command_line() {
+        let args = |a: &mut AgentState| -> Vec<String> {
+            a.command("x".into(), "http://127.0.0.1:1/mcp", None, 1)
+                .get_args()
+                .map(|x| x.to_string_lossy().into_owned())
+                .collect()
+        };
+        let mut a = AgentState {
+            kind: AgentKind::Claude,
+            ..Default::default()
+        };
+        assert!(
+            !args(&mut a)
+                .iter()
+                .any(|x| x == "--model" || x == "--effort"),
+            "defaults: nothing"
+        );
+        a.model[AgentKind::Claude.index()] = Some("opus".into());
+        a.effort[AgentKind::Claude.index()] = Some("high".into());
+        let c = args(&mut a).join(" ");
+        assert!(
+            c.contains("--model opus") && c.contains("--effort high"),
+            "{c}"
+        );
+        a.kind = AgentKind::Codex;
+        a.session = Some("t1".into());
+        a.model[AgentKind::Codex.index()] = Some("gpt-6.2-astra".into());
+        a.effort[AgentKind::Codex.index()] = Some("xhigh".into());
+        let c = args(&mut a);
+        let joined = c.join(" ");
+        assert!(joined.starts_with("exec resume t1"), "{joined}");
+        assert!(joined.contains("-m gpt-6.2-astra"), "{joined}");
+        assert!(
+            joined.contains("model_reasoning_effort=\"xhigh\""),
+            "{joined}"
+        );
+        assert_eq!(
+            c.last().map(String::as_str),
+            Some("-"),
+            "prompt on stdin last"
+        );
+    }
+
+    #[test]
+    fn codex_runs_with_only_zigzags_tools() {
+        let json = r#"[{"name":"node_repl","enabled":true},{"name":"computer-use","enabled":false},
+            {"name":"cua_repl"},{"name":"zigzag","enabled":true},{"name":"bad name;rm","enabled":true}]"#;
+        let servers = parse_codex_servers(json);
+        assert_eq!(
+            servers,
+            ["node_repl", "cua_repl", "zigzag"],
+            "on, and safe to name"
+        );
+        assert!(parse_codex_servers("nope").is_empty());
+        let mut a = AgentState {
+            kind: AgentKind::Codex,
+            codex_info: Some(CodexInfo {
+                models: Vec::new(),
+                servers,
+            }),
+            ..Default::default()
+        };
+        let args: Vec<String> = a
+            .command("codex".into(), "http://127.0.0.1:1/mcp", None, 1)
+            .get_args()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
+        for want in [
+            "features.plugins=false",
+            "features.apps=false",
+            "mcp_servers.node_repl.enabled=false",
+            "mcp_servers.cua_repl.enabled=false",
+        ] {
+            assert!(args.iter().any(|x| x == want), "{want}: {args:?}");
+        }
+        assert!(!args.iter().any(|x| x == "mcp_servers.zigzag.enabled=false"));
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn reads_codex_models_and_leaves_out_the_hidden_ones() {
+        let json = r#"{"models":[
+            {"slug":"gpt-a","display_name":"GPT-A","description":"Big.","visibility":"list",
+             "supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]},
+            {"slug":"gpt-hidden","visibility":"hide","supported_reasoning_levels":[]}]}"#;
+        let m = parse_codex_models(json);
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].id.as_str(), m[0].name.as_str()), ("gpt-a", "GPT-A"));
+        assert_eq!(m[0].efforts, ["low", "ultra"]);
+        assert!(parse_codex_models("not json").is_empty());
+    }
+
+    #[test]
+    fn what_the_panels_agent_makes_keeps_its_prompt_unless_turned_off() {
+        let mut h = studio();
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm" viewBox="0 0 10 10"><rect id="leaf" width="10" height="10" fill="#2a7"/></svg>"##;
+        let add = |h: &mut egui_kittest::Harness<'static, Studio>| {
+            let r = h
+                .state_mut()
+                .run_mcp_call("add_svg", &serde_json::json!({ "svg": svg }));
+            assert!(!r.is_error);
+            h.state().doc.shapes.len() - 1
+        };
+        // Not while nothing is running (an outside agent, say).
+        let i = add(&mut h);
+        assert_eq!(h.state().doc.prompt(i), None);
+        // While the panel's agent works on a prompt: kept, and read back.
+        h.state_mut().agent.turn_prompt = Some("A leaf, \"green\" & <small>\nplease".into());
+        h.state_mut().agent.start_fake_run();
+        let i = add(&mut h);
+        assert_eq!(
+            h.state().doc.prompt(i),
+            Some("A leaf, \"green\" & <small>\nplease")
+        );
+        let got = h
+            .state_mut()
+            .run_mcp_call("get_design", &serde_json::json!({}));
+        let text = match &got.content[0] {
+            crate::mcp::Content::Text(t) => t.clone(),
+            _ => unreachable!(),
+        };
+        assert!(text.contains("A leaf"), "get_design shows it");
+        // Saved with the file, and back on reopening.
+        let svg_out = h.state().doc.to_svg().unwrap();
+        let back = zigzag::document::Document::from_svg(&svg_out, "back", None).ok();
+        assert!(back.is_some_and(|d| {
+            (0..d.shapes.len()).any(|k| d.prompt(k).is_some_and(|p| p.ends_with("please")))
+        }));
+        // One undo takes the object and its prompt together.
+        let n = h.state().doc.shapes.len();
+        h.state_mut().run_mcp_call("undo", &serde_json::json!({}));
+        assert_eq!(h.state().doc.shapes.len(), n - 1);
+        // Turned off in Settings: not kept.
+        h.state_mut().prefs.agent_prompts = false;
+        let i = add(&mut h);
+        assert_eq!(h.state().doc.prompt(i), None);
+        h.state_mut().agent.stop();
+    }
+
+    #[test]
+    fn a_long_chat_folds_its_earlier_turns_and_the_clock_lists_chats() {
+        use crate::dock::PanelId;
+        use egui_kittest::kittest::Queryable;
+        let mut h = studio();
+        h.state_mut().agent.config = None;
+        h.state_mut().dock.reveal(PanelId::Agent);
+        for k in 1..=5 {
+            let a = &mut h.state_mut().agent;
+            a.log.push(Entry::You(format!("prompt {k}")));
+            a.log.push(Entry::Said(format!("answer {k}")));
+        }
+        h.run_steps(4);
+        assert!(
+            h.query_by_label("2 earlier turns").is_some(),
+            "the first two fold"
+        );
+        assert!(
+            h.query_by_label("answer 1").is_none(),
+            "and aren't laid out"
+        );
+        assert!(h.query_by_label("answer 5").is_some());
+        h.get_by_label("2 earlier turns").click();
+        h.run_steps(3);
+        assert!(h.state().agent.show_earlier);
+        assert!(h.query_by_label("answer 1").is_some());
+        // The clock: no kept chats for this design (none are kept in tests).
+        h.get_by_label("Chat History").click();
+        h.run_steps(3);
+        assert!(
+            h.query_by_label("No earlier chats about this design yet.")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_image_pasted_or_dropped_goes_with_the_prompt_to_either_agent() {
+        use crate::dock::PanelId;
+        use egui_kittest::kittest::Queryable;
+        let mut h = studio();
+        h.state_mut().agent.config = None;
+        h.state_mut().agent.kind = AgentKind::Codex;
+        h.state_mut().dock.reveal(PanelId::Agent);
+        h.state_mut().agent.focus = true;
+        h.run_steps(4);
+        // ⌘V with an image on the clipboard, the prompt in focus.
+        let red = egui::ColorImage::from_rgba_unmultiplied([8, 8], &[220, 30, 40, 255].repeat(64));
+        h.event(egui::Event::PasteImage(std::sync::Arc::new(red)));
+        h.run_steps(3);
+        assert_eq!(h.state().agent.attach.len(), 1, "attached");
+        assert!(h.state().agent.attach[0].exists(), "kept as a file");
+        let shapes = h.state().doc.shapes.len();
+        // Its × takes it off.
+        h.get_by_label("Remove Image").click();
+        h.run_steps(3);
+        assert!(h.state().agent.attach.is_empty());
+        // Dropped on the panel: attached, not opened as a design.
+        let dir = std::env::temp_dir().join(format!("zz-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("logo.png");
+        std::fs::write(
+            &file,
+            vectorcraft_trace::Raster::from_fn(16, 16, |_, _| [20, 60, 200, 255]).encode_png(),
+        )
+        .unwrap();
+        let over = h.state().agent.panel_rect.unwrap().center();
+        h.event(egui::Event::PointerMoved(over));
+        /// A file dropped on the window, as the OS hands it over.
+        #[derive(Debug)]
+        struct Dropped(PathBuf);
+        impl egui::DroppedFile for Dropped {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                std::fs::read(&self.0).map_err(|e| e.to_string())
+            }
+        }
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(file.clone())));
+        h.run_steps(3);
+        assert_eq!(h.state().agent.attach.len(), 1, "the dropped image");
+        assert_eq!(h.state().tab_count(), 1, "no design opened for it");
+        assert_eq!(h.state().doc.shapes.len(), shapes);
+        let kept = h.state().agent.attach[0].clone();
+
+        // Codex: each image an --image option; the prompt names the file.
+        let a = &mut h.state_mut().agent;
+        a.sending_images = vec![kept.clone()];
+        let args: Vec<String> = a
+            .command("codex".into(), "http://127.0.0.1:1/mcp", None, 1)
+            .get_args()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&format!("--image={}", kept.display())),
+            "{args:?}"
+        );
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+        // Claude: its streaming input, the image inline.
+        a.kind = AgentKind::Claude;
+        let args: Vec<String> = a
+            .command("claude".into(), "http://127.0.0.1:1/mcp", None, 1)
+            .get_args()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--input-format", "stream-json"]),
+            "{args:?}"
+        );
+        let msg: Value =
+            serde_json::from_str(claude_message("make this", std::slice::from_ref(&kept)).trim())
+                .unwrap();
+        assert_eq!(msg["message"]["content"][0]["text"], "make this");
+        assert_eq!(msg["message"]["content"][1]["type"], "image");
+        assert_eq!(
+            msg["message"]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        a.sending_images.clear();
+
+        // Sent (no agent here to run): the chat shows it under the prompt.
+        a.kind = AgentKind::Codex;
+        a.found = [Some(None), Some(None)];
+        a.prompt = "make this into a patch".into();
+        a.send(
+            Some("127.0.0.1:1".parse().unwrap()),
+            &egui::Context::default(),
+        );
+        assert!(a.attach.is_empty(), "sent with it");
+        assert_eq!(a.log[1], Entry::Images(vec![kept.clone()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_agent_asks_and_a_click_on_an_option_makes_it() {
+        use crate::dock::PanelId;
+        use egui_kittest::kittest::Queryable;
+        let mut h = studio();
+        h.state_mut().agent.config = None;
+        h.state_mut().dock.reveal(PanelId::Agent);
+        h.run_steps(3);
+        // Steps that reach outside the document aren't offered; and a
+        // question is asked for.
+        let bad = h.state_mut().run_mcp_call(
+            "offer_choices",
+            &json!({ "title": "t", "question": "q?", "choices": [{ "label": "Ship it", "steps": [{ "tool": "export", "arguments": {} }] }] }),
+        );
+        assert!(bad.is_error);
+        let vague = h.state_mut().run_mcp_call(
+            "offer_choices",
+            &json!({ "choices": [{ "label": "x", "steps": [{ "tool": "set_document", "arguments": { "over_sewn": true } }] }] }),
+        );
+        assert!(vague.is_error);
+        // At most four of the agent's own: a card stays short.
+        let many: Vec<Value> = (0..5)
+            .map(|k| json!({ "label": format!("Option {k}"), "steps": [{ "tool": "set_document", "arguments": { "connect_mm": k } }] }))
+            .collect();
+        assert!(
+            h.state_mut()
+                .run_mcp_call(
+                    "offer_choices",
+                    &json!({ "title": "t", "question": "q?", "choices": many })
+                )
+                .is_error
+        );
+        let offer = json!({ "title": "Fewer trims", "question": "Which should I do?", "choices": [
+            { "label": "Travel over fills", "detail": "12 to 7 trims; about 4 mm of thread crosses other colors",
+              "steps": [{ "tool": "set_document", "arguments": { "over_sewn": true } }] },
+            { "label": "Sun as satin", "detail": "smoother edge",
+              "steps": [{ "tool": "set_object", "arguments": { "object": "sun", "kind": "satin" } }] }
+        ] });
+        assert!(!h.state_mut().run_mcp_call("offer_choices", &offer).is_error);
+        h.run_steps(3);
+        assert!(
+            h.query_by_label("Which should I do?").is_some(),
+            "its question"
+        );
+        assert!(
+            h.query_by_label("Keep it as it is").is_some(),
+            "always a way out"
+        );
+        assert!(
+            h.query_by_label("Apply").is_none(),
+            "no button: a click is the choice"
+        );
+        let undo = h.state().undo.len();
+        // One click on an option makes it, as one undo step.
+        h.get_by_label("Travel over fills").click();
+        h.run_steps(3);
+        assert!(h.state().doc.settings.over_sewn, "made");
+        assert_eq!(h.state().undo.len(), undo + 1);
+        // The card is closed: another click makes nothing.
+        let sun = h.state().names.iter().position(|n| n == "sun").unwrap();
+        h.get_by_label("Sun as satin").click();
+        h.run_steps(3);
+        assert_ne!(
+            h.state().doc.shapes[sun].params.kind,
+            Some(zigzag::params::Kind::Satin)
+        );
+        assert_eq!(h.state().undo.len(), undo + 1);
+        // Keeping it as it is changes nothing, and closes the card.
+        assert!(!h.state_mut().run_mcp_call("offer_choices", &offer).is_error);
+        h.run_steps(3);
+        let before = h.state().doc.to_svg().unwrap();
+        // (The new card's: the first card's is closed.)
+        h.get_all_by_label("Keep it as it is")
+            .last()
+            .unwrap()
+            .click();
+        h.run_steps(3);
+        assert_eq!(h.state().doc.to_svg().unwrap(), before);
+        assert!(matches!(
+            h.state().agent.log.iter().rev().find(|e| matches!(e, Entry::Choices { .. })),
+            Some(Entry::Choices { applied: Some(a), .. }) if a == &["Keep it as it is".to_string()]
+        ));
+        // Changes that go together get an option to do them all; changes
+        // that set the same thing differently don't.
+        let both = json!({ "title": "t", "question": "Which?", "choices": [
+            { "label": "A", "steps": [{ "tool": "set_document", "arguments": { "connect_mm": 2 } }] },
+            { "label": "B", "steps": [{ "tool": "set_object", "arguments": { "object": "sun", "kind": "satin" } }] }
+        ] });
+        assert!(!h.state_mut().run_mcp_call("offer_choices", &both).is_error);
+        let clash = json!({ "title": "t", "question": "Which?", "choices": [
+            { "label": "C", "steps": [{ "tool": "set_document", "arguments": { "connect_mm": 2 } }] },
+            { "label": "D", "steps": [{ "tool": "set_document", "arguments": { "connect_mm": 3 } }] }
+        ] });
+        assert!(!h.state_mut().run_mcp_call("offer_choices", &clash).is_error);
+        let cards: Vec<Vec<String>> = h
+            .state()
+            .agent
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Choices { choices, .. } => {
+                    Some(choices.iter().map(|c| c.label.clone()).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        let n = cards.len();
+        assert_eq!(
+            cards[n - 2],
+            ["A", "B", "Do all of these", "Keep it as it is"]
+        );
+        assert_eq!(
+            cards[n - 1],
+            ["C", "D", "Keep it as it is"],
+            "no all: they clash"
+        );
+        assert_eq!(
+            cards[0],
+            [
+                "Travel over fills",
+                "Sun as satin",
+                "Do all of these",
+                "Keep it as it is"
+            ]
+        );
+        // Doing them all makes both, as one undo step.
+        h.run_steps(3);
+        let undo = h.state().undo.len();
+        h.get_all_by_label("Do all of these")
+            .last()
+            .unwrap()
+            .click();
+        h.run_steps(3);
+        assert_eq!(h.state().doc.settings.connect_mm, 2.0);
+        assert_eq!(
+            h.state().doc.shapes[sun].params.kind,
+            Some(zigzag::params::Kind::Satin)
+        );
+        assert_eq!(h.state().undo.len(), undo + 1);
+        // Kept in history, a card comes back closed.
+        let kept = h
+            .state()
+            .agent
+            .log
+            .iter()
+            .find(|e| matches!(e, Entry::Choices { .. }))
+            .cloned()
+            .unwrap();
+        let back = crate::history::entry_from(&crate::history::entry_json(&kept)).unwrap();
+        assert!(matches!(
+            back,
+            Entry::Choices {
+                applied: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn one_change_on_offer_is_a_question_with_two_buttons() {
+        use crate::dock::PanelId;
+        use egui_kittest::kittest::Queryable;
+        let mut h = studio();
+        h.state_mut().agent.config = None;
+        h.state_mut().dock.reveal(PanelId::Agent);
+        h.run_steps(3);
+        let one = json!({ "title": "Fewer trims", "question": "Let the thread run over the fills?",
+            "choices": [{ "label": "Yes, do it", "detail": "Cuts the thread 7 times instead of 12; short lines show.",
+                "steps": [{ "tool": "set_document", "arguments": { "over_sewn": true } }] }] });
+        assert!(!h.state_mut().run_mcp_call("offer_choices", &one).is_error);
+        h.run_steps(3);
+        assert!(h.query_by_label("Not now").is_some());
+        assert!(
+            h.query_by_label("Do all of these").is_none(),
+            "one change: nothing to do all of"
+        );
+        h.get_by_label("Yes, do it").click();
+        h.run_steps(3);
+        assert!(h.state().doc.settings.over_sewn);
+        assert!(h.query_by_label("Done: Yes, do it.").is_some());
+        // Not now: nothing changes.
+        let off = json!({ "title": "t", "question": "Stitch across tiny gaps?",
+            "choices": [{ "label": "Stitch across", "steps": [{ "tool": "set_document", "arguments": { "connect_mm": 3 } }] }] });
+        assert!(!h.state_mut().run_mcp_call("offer_choices", &off).is_error);
+        h.run_steps(3);
+        h.get_by_label("Not now").click();
+        h.run_steps(3);
+        assert_eq!(h.state().doc.settings.connect_mm, 0.0);
+        assert!(h.query_by_label("Kept it as it is.").is_some());
+    }
+
+    #[test]
+    fn a_quick_second_click_on_send_doesnt_stop_the_run() {
+        use crate::dock::PanelId;
+        use egui_kittest::kittest::Queryable;
+        let mut h = studio();
+        h.state_mut().agent.config = None;
+        h.state_mut().dock.reveal(PanelId::Agent);
+        h.run_steps(3);
+        h.state_mut().agent.start_fake_run();
+        h.state_mut().agent.started = Some(Instant::now());
+        h.run_steps(2);
+        h.get_by_label("Stop").click();
+        h.run_steps(2);
+        assert!(
+            h.state().agent.running(),
+            "the click that came with the Send"
+        );
+        h.state_mut().agent.started = Some(Instant::now() - Duration::from_secs(2));
+        h.run_steps(1);
+        h.get_by_label("Stop").click();
+        h.run_steps(2);
+        assert!(!h.state().agent.running(), "a Stop later on stops");
+    }
+
+    #[test]
+    fn typing_a_slash_opens_the_command_menu_and_enter_runs_a_pick() {
+        use crate::dock::PanelId;
+        use egui_kittest::kittest::Queryable;
+        let mut h = studio();
+        h.state_mut().agent.config = None; // don't save the choice
+        h.state_mut().agent.kind = AgentKind::Claude;
+        h.state_mut().dock.reveal(PanelId::Agent);
+        h.state_mut().agent.focus = true;
+        h.run_steps(4);
+        h.get_by_label("Prompt").type_text("/mo");
+        h.run_steps(3);
+        assert!(
+            h.query_by_label("/model name").is_some(),
+            "the menu shows /model"
+        );
+        assert!(
+            h.query_by_label("/new").is_none(),
+            "narrowed to what's typed"
+        );
+        // Enter completes it, and the models are listed next.
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().agent.prompt, "/model ");
+        assert!(
+            h.query_by_label("Opus").is_some(),
+            "{:?}",
+            h.state().agent.prompt
+        );
+        // Down to the second model (Default, Fable, Opus…), Enter picks it.
+        h.key_press(Key::ArrowDown);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().agent.model(), Some("opus"));
+        assert!(h.state().agent.prompt.is_empty());
+        assert!(
+            !h.state().agent.running(),
+            "a command isn't sent to the agent"
+        );
+    }
+
+    #[test]
+    fn only_codex_is_told_to_generate_and_trace_images() {
+        // Codex can generate images; Claude can't, and isn't told to.
+        let codex = AgentKind::Codex.brief();
+        assert!(codex.starts_with(BRIEF) && codex.contains("trace_image"));
+        assert_eq!(AgentKind::Claude.brief(), BRIEF);
+    }
+
+    #[test]
     fn work_is_boxed_as_the_whole_it_is() {
         use zigzag::geom::P;
         let mut d = zigzag::document::Document::empty();
@@ -2266,6 +4210,40 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_batch_says_its_error_not_its_whole_answer() {
+        let answer = r#"{"error":"Step 3 (edit_path) failed: edit 1: no such point. Nothing was changed.","results":[{"step":0,"tool":"move_object","result":"Sewing order: a → b"}]}"#;
+        assert_eq!(
+            codex_tool_error("zigzag", "batch", answer),
+            "batch: Step 3 (edit_path) failed: edit 1: no such point. Nothing was changed."
+        );
+        assert_eq!(
+            codex_tool_error("zigzag", "set_object", "no object called x"),
+            "set_object: no object called x"
+        );
+    }
+
+    #[test]
+    fn another_servers_failure_is_said_as_it_is_not_as_an_approval() {
+        // As Codex's browser tool failed in a real run: its help text after
+        // the error mentions cancelling, which isn't about approval.
+        let mut s = None;
+        let l = json!({"type":"item.completed","item":{"id":"1","type":"mcp_tool_call","server":"cua_repl","tool":"js","status":"failed",
+            "result":{"content":[{"type":"text","text":"The browser access host is unavailable"},{"type":"text","text":"## Computer Use\nIf the user cancelled, stop."}]}}});
+        let out = codex_event(&l, &mut s);
+        let said: Vec<&String> = out
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Entry::Error(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            said,
+            ["cua_repl js: The browser access host is unavailable"]
+        );
+    }
+
+    #[test]
     fn codex_cancelled_edits_are_explained_once() {
         let mut s = None;
         let mut a = AgentState::default();
@@ -2319,6 +4297,89 @@ mod tests {
             args.last().map(String::as_str),
             Some("-"),
             "prompt on stdin last"
+        );
+    }
+
+    /// As npm's `codex` does: a launcher that starts the program doing the
+    /// work and waits on it. Stopping has to end that one too, or it goes
+    /// on (holding its chat, connected to the studio).
+    #[cfg(unix)]
+    #[test]
+    fn stopping_ends_what_the_agent_started_too() {
+        let _env = AGENT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("zz-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("worker.pid");
+        let _ = std::fs::remove_file(&pidfile);
+        let fake = dir.join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nsleep 300 &\necho $! > '{}'\nwait\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        unsafe { std::env::set_var("ZIGZAG_CLAUDE", &fake) };
+        let mut a = AgentState {
+            kind: AgentKind::Claude,
+            path: Some(None),
+            ..Default::default()
+        };
+        a.prompt = "go".into();
+        a.send(
+            Some("127.0.0.1:1".parse().unwrap()),
+            &egui::Context::default(),
+        );
+        let mut worker = None;
+        for _ in 0..150 {
+            // (As every frame: a send waiting on its lookups goes.)
+            a.poll();
+            if let Some(p) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+            {
+                worker = Some(p.trim().to_string());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let worker = worker.expect("the worker started");
+        let alive = |pid: &str| {
+            Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        assert!(alive(&worker));
+        a.stop();
+        let mut gone = false;
+        for _ in 0..200 {
+            if !alive(&worker) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        unsafe { std::env::remove_var("ZIGZAG_CLAUDE") };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "the program the launcher started ended too");
+        assert_eq!(a.log.last(), Some(&Entry::Error("Stopped.".into())));
+    }
+
+    #[test]
+    fn a_held_codex_chat_is_explained() {
+        let mut s = None;
+        let l = json!({"type":"error","message":"thread/resume: thread/resume failed: thread 01a1 already has an active writer (code -32600)"});
+        let out = codex_event(&l, &mut s);
+        assert!(
+            matches!(&out[0].1, Entry::Error(m) if m.contains("still finishing") && m.contains("/new")),
+            "{out:?}"
         );
     }
 
@@ -2729,6 +4790,138 @@ mod tests {
             h.state().agent.work.active(),
             vec![added],
             "a new object is one it's on"
+        );
+    }
+
+    #[test]
+    fn codex_keeps_to_the_design_tools() {
+        let mut a = AgentState {
+            kind: AgentKind::Codex,
+            ..Default::default()
+        };
+        let cmd = a.command("codex".into(), "http://127.0.0.1:1/mcp", None, 1);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().any(|x| x == "features.plugins=false"),
+            "{args:?}"
+        );
+        // A tool that isn't ours, failing, isn't blamed on ZigZag.
+        let v = json!({"type": "item.completed", "item": {"id": "item_1", "type": "mcp_tool_call",
+            "server": "node_repl", "tool": "js", "status": "failed",
+            "error": {"message": "fetch failed"}}});
+        let said = codex_event(&v, &mut None);
+        assert!(
+            matches!(&said[1].1, Entry::Error(m) if m.contains("node_repl") && m.contains("fetch failed") && !m.contains("ZigZag")),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_thats_gone_isnt_tried_again() {
+        assert!(session_gone("No conversation found with session ID: 123"));
+        assert!(session_gone("thread/resume failed: rollout not found"));
+        assert!(!session_gone("thread 01a1 already has an active writer"));
+        assert!(!session_gone("file not found: a.png"));
+        let child = Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/C", "exit 0"][..]
+            } else {
+                &[][..]
+            })
+            .spawn()
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut a = AgentState {
+            kind: AgentKind::Claude,
+            session: Some("old".into()),
+            run: Some(Run {
+                child: Arc::new(Mutex::new(child)),
+                rx,
+                stderr: Vec::new(),
+                exit: None,
+                eof: true,
+                kind: AgentKind::Claude,
+                resumed: true,
+            }),
+            ..Default::default()
+        };
+        a.log.push(Entry::You("go on".into()));
+        tx.send(Event::Stderr(
+            "No conversation found with session ID: old".into(),
+        ))
+        .unwrap();
+        tx.send(Event::Exit(Some(1))).unwrap();
+        a.poll();
+        assert!(!a.running());
+        assert!(a.session.is_none(), "the next prompt starts afresh");
+        assert!(
+            matches!(a.log.last(), Some(Entry::Info(m)) if m.contains("new one")),
+            "{:?}",
+            a.log
+        );
+    }
+
+    #[test]
+    fn a_step_cut_short_stops_spinning() {
+        let mut a = AgentState::default();
+        a.log.push(Entry::You("go".into()));
+        a.push(
+            Some("1".into()),
+            Entry::Tool("add_svg".into(), String::new(), None),
+        );
+        a.settle(false);
+        assert_eq!(
+            a.log[1],
+            Entry::Tool("add_svg".into(), String::new(), Some(false))
+        );
+        assert_eq!(a.status(), "Thinking");
+    }
+
+    #[test]
+    fn the_last_lines_are_read_though_the_program_has_ended() {
+        let _env = AGENT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/C", "exit 0"][..]
+            } else {
+                &[][..]
+            })
+            .spawn()
+            .unwrap();
+        let _ = child.wait();
+        let (tx, rx) = mpsc::channel();
+        let mut a = AgentState {
+            kind: AgentKind::Claude,
+            run: Some(Run {
+                child: Arc::new(Mutex::new(child)),
+                rx,
+                stderr: Vec::new(),
+                exit: None,
+                eof: false,
+                kind: AgentKind::Claude,
+                resumed: false,
+            }),
+            ..Default::default()
+        };
+        // It has ended, but what it printed last is still on its way.
+        tx.send(Event::Exit(Some(0))).unwrap();
+        a.poll();
+        assert!(a.running(), "waits for the rest of its output");
+        tx.send(Event::Line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"All done."}]}}"#
+                .into(),
+        ))
+        .unwrap();
+        tx.send(Event::Eof).unwrap();
+        a.poll();
+        assert!(!a.running());
+        assert!(
+            a.log.contains(&Entry::Said("All done.".into())),
+            "{:?}",
+            a.log
         );
     }
 

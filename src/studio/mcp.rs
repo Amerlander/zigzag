@@ -37,7 +37,8 @@ impl ToolResult {
         }
     }
     pub fn json(v: &Value) -> Self {
-        Self::text(serde_json::to_string_pretty(v).unwrap_or_default())
+        // (Compact: an agent reads every byte of it.)
+        Self::text(v.to_string())
     }
     pub fn error(s: impl Into<String>) -> Self {
         ToolResult {
@@ -70,6 +71,10 @@ pub struct Call {
     pub reply: Sender<ToolResult>,
     /// When whoever sent it stops waiting for the answer.
     pub deadline: Instant,
+    /// From the Agent panel's own agent (its address says so), not one
+    /// connected from outside: its calls go to the document it's working
+    /// on, wherever that is.
+    pub panel: bool,
 }
 
 /// How long a tool call waits for the UI thread.
@@ -245,6 +250,11 @@ fn handle_http(
         );
     }
     let path = req.url().split('?').next().unwrap_or("").to_string();
+    let panel = req
+        .url()
+        .split('?')
+        .nth(1)
+        .is_some_and(|q| q.split('&').any(|p| p == "panel=1"));
     if path != "/mcp" && path != "/" {
         return respond(req, 404, None);
     }
@@ -294,6 +304,7 @@ fn handle_http(
                 args,
                 reply: rtx,
                 deadline: Instant::now() + CALL_TIMEOUT,
+                panel,
             })
             .is_err()
         {

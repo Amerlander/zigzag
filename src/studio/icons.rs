@@ -84,6 +84,8 @@ pub enum Icon {
     PenDelete,
     /// A check mark: all clear.
     Check,
+    /// A clock face: earlier chats.
+    History,
     /// A rounded corner.
     RoundCorner,
     /// A shape inside a heavy edge: Add Outline.
@@ -437,6 +439,10 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
             );
         }
         Icon::Check => line(&[(0.16, 0.54), (0.4, 0.78), (0.86, 0.24)]),
+        Icon::History => {
+            p.circle_stroke(at(0.5, 0.5), side * 0.42, s);
+            line(&[(0.5, 0.26), (0.5, 0.5), (0.68, 0.62)]);
+        }
         Icon::PenAdd | Icon::PenDelete => {
             // The nib, a little smaller and to the right, the sign at top left.
             let nib = Rect::from_min_size(at(0.3, 0.12), Vec2::splat(side * 0.78));

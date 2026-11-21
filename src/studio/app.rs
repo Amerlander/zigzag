@@ -45,6 +45,29 @@ pub fn standard_hoop(
 /// Typical single-needle home machine speed, for time estimates.
 pub const SPM: f64 = 400.0;
 
+/// A way the thread goes from one object to the next: the object it
+/// leads to (its uid), the way (from where the thread was to where that
+/// object begins), whether it's a route kept with the object (or one the
+/// planner made), and whether it's sewn in the open.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Connection {
+    pub uid: usize,
+    pub way: Vec<P>,
+    pub kept: bool,
+    pub open: bool,
+}
+
+/// A point of an object's thread route in hand: the object (its uid),
+/// which of the route's points (or, pulled out of the middle of a stretch
+/// to add one, the place it goes in at), and where it's been dragged to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RouteDrag {
+    pub uid: usize,
+    pub k: usize,
+    pub insert: bool,
+    pub at: P,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Tool {
     Select,
@@ -114,6 +137,20 @@ pub struct Studio {
     pub(crate) stable: Document,
     pub design: Design,
     pub issues: Vec<Issue>,
+    /// The names of objects delete_object took (outlines with their
+    /// shapes): an agent naming one of them again is told it's gone.
+    pub deleted_names: Vec<String>,
+    /// The line Edit Thread Route made, and the object whose route it is
+    /// (their uids): Route Thread Along Path puts it back from that alone.
+    pub(crate) route_edit: Option<(usize, usize)>,
+    /// A point of a thread route being dragged on the canvas.
+    pub(crate) route_drag: Option<RouteDrag>,
+    /// The connection in hand (the uid of the object it leads to): shown
+    /// in yellow with its points, till something else is clicked.
+    pub(crate) route_active: Option<usize>,
+    /// What `review_design` found other settings would come to, for the
+    /// design as it stood (document, revision, trims): see `trim_what_ifs`.
+    pub(crate) what_ifs: std::cell::RefCell<Option<((u32, u64, usize), Vec<serde_json::Value>)>>,
     pub names: Vec<String>,
     pub(crate) dirty: bool,
     pub(crate) plan_ms: f64,
@@ -368,6 +405,96 @@ impl Studio {
                         s.set_selection(&all);
                     }
                 }
+                // The Agent panel's slash command menu: the commands, or
+                // (`agent-slash-model`) the models after /model.
+                Ok(show @ ("agent-slash" | "agent-slash-model")) => {
+                    s.dock.reveal(crate::dock::PanelId::Agent);
+                    s.agent.prompt = if show == "agent-slash" {
+                        "/"
+                    } else {
+                        "/model "
+                    }
+                    .into();
+                    s.agent.focus = true;
+                }
+                // One change on offer: a question and two buttons.
+                Ok("agent-choice") => {
+                    use crate::agent::{Choice, Entry};
+                    s.dock.reveal(crate::dock::PanelId::Agent);
+                    s.agent.log = vec![
+                        Entry::You("can you clean up the trims".into()),
+                        Entry::Said("I joined the sun's stray pieces and sewed the swoosh in one pass: 4 trims now, down from 9.".into()),
+                        Entry::Choices {
+                            title: "Fewer trims".into(),
+                            question: "Let the thread run over the disc, so it sews faster?".into(),
+                            choices: vec![
+                                Choice {
+                                    label: "Yes, do it".into(),
+                                    detail: "Cuts the thread once instead of 4 times; a short thread line shows on the ring.".into(),
+                                    steps: serde_json::json!([{ "tool": "set_document", "arguments": { "over_sewn": true } }]),
+                                    picked: false,
+                                },
+                                Choice {
+                                    label: "Keep it as it is".into(),
+                                    detail: String::new(),
+                                    steps: serde_json::json!([]),
+                                    picked: false,
+                                },
+                            ],
+                            applied: None,
+                        },
+                        Entry::Done("1 turn · 41 s".into()),
+                    ];
+                }
+                // The Agent panel with a card of choices (`offer_choices`),
+                // as an agent leaves one after a review.
+                Ok("agent-choices") => {
+                    use crate::agent::{Choice, Entry};
+                    s.dock.reveal(crate::dock::PanelId::Agent);
+                    let set = |k: &str, v: serde_json::Value| serde_json::json!([{ "tool": "set_document", "arguments": { k: v } }]);
+                    s.agent.log = vec![
+                        Entry::You("can you clean up the trims".into()),
+                        Entry::Said("I joined the sun's stray pieces and sewed the swoosh in one pass. The review found two more ways to cut trims, but each changes how the badge looks a little, so they're yours to choose.".into()),
+                        Entry::Choices {
+                            title: "Fewer trims".into(),
+                            question: "These make the badge quicker to sew, but each changes the look a little. Which should I do?".into(),
+                            choices: vec![
+                                Choice {
+                                    label: "Let the thread run over the disc".into(),
+                                    detail: "Cuts the thread once instead of 4 times; a short thread line shows on the ring.".into(),
+                                    steps: set("over_sewn", serde_json::json!(true)),
+                                    picked: false,
+                                },
+                                Choice {
+                                    label: "Stitch across tiny gaps".into(),
+                                    detail: "One fewer cut; two tiny stitches show near the sun.".into(),
+                                    steps: set("connect_mm", serde_json::json!(3.0)),
+                                    picked: false,
+                                },
+                                Choice {
+                                    label: "Make the swoosh smooth and shiny".into(),
+                                    detail: "Long side-to-side stitches that catch the light; same sewing time.".into(),
+                                    steps: serde_json::json!([{ "tool": "set_object", "arguments": { "object": "swoosh", "kind": "satin" } }]),
+                                    picked: false,
+                                },
+                                Choice {
+                                    label: "Do all of these".into(),
+                                    detail: String::new(),
+                                    steps: serde_json::json!([]),
+                                    picked: false,
+                                },
+                                Choice {
+                                    label: "Keep it as it is".into(),
+                                    detail: String::new(),
+                                    steps: serde_json::json!([]),
+                                    picked: false,
+                                },
+                            ],
+                            applied: None,
+                        },
+                        Entry::Done("1 turn · 48 s".into()),
+                    ];
+                }
                 // (The update window, offering a release that isn't out.)
                 Ok("update") => {
                     let mut v = crate::update::this_version();
@@ -454,6 +581,11 @@ impl Studio {
             doc,
             design: Design::default(),
             issues: Vec::new(),
+            deleted_names: Vec::new(),
+            route_edit: None,
+            route_drag: None,
+            route_active: None,
+            what_ifs: Default::default(),
             names: Vec::new(),
             dirty: true,
             plan_ms: 0.0,
@@ -621,6 +753,11 @@ impl Studio {
         self.dirty = true;
         self.fit_pending = true;
         self.modified = false;
+        // A document opened into this tab: its own chats are looked for
+        // (unless a conversation is already under way here).
+        if self.agent.log.is_empty() && !self.agent.running() {
+            self.agent.forget_document();
+        }
     }
 
     pub fn replan(&mut self) {
@@ -978,7 +1115,8 @@ impl Studio {
             .any(|i| i.shape.is_none() && i.level == Level::Error)
     }
 
-    pub fn save(&mut self, path: Option<&Path>) {
+    /// Save the document; false if it couldn't be written (the status says why).
+    pub fn save(&mut self, path: Option<&Path>) -> bool {
         // (What's kept as saved is the document, not a corner drag's preview.)
         self.cancel_point_drag();
         match self.doc.save(path) {
@@ -990,8 +1128,12 @@ impl Studio {
                     p.display()
                 );
                 self.dirty = true;
+                true
             }
-            Err(e) => self.status = format!("Couldn't save: {e:#}"),
+            Err(e) => {
+                self.status = format!("Couldn't save: {e:#}");
+                false
+            }
         }
     }
 
@@ -1263,11 +1405,23 @@ impl eframe::App for Studio {
         }
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        immediate_scrolling(&mut raw_input.events);
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // A launch from now on opens a window of its own once this one is
         // gone, rather than handing it files that would never open.
         if let Some(i) = &self.inbox {
             i.close();
+        }
+        // Agents still working stop with the app (they'd go on editing
+        // nothing, holding their chats).
+        self.agent.stop();
+        for t in &mut self.tabs.list {
+            if t.chat.running() {
+                self.agent.stop_parked(&mut t.chat);
+            }
         }
         // Quitting from the menu bar ends the app without a closing frame.
         self.flush_session();
@@ -1315,7 +1469,7 @@ impl Studio {
             if at > call.deadline {
                 continue;
             }
-            let result = self.run_mcp_call(&call.name, &call.args);
+            let result = self.answer_call(&call.name, &call.args, call.panel);
             self.mcp_ui.note(&call.name, &call.args, at, &result);
             self.log_call(&call.name, &call.args, at, &result);
             let _ = call.reply.send(result);
@@ -1391,6 +1545,28 @@ impl Studio {
                 .map(|f| f.path().to_path_buf())
                 .collect()
         });
+        // Images dropped on the Agent panel go with the prompt (where it
+        // was last frame: it's drawn again below).
+        let agent_at = self.agent.panel_rect.take();
+        let on_agent = agent_at.is_some_and(|r| {
+            ctx.input(|i| i.pointer.latest_pos())
+                .is_some_and(|p| r.contains(p))
+        });
+        let dropped: Vec<PathBuf> = if on_agent {
+            let (images, rest): (Vec<PathBuf>, Vec<PathBuf>) = dropped.into_iter().partition(|p| {
+                p.extension().is_some_and(|e| {
+                    zigzag::trace::is_image(&e.to_string_lossy().to_ascii_lowercase())
+                })
+            });
+            for p in images {
+                if !self.attach_file(&p) {
+                    self.status = format!("Couldn't attach {}.", p.display());
+                }
+            }
+            rest
+        } else {
+            dropped
+        };
         let openable = |e: &std::ffi::OsStr| {
             let e = e.to_string_lossy().to_ascii_lowercase();
             e == "svg"
@@ -1773,6 +1949,319 @@ impl Studio {
 
     /// The gaps Connect sews across in the open, lit up while its bar is
     /// in hand: these are the stitches that will show.
+    /// The thread's connections between objects, to see and reshape like
+    /// a path, with the Selection or Direct Selection tool. One under the
+    /// pointer lights up yellow; a click on it takes it in hand, and it
+    /// stays yellow with its points until something else is clicked (or
+    /// Escape). So does the route of an object that's selected. In hand:
+    /// drag a point to move it, drag the small dot in the middle of a
+    /// stretch to add a point there, double-click a point (or right-click
+    /// it) to take it out. The design changes only when the way does (one
+    /// undo step each time): a connection the planner made becomes the
+    /// object's own route with the first change to it.
+    fn route_handles(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
+        let [r, g, b] = crate::tools::ROUTE_RGB;
+        let yellow = Color32::from_rgb(r, g, b);
+        let edge = Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+        let editing = matches!(self.tool, Tool::Select | Tool::Direct)
+            && !self.review.annotating
+            && self.drag.is_none()
+            && self.path_edit.drag.is_none();
+        if !editing {
+            self.route_drag = None;
+            self.route_active = None;
+            return;
+        }
+        if ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.route_active = None;
+            self.route_drag = None;
+        }
+        // (Whether the pointer is on any of it: a press anywhere else
+        // lets go of the one in hand.)
+        let mut on_it = false;
+        // (What's to be done, once they've been gone through.)
+        let mut set: Option<(usize, Vec<(f64, f64)>)> = None;
+        let ways = self.connections();
+        // One under the pointer: lit, and a click takes it in hand.
+        if self.route_drag.is_none()
+            && let Some(at) = ui.ctx().pointer_hover_pos().filter(|p| rect.contains(*p))
+            && let Some(c) = self.connector_at(rect, at)
+            && self.route_active != Some(c.uid)
+        {
+            let pts: Vec<Pos2> = c
+                .way
+                .iter()
+                .map(|&q| self.view.to_screen(rect, q))
+                .collect();
+            painter.add(egui::Shape::line(pts.clone(), egui::Stroke::new(4.0, edge)));
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, yellow)));
+            let resp = ui
+                .interact(
+                    Rect::from_center_size(at, Vec2::splat(16.0)),
+                    ui.make_persistent_id("route-connector"),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Click to reshape how the thread gets here");
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, "Reshape this connection")
+            });
+            on_it |= resp.hovered();
+            if resp.clicked() {
+                self.route_active = Some(c.uid);
+            }
+        }
+        // The ones in hand: clicked, or their object selected.
+        let selected: Vec<usize> = self
+            .sel_indices()
+            .iter()
+            .filter_map(|&i| self.doc.shapes.get(i).map(|s| s.uid))
+            .collect();
+        for c in &ways {
+            let shown = self.route_active == Some(c.uid) || (c.kept && selected.contains(&c.uid));
+            if !shown {
+                continue;
+            }
+            let uid = c.uid;
+            // The way as it is (a kept route's own points; one the planner
+            // made, in as few as go the same way), or as the drag in hand
+            // has it.
+            let base = if c.kept {
+                c.way.clone()
+            } else {
+                crate::tools::simplified(&c.way, 1.5)
+            };
+            let mut way = base.clone();
+            let mut held = None;
+            if let Some(d) = self.route_drag.filter(|d| d.uid == uid) {
+                if d.insert {
+                    way.insert((d.k + 1).min(way.len() - 1), d.at);
+                } else if let Some(q) = way.get_mut(d.k + 1) {
+                    *q = d.at;
+                }
+                held = Some(d.k + 1);
+            }
+            let pts: Vec<Pos2> = way.iter().map(|&q| self.view.to_screen(rect, q)).collect();
+            painter.add(egui::Shape::line(pts.clone(), egui::Stroke::new(3.0, edge)));
+            painter.extend(egui::Shape::dashed_line(
+                &pts,
+                egui::Stroke::new(1.5, yellow),
+                6.0,
+                3.0,
+            ));
+            let as_via = |way: &[P]| -> Vec<(f64, f64)> {
+                way[1..way.len() - 1]
+                    .iter()
+                    .map(|q| ((q.x).round() / 10.0, (q.y).round() / 10.0))
+                    .collect()
+            };
+            // Its points.
+            for k in 0..way.len() - 2 {
+                let at = pts[k + 1];
+                let mut hot = held == Some(k + 1);
+                let resp = ui
+                    .interact(
+                        Rect::from_center_size(at, Vec2::splat(14.0)),
+                        ui.make_persistent_id(("route-point", uid, k)),
+                        Sense::click_and_drag(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::Grab);
+                resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::Role::Button,
+                        true,
+                        format!("Thread route point {}", k + 1),
+                    )
+                });
+                hot |= resp.hovered();
+                on_it |= resp.hovered() || resp.dragged();
+                if resp.double_clicked() || resp.secondary_clicked() {
+                    let mut left = base.clone();
+                    left.remove(k + 1);
+                    set = Some((uid, as_via(&left)));
+                } else if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.dragged()) {
+                    self.route_drag = Some(RouteDrag {
+                        uid,
+                        k,
+                        insert: false,
+                        at: self.view.to_design(rect, p),
+                    });
+                } else if resp.drag_stopped()
+                    && self
+                        .route_drag
+                        .is_some_and(|d| d.uid == uid && !d.insert && d.k == k)
+                {
+                    set = Some((uid, as_via(&way)));
+                }
+                painter.circle_filled(at, if hot { 6.0 } else { 4.5 }, edge);
+                painter.circle_filled(at, if hot { 5.0 } else { 3.5 }, yellow);
+            }
+            // And, in the middle of each stretch, where one can be added.
+            if held.is_none() {
+                for k in 0..base.len() - 1 {
+                    let (a, b) = (pts[k], pts[k + 1]);
+                    if a.distance(b) < 36.0 {
+                        continue;
+                    }
+                    let at = a + (b - a) * 0.5;
+                    let resp = ui
+                        .interact(
+                            Rect::from_center_size(at, Vec2::splat(12.0)),
+                            ui.make_persistent_id(("route-add", uid, k)),
+                            Sense::drag(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::Grab)
+                        .on_hover_text("Drag to add a point to the thread's route");
+                    on_it |= resp.hovered() || resp.dragged();
+                    if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.dragged()) {
+                        self.route_drag = Some(RouteDrag {
+                            uid,
+                            k,
+                            insert: true,
+                            at: self.view.to_design(rect, p),
+                        });
+                    }
+                    let big = resp.hovered();
+                    painter.circle_filled(at, if big { 4.5 } else { 3.0 }, edge);
+                    painter.circle_filled(at, if big { 3.5 } else { 2.0 }, Color32::WHITE);
+                }
+            } else if let Some(d) = self.route_drag.filter(|d| d.uid == uid && d.insert) {
+                // (The new point is held by the dot it was pulled out of.)
+                let resp = ui.interact(
+                    Rect::from_center_size(pts[(d.k + 1).min(pts.len() - 1)], Vec2::splat(12.0)),
+                    ui.make_persistent_id(("route-add", uid, d.k)),
+                    Sense::drag(),
+                );
+                on_it = true;
+                if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.dragged()) {
+                    self.route_drag = Some(RouteDrag {
+                        at: self.view.to_design(rect, p),
+                        ..d
+                    });
+                } else if !ui.input(|i| i.pointer.primary_down()) {
+                    set = Some((uid, as_via(&way)));
+                }
+            }
+        }
+        if self.route_drag.is_some() {
+            ui.ctx().request_repaint();
+        } else if !on_it && ui.input(|i| i.pointer.primary_pressed()) {
+            // A press on anything else: it's let go.
+            self.route_active = None;
+        }
+        if let Some((uid, via)) = set {
+            self.route_drag = None;
+            self.route_active = Some(uid);
+            self.set_route(uid, via);
+        }
+    }
+
+    /// The thread's connections from one object to another, each with the
+    /// object it leads to: the routes kept with objects (as sewn), and
+    /// the ones the planner made by itself.
+    fn connections(&self) -> Vec<Connection> {
+        use zigzag::design::TravelHow;
+        let d = &self.design;
+        let mut out: Vec<Connection> = d
+            .routes
+            .iter()
+            .filter_map(|(si, way)| {
+                let s = self.doc.shapes.get(*si)?;
+                // (A plan a step behind the document is left for next frame.)
+                (s.params.via.as_ref()?.len() + 2 == way.len()).then(|| Connection {
+                    uid: s.uid,
+                    way: way.clone(),
+                    kept: true,
+                    open: true,
+                })
+            })
+            .collect();
+        for t in &d.travels {
+            if t.how == TravelHow::Routed {
+                continue;
+            }
+            let Some(pts) = d
+                .blocks
+                .get(t.block)
+                .and_then(|b| b.runs.get(t.run))
+                .map(|r| &r.pts)
+            else {
+                continue;
+            };
+            let (from, to) = (t.from, t.to.min(pts.len().saturating_sub(1)));
+            if to <= from {
+                continue;
+            }
+            // Between two objects: the stitch it leaves isn't the same
+            // object's as the one it comes to.
+            let whose = |k: usize| {
+                d.stitch_shapes
+                    .get(t.block)
+                    .and_then(|b| b.get(t.run))
+                    .and_then(|spans| spans.iter().rev().find(|s| s.0 <= k))
+                    .map(|s| s.1)
+            };
+            if whose(from) == Some(t.shape) {
+                continue;
+            }
+            let Some(shape) = self.doc.shapes.get(t.shape) else {
+                continue;
+            };
+            if shape.params.via.is_some() || out.iter().any(|c| c.uid == shape.uid) {
+                continue;
+            }
+            out.push(Connection {
+                uid: shape.uid,
+                way: pts[from..=to].to_vec(),
+                kept: false,
+                open: matches!(t.how, TravelHow::Open | TravelHow::Blend),
+            });
+        }
+        out
+    }
+
+    /// The connection under screen point `at`, if one is. One sewn in
+    /// the open (a kept route, or the document's Connect or Blend) with
+    /// either selection tool; one out of sight under stitches with Direct
+    /// Selection alone, where a click isn't taken from what's over it.
+    pub(crate) fn connector_at(&self, rect: Rect, at: Pos2) -> Option<Connection> {
+        self.connections().into_iter().find(|c| {
+            (c.open || self.tool == Tool::Direct)
+                && c.way.windows(2).any(|w| {
+                    let (a, b) = (
+                        self.view.to_screen(rect, w[0]),
+                        self.view.to_screen(rect, w[1]),
+                    );
+                    let ab = b - a;
+                    let t = if ab.length_sq() > 0.0 {
+                        ((at - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    (a + ab * t).distance(at) <= 5.0
+                })
+        })
+    }
+
+    /// Give the object `uid` the thread route `via` (mm): one undo step.
+    pub(crate) fn set_route(&mut self, uid: usize, via: Vec<(f64, f64)>) {
+        let Some(i) = self.doc.shapes.iter().position(|s| s.uid == uid) else {
+            return;
+        };
+        if self.doc.shapes[i].params.via.as_ref() == Some(&via) {
+            return;
+        }
+        if self
+            .structural(|d| {
+                d.shapes[i].params.via = Some(via);
+                Ok(())
+            })
+            .is_ok()
+        {
+            self.replan_soon();
+        }
+    }
+
     fn draw_bridges(&mut self, painter: &egui::Painter, rect: Rect) {
         let Some(until) = self.bridges_peek else {
             return;
@@ -1786,13 +2275,23 @@ impl Studio {
         let p = crate::theme::pal(painter.ctx());
         // Over any thread color: a dark edge, then the highlight.
         let edge = Color32::from_rgba_unmultiplied(0, 0, 0, 170);
-        for &(a, b) in &self.design.bridges {
-            let (a, b) = (self.view.to_screen(rect, a), self.view.to_screen(rect, b));
-            painter.line_segment([a, b], egui::Stroke::new(5.0, edge));
-            painter.line_segment([a, b], egui::Stroke::new(2.5, p.warning));
+        // (What shows, in the warning's color; what blends in, the accent.)
+        let all = self
+            .design
+            .bridges
+            .iter()
+            .map(|&(a, b)| (vec![a, b], p.warning))
+            .chain(self.design.blends.iter().map(|g| (g.clone(), p.accent)));
+        for (way, color) in all {
+            let pts: Vec<Pos2> = way.iter().map(|&q| self.view.to_screen(rect, q)).collect();
+            let Some((&a, &b)) = pts.first().zip(pts.last()) else {
+                continue;
+            };
+            painter.add(egui::Shape::line(pts.clone(), egui::Stroke::new(5.0, edge)));
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(2.5, color)));
             for q in [a, b] {
                 painter.circle_filled(q, 4.5, edge);
-                painter.circle_filled(q, 3.0, p.warning);
+                painter.circle_filled(q, 3.0, color);
             }
         }
     }
@@ -2344,6 +2843,7 @@ impl Studio {
         crate::profile::mark("c:stitches");
         if sewing.is_none() {
             self.draw_bridges(&painter, rect);
+            self.route_handles(ui, &painter, rect);
         }
         self.draw_isolation(&painter, rect);
         if self.view_tools.density {
@@ -2758,11 +3258,325 @@ pub fn mean_satin_width(s: &Shape) -> f64 {
     }
 }
 
+/// Precise scrolling (a trackpad, its momentum after the fingers lift, a
+/// Magic Mouse) moves the content at once, as the system's own apps do.
+/// egui eases a step of 8 points or more in over a tenth of a second,
+/// which is right for a wheel's big notches but makes a trackpad's quick
+/// flicks and its momentum lag and float: those steps are split into
+/// pieces under that, which egui applies in the frame they come in. (A
+/// wheel's notches, in lines, keep their easing.)
+pub(crate) fn immediate_scrolling(events: &mut Vec<egui::Event>) {
+    /// Under egui's threshold for easing (8 points).
+    const PIECE: f32 = 7.5;
+    if !events.iter().any(|e| {
+        matches!(e, egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, .. } if delta.length() >= PIECE)
+    }) {
+        return;
+    }
+    let mut out = Vec::with_capacity(events.len() + 8);
+    for e in events.drain(..) {
+        match e {
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta,
+                phase: egui::TouchPhase::Move,
+                source,
+                modifiers,
+            } if delta.length() >= PIECE => {
+                let n = (delta.length() / PIECE).ceil();
+                for _ in 0..n as usize {
+                    out.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: delta / n,
+                        phase: egui::TouchPhase::Move,
+                        source,
+                        modifiers,
+                    });
+                }
+            }
+            e => out.push(e),
+        }
+    }
+    *events = out;
+}
+
+impl Studio {
+    /// Answer one of the panel agent's tool calls (see [`Studio::answer_call`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn answer_mcp_call(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> crate::mcp::ToolResult {
+        self.answer_call(name, args, true)
+    }
+
+    /// Answer one tool call. The panel's agent's (`panel`) go to the
+    /// document it's working on, in front or not: the one its prompt was
+    /// sent from, or one it has opened or switched to since. An agent
+    /// connected from outside works on the one in front.
+    pub(crate) fn answer_call(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        panel: bool,
+    ) -> crate::mcp::ToolResult {
+        let Some(chat) = self.agent_tab().filter(|_| panel) else {
+            return self.run_mcp_call(name, args);
+        };
+        let target = self
+            .agent
+            .follow
+            .and_then(|rec| self.tab_of(rec))
+            .unwrap_or(chat);
+        let moves = changes_tabs(name, args);
+        if target != self.tabs.active && moves {
+            return crate::mcp::ToolResult::error(
+                "The person is looking at another document while you work on this one: open, switch or make documents when they're back on it.",
+            );
+        }
+        if !moves {
+            return self.visit(target, |s| s.run_mcp_call(name, args));
+        }
+        // It opens, makes or switches documents itself: the one that
+        // comes forward is the one it's working on from here (its chat
+        // stays with the document it was asked in).
+        let (before, asked_in) = (self.session.rec, self.tab_infos()[chat].name.clone());
+        let r = self.run_mcp_call(name, args);
+        if self.session.rec != before {
+            self.agent.follow = Some(self.session.rec);
+            if !self.agent.running() {
+                self.agent.log.push(crate::agent::Entry::Info(format!(
+                    "{} is working here, from the chat in “{asked_in}”.",
+                    self.agent.kind.name()
+                )));
+            }
+        }
+        r
+    }
+}
+
+/// A tool call that opens, makes or brings forward a document (in a batch
+/// too), which can't be done on one that isn't in front.
+fn changes_tabs(name: &str, args: &serde_json::Value) -> bool {
+    const TABS: [&str; 3] = ["open_file", "new_document", "switch_document"];
+    TABS.contains(&name)
+        || (name == "batch"
+            && args["steps"].as_array().is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|st| st["tool"].as_str().is_some_and(|t| TABS.contains(&t)))
+            }))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_connection_the_planner_made_is_clicked_into_a_route() {
+        use serde_json::json;
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 900.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="20mm" viewBox="0 0 40 20">
+            <rect id="left" x="0" y="0" width="10" height="10" fill="#aa0000"/>
+            <rect id="right" x="16" y="0" width="10" height="10" fill="#aa0000"/></svg>"##;
+        let s = h.state_mut();
+        assert!(
+            !s.run_tool("add_svg", &json!({ "svg": svg, "replace": true }))
+                .is_error
+        );
+        // Sewn across the 6 mm between them by the document's Connect.
+        assert!(
+            !s.run_tool("set_document", &json!({ "connect_mm": 20 }))
+                .is_error
+        );
+        s.set_tool(Tool::Select);
+        h.run_steps(4);
+        assert_eq!(h.state().design.bridges.len(), 1);
+        let (a, b) = h.state().design.bridges[0];
+        let right = h.state().names.iter().position(|n| n == "right").unwrap();
+        assert!(h.state().doc.shapes[right].params.via.is_none());
+        // A click on it takes it in hand: yellow, with a dot to pull a
+        // point out of, and the design as it was.
+        let at = h
+            .state()
+            .view
+            .to_screen(h.state().canvas_rect, a.lerp(b, 0.25));
+        let (cuts, undo) = (h.state().design.trim_count(), h.state().undo.len());
+        h.hover_at(at);
+        h.run_steps(2);
+        h.get_by_label("Reshape this connection").click();
+        h.run_steps(3);
+        let uid = h.state().doc.shapes[right].uid;
+        assert_eq!(h.state().route_active, Some(uid));
+        assert!(
+            h.state().doc.shapes[right].params.via.is_none(),
+            "not changed yet"
+        );
+        assert_eq!(h.state().undo.len(), undo);
+        // Reshaped (a point pulled out of its middle): the object's own
+        // route from here, in one step.
+        let mid = h
+            .state()
+            .view
+            .to_screen(h.state().canvas_rect, a.lerp(b, 0.5));
+        h.hover_at(mid);
+        h.run_steps(1);
+        h.drag_at(mid);
+        h.run_steps(1);
+        h.hover_at(mid + Vec2::new(0.0, 15.0));
+        h.run_steps(1);
+        h.hover_at(mid + Vec2::new(0.0, 30.0));
+        h.run_steps(1);
+        h.drop_at(mid + Vec2::new(0.0, 30.0));
+        h.run_steps(3);
+        let s = h.state();
+        let right = s.names.iter().position(|n| n == "right").unwrap();
+        assert_eq!(
+            s.doc.shapes[right].params.via.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(s.undo.len(), undo + 1);
+        assert_eq!(s.design.routes.len(), 1);
+        assert_eq!(s.design.trim_count(), cuts);
+        // A press somewhere else lets it go: no yellow left behind.
+        let away = s.canvas_rect.left_top() + Vec2::new(30.0, 30.0);
+        h.hover_at(away);
+        h.run_steps(1);
+        h.drag_at(away);
+        h.run_steps(1);
+        h.drop_at(away);
+        h.run_steps(2);
+        assert_eq!(h.state().route_active, None);
+        assert!(h.query_by_label("Thread route point 1").is_none());
+    }
+
+    #[test]
+    fn a_thread_route_is_reshaped_by_its_points_on_the_canvas() {
+        use serde_json::json;
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(1400.0, 900.0))
+            .build_ui_state(
+                |ui, s: &mut Studio| s.frame(ui),
+                Studio::with_file(None, None),
+            );
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="80mm" height="20mm" viewBox="0 0 80 20">
+            <rect id="left" x="0" y="0" width="10" height="10" fill="#aa0000"/>
+            <rect id="right" x="60" y="0" width="10" height="10" fill="#aa0000"/></svg>"##;
+        let s = h.state_mut();
+        assert!(
+            !s.run_tool("add_svg", &json!({ "svg": svg, "replace": true }))
+                .is_error
+        );
+        assert!(
+            !s.run_tool(
+                "set_object",
+                &json!({ "object": "right", "route_mm": [[0.0, 20.0]] })
+            )
+            .is_error
+        );
+        s.set_tool(Tool::Select);
+        h.run_steps(4);
+        // Nothing in hand: no points to take hold of. Its object selected:
+        // there they are.
+        assert!(h.query_by_label("Thread route point 1").is_none());
+        let right = h.state().names.iter().position(|n| n == "right").unwrap();
+        h.state_mut().set_selection(&[right]);
+        h.run_steps(2);
+        h.get_by_label("Thread route point 1");
+        let via = |h: &Harness<'_, Studio>| {
+            let s = h.state();
+            let i = s.names.iter().position(|n| n == "right").unwrap();
+            s.doc.shapes[i].params.via.clone().unwrap()
+        };
+        let screen =
+            |h: &Harness<'_, Studio>, q: P| h.state().view.to_screen(h.state().canvas_rect, q);
+        // Its one point, dragged 10 mm down: the route goes through there.
+        let at = screen(&h, P::new(0.0, 200.0));
+        let undo = h.state().undo.len();
+        h.hover_at(at);
+        h.run_steps(1);
+        h.drag_at(at);
+        h.run_steps(1);
+        let to = screen(&h, P::new(0.0, 300.0));
+        h.hover_at(at + (to - at) * 0.5);
+        h.run_steps(1);
+        h.hover_at(to);
+        h.run_steps(1);
+        h.drop_at(to);
+        h.run_steps(3);
+        let v = via(&h);
+        assert_eq!(v.len(), 1);
+        assert!((v[0].0).abs() < 0.3 && (v[0].1 - 30.0).abs() < 0.3, "{v:?}");
+        assert_eq!(h.state().undo.len(), undo + 1, "one step");
+        // The dot in the middle of a stretch, pulled out: a point more.
+        let (_, way) = h.state().design.routes[0].clone();
+        let mid = way[1].lerp(way[2], 0.5);
+        let at = screen(&h, mid);
+        h.hover_at(at);
+        h.run_steps(1);
+        h.drag_at(at);
+        h.run_steps(1);
+        let to = at + Vec2::new(0.0, 40.0);
+        h.hover_at(at + Vec2::new(0.0, 20.0));
+        h.run_steps(1);
+        h.hover_at(to);
+        h.run_steps(1);
+        h.drop_at(to);
+        h.run_steps(3);
+        assert_eq!(via(&h).len(), 2, "{:?}", via(&h));
+        // And a point right-clicked goes.
+        h.get_by_label("Thread route point 1").click_secondary();
+        h.run_steps(3);
+        assert_eq!(via(&h).len(), 1);
+    }
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn a_trackpad_flick_moves_the_content_in_the_frame_it_comes_in() {
+        use egui::{Event, MouseWheelSource, MouseWheelUnit, TouchPhase};
+        let wheel = |unit, dy: f32| Event::MouseWheel {
+            unit,
+            delta: egui::vec2(0.0, dy),
+            phase: TouchPhase::Move,
+            source: MouseWheelSource::Unknown,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // How far egui scrolls in the frame a flick comes in.
+        let first_frame = |events: Vec<Event>| {
+            let ctx = egui::Context::default();
+            let mut moved = egui::Vec2::ZERO;
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| moved = ui.input(|i| i.smooth_scroll_delta));
+            out.textures_delta.clear();
+            moved.y
+        };
+        let flick = vec![wheel(MouseWheelUnit::Point, 30.0)];
+        let mut split = flick.clone();
+        immediate_scrolling(&mut split);
+        assert!(first_frame(flick) < 29.0, "egui on its own eases it in");
+        assert!(
+            (first_frame(split.clone()) - 30.0).abs() < 1e-3,
+            "all of it, at once"
+        );
+        assert!(split.len() >= 4);
+        // A wheel's notch keeps its easing; a small step is left as it is.
+        let mut other = vec![
+            wheel(MouseWheelUnit::Line, 1.0),
+            wheel(MouseWheelUnit::Point, 5.0),
+        ];
+        immediate_scrolling(&mut other);
+        assert_eq!(other.len(), 2);
+    }
 
     fn studio(select: Option<usize>) -> Harness<'static, Studio> {
         let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/badge.svg"));
@@ -3172,5 +3986,8 @@ mod tests {
         assert_eq!(normalize_angle(-135.0), 45.0);
         assert_eq!(normalize_angle(90.0), 90.0);
         assert_eq!(normalize_angle(-90.0), 90.0);
+        // (However far round: an agent can send anything.)
+        assert_eq!(normalize_angle(1e300).abs() <= 90.0, true);
+        assert_eq!(normalize_angle(360.0 + 30.0), 30.0);
     }
 }

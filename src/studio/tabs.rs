@@ -59,6 +59,10 @@ pub struct Tab {
     pub(crate) saved: Option<(u64, Snap)>,
     /// Which recovery file is its (see `session::recovery_file`).
     pub(crate) rec: u32,
+    /// Its conversation with the agent (each document has its own).
+    pub(crate) chat: crate::agent::Chat,
+    /// What the agent deleted from it (see `Studio::deleted_names`).
+    deleted_names: Vec<String>,
 }
 
 impl Tab {
@@ -85,6 +89,8 @@ impl Tab {
             plan_cache: PlanCache::default(),
             saved: None,
             rec,
+            chat: Default::default(),
+            deleted_names: Vec::new(),
         }
     }
 
@@ -227,12 +233,69 @@ impl Studio {
         swap(&mut self.redo, &mut t.redo);
         swap(&mut self.player, &mut t.player);
         swap(&mut self.plan_cache, &mut t.plan_cache);
+        swap(&mut self.deleted_names, &mut t.deleted_names);
         self.session.swap_doc(&mut t.saved, &mut t.rec);
+        self.agent.swap_chat(&mut t.chat);
+    }
+
+    /// The tab holding the document with recovery number `rec`.
+    pub(crate) fn tab_of(&self, rec: u32) -> Option<usize> {
+        if self.session.rec == rec {
+            return Some(self.tabs.active);
+        }
+        (0..self.tab_count()).find(|&i| i != self.tabs.active && self.tabs.list[i].rec == rec)
+    }
+
+    /// The tab whose agent is working, if one is (only one works at a time).
+    pub fn agent_tab(&self) -> Option<usize> {
+        if self.agent.running() {
+            return Some(self.tabs.active);
+        }
+        (0..self.tab_count()).find(|&i| i != self.tabs.active && self.tabs.list[i].chat.running())
+    }
+
+    /// Do `f` with tab `i`'s document in front, without showing it: the
+    /// agent working on a document that isn't in front still edits that
+    /// one. Nothing under way in the one in front is let go (calls wait
+    /// while it is, see `handle_mcp`); a plan out on the worker for either
+    /// is made again when it's back in front.
+    pub(crate) fn visit<R>(&mut self, i: usize, f: impl FnOnce(&mut Studio) -> R) -> R {
+        let a = self.tabs.active;
+        if i == a || i >= self.tab_count() {
+            return f(self);
+        }
+        let park = |s: &mut Studio| {
+            if s.planner.pending {
+                s.dirty = true;
+            }
+            s.planner.superseded();
+        };
+        park(self);
+        // (What's being watched while comments are pinned is the document
+        // in front, which this doesn't change.)
+        let watch = self.review.watch_kept();
+        self.swap_live(a);
+        self.swap_live(i);
+        self.tabs.active = i;
+        let r = f(self);
+        self.review.watch_put(watch);
+        // (Its changes are kept for recovery like any other's.)
+        self.session.behind = true;
+        park(self);
+        self.swap_live(i);
+        self.swap_live(a);
+        self.tabs.active = a;
+        // (What's kept by plan number was the other document's a moment ago.)
+        self.replans += 1;
+        *self.satin_memo.borrow_mut() = None;
+        r
     }
 
     /// Before the document in front goes away: finish what's under way on
     /// it (typing, a preview, a drag) so nothing carries over to the next.
     fn leave_tab(&mut self) {
+        // (Its chat written down while its document is still in front.)
+        self.keep_chat();
         self.finish_typing();
         // (A path the Curvature tool is part way through is kept, in the
         // document it was drawn in; a loop or a drag in hand is let go.)
@@ -276,7 +339,6 @@ impl Studio {
         // density, the stitch meshes) is out of date.
         self.replans += 1;
         *self.satin_memo.borrow_mut() = None;
-        self.agent.work.clear();
         self.leave_review();
     }
 
@@ -373,7 +435,11 @@ impl Studio {
         };
         if self.tab_count() == 1 {
             self.leave_tab();
+            // (Its chat goes with it.)
+            self.agent.new_chat();
             self.set_document(self.blank_document());
+            self.forget_review(rec);
+            self.agent.forget_document();
             self.session.forget_recovery(rec);
             self.status = "Closed.".into();
             return;
@@ -388,7 +454,14 @@ impl Studio {
             };
             self.switch_tab(next);
         }
-        self.tabs.list.remove(i);
+        // Its chat goes with it, and an agent working on it stops.
+        // (And its notes and versions: nothing is left to pin them to.)
+        self.review.notes.retain(|n| n.tab != rec);
+        self.review.turns.retain(|t| t.tab != rec);
+        let mut gone = self.tabs.list.remove(i);
+        if gone.chat.running() {
+            self.agent.stop_parked(&mut gone.chat);
+        }
         if self.tabs.active > i {
             self.tabs.active -= 1;
         }
@@ -479,6 +552,9 @@ impl Studio {
         painter.rect_filled(strip, 0.0, p.dock);
         let infos = self.tab_infos();
         let active = self.tabs.active;
+        // The tab whose agent is working shows it (wherever it is).
+        let working = self.agent_tab();
+        let time = ui.input(|i| i.time);
         let font = egui::FontId::proportional(12.0);
         // Each tab sized to its name, within bounds.
         let galleys: Vec<_> = infos
@@ -566,7 +642,10 @@ impl Studio {
             if xresp.hovered() {
                 painter.rect_filled(xr, 4.0, p.pressed);
             }
-            if infos[i].modified && !(resp.hovered() || xresp.hovered()) {
+            if working == Some(i) && !(resp.hovered() || xresp.hovered()) {
+                crate::agent::spinner(&painter, xr.center(), 4.0, p.accent, time);
+                ui.ctx().request_repaint();
+            } else if infos[i].modified && !(resp.hovered() || xresp.hovered()) {
                 painter.circle_filled(
                     xr.center(),
                     3.5,
@@ -1050,6 +1129,127 @@ mod tests {
             let doc = zigzag::document::Document::open(file).unwrap();
             assert_eq!(doc.shapes.len(), objects, "{}", file.display());
         }
+    }
+
+    #[test]
+    fn the_agent_goes_on_in_a_document_it_opens_and_outside_agents_work_in_front() {
+        use serde_json::json;
+        let a = svg_file("follow", "a.svg");
+        let b = svg_file("follow", "b.svg");
+        let mut s = Studio::with_file(Some(a.clone()), None);
+        s.agent.config = None;
+        s.load(&b);
+        s.switch_tab(0);
+        s.agent.start_fake_run();
+        // An agent connected from outside works on the one in front,
+        // whatever the panel's is doing behind.
+        s.switch_tab(1);
+        let front = s.doc.name.clone();
+        let r = s.answer_call("get_design", &json!({}), false);
+        let v: serde_json::Value = serde_json::from_str(match &r.content[0] {
+            crate::mcp::Content::Text(t) => t,
+            _ => "",
+        })
+        .unwrap();
+        assert_eq!(v["document"]["name"], front);
+        // The panel's agent makes a document of its own: what it does
+        // next is done there, and the one it was asked in is left alone.
+        s.switch_tab(0);
+        let a_shapes = s.doc.shapes.len();
+        assert!(!s.answer_mcp_call("new_document", &json!({})).is_error);
+        assert_eq!(s.tab_count(), 3);
+        assert_eq!(s.agent_tab(), Some(0), "its chat stays where it was asked");
+        let new = s.active_tab();
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect id="fox" width="10" height="10" fill="#c60"/></svg>"##;
+        assert!(
+            !s.answer_mcp_call("add_svg", &json!({ "svg": svg }))
+                .is_error
+        );
+        assert_eq!(s.active_tab(), new);
+        assert_eq!(s.doc.shapes.len(), 1, "drawn in the new document");
+        assert_eq!(
+            s.tabs.list[0].doc.shapes.len(),
+            a_shapes,
+            "the first untouched"
+        );
+        // And still there with another brought forward by the person.
+        let other = s.tab_with_path(&b).unwrap();
+        assert_ne!(other, new);
+        s.switch_tab(other);
+        let b_before = s.doc.to_svg().unwrap();
+        assert!(
+            !s.answer_mcp_call("set_object", &json!({ "object": "fox", "kind": "satin" }))
+                .is_error
+        );
+        assert_eq!(s.doc.to_svg().unwrap(), b_before);
+        s.agent
+            .stop_parked(&mut std::mem::take(&mut s.tabs.list[0].chat));
+    }
+
+    #[test]
+    fn each_document_has_its_own_agent_chat_and_a_working_agent_keeps_to_its_own() {
+        use crate::agent::Entry;
+        use serde_json::json;
+        let a = svg_file("chat", "a.svg");
+        let b = svg_file("chat", "b.svg");
+        let mut s = Studio::with_file(Some(a.clone()), None);
+        s.agent.config = None;
+        s.agent.log.push(Entry::You("make A green".into()));
+        s.agent.session = Some("session-a".into());
+        s.agent.prompt = "half-written for A".into();
+
+        // B has a chat of its own; A's comes back with A.
+        s.load(&b);
+        assert!(s.agent.log.is_empty(), "B starts its own chat");
+        assert!(s.agent.session.is_none());
+        assert!(s.agent.prompt.is_empty());
+        s.agent.log.push(Entry::You("make B blue".into()));
+        s.switch_tab(0);
+        assert_eq!(s.agent.log, [Entry::You("make A green".into())]);
+        assert_eq!(s.agent.session.as_deref(), Some("session-a"));
+        assert_eq!(s.agent.prompt, "half-written for A");
+        s.switch_tab(1);
+        assert_eq!(s.agent.log, [Entry::You("make B blue".into())]);
+
+        // A's agent at work while B is in front: its calls change A.
+        s.switch_tab(0);
+        s.agent.start_fake_run();
+        s.switch_tab(1);
+        assert!(!s.agent.running(), "B's chat isn't the one working");
+        assert_eq!(s.agent_tab(), Some(0));
+        let b_before = s.doc.to_svg().unwrap();
+        let a_count = s.tabs.list[0].doc.shapes.len();
+        let r = s.answer_mcp_call("delete_object", &json!({ "object": "a" }));
+        assert!(!r.is_error);
+        assert_eq!(s.active_tab(), 1, "B stays in front");
+        assert_eq!(s.doc.to_svg().unwrap(), b_before, "B untouched");
+        assert_eq!(s.tabs.list[0].doc.shapes.len(), a_count - 1, "A changed");
+        // It can't open or bring forward documents from behind.
+        assert!(
+            s.answer_mcp_call("switch_document", &json!({ "index": 1 }))
+                .is_error
+        );
+        assert!(
+            s.answer_mcp_call(
+                "batch",
+                &json!({ "atomic": false, "steps": [{ "tool": "new_document" }] })
+            )
+            .is_error
+        );
+        assert_eq!(s.tab_count(), 2);
+        // A prompt in B waits: one document at a time.
+        s.agent.prompt = "make B blue".into();
+        s.agent_send(&egui::Context::default());
+        assert!(
+            matches!(s.agent.log.last(), Some(Entry::Info(t)) if t.contains("working on a")),
+            "{:?}",
+            s.agent.log.last()
+        );
+        assert!(!s.agent.running());
+        // Closing A stops its agent.
+        s.discard_tab(0);
+        assert_eq!(s.agent_tab(), None);
+        assert_eq!(s.agent.log.first(), Some(&Entry::You("make B blue".into())));
     }
 
     #[test]

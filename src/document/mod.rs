@@ -30,6 +30,9 @@ pub use simplify::{SimplifyDesign, SimplifyReport, Unite};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// The attribute on an element an agent made: the prompt it was made for.
+pub const PROMPT_ATTR: &str = "data-zigzag-prompt";
+
 /// Root `<svg>` attribute that holds the document-wide settings.
 pub const SETTINGS_ATTR: &str = "data-zigzag";
 /// The same attribute as written before the app was renamed; still read, and
@@ -56,6 +59,10 @@ pub struct Settings {
     /// Sew across gaps between objects up to this long (mm) with running
     /// stitches instead of cutting the thread (0: always cut).
     pub connect_mm: f64,
+    /// Sew across gaps up to this long (mm) where the thread is close in
+    /// color to what it crosses, and less far the more it would stand out
+    /// (0: off). See [`crate::design::PlanOptions::blend`].
+    pub blend_mm: f64,
     /// Where the thread can't get from one part of an object to the next
     /// out of sight, sew it over the fill already there instead of
     /// cutting it (fewer cuts; the running stitch shows on top).
@@ -76,6 +83,15 @@ pub struct Settings {
     /// Satins narrower than this on average (mm) get a warning. How narrow
     /// a column still sews cleanly depends on the fabric and the thread.
     pub narrow_satin_mm: f64,
+    /// Which chats with the studio's agent are this design's: a random id,
+    /// given the first time it has one (the chats themselves are kept on
+    /// the computer, not in the file). Says nothing about anyone.
+    pub chats: Option<String>,
+}
+
+/// Whether `v` can be a design's chats id (letters and digits, 1–32).
+pub fn is_chats_id(v: &str) -> bool {
+    (1..=32).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// The narrowest satin that isn't warned about when a design doesn't say, mm.
@@ -87,6 +103,10 @@ pub const NARROW_SATIN_MM: std::ops::RangeInclusive<f64> = 0.0..=3.0;
 /// The shortest stitch when a design doesn't say, mm: what ZigZag has
 /// always kept.
 pub const DEFAULT_MIN_STITCH_MM: f64 = 0.1;
+
+/// The furthest a gap is ever sewn across for blending in (mm): a longer
+/// run of stitches across the open pulls at the cloth whatever its color.
+pub const BLEND_MM_MOST: f64 = 15.0;
 
 /// The shortest stitches a design can ask for (mm).
 pub const MIN_STITCH_MM: std::ops::RangeInclusive<f64> = 0.1..=1.0;
@@ -129,12 +149,14 @@ impl Default for Settings {
             hat_order: false,
             hoop: DEFAULT_HOOP,
             connect_mm: 0.0,
+            blend_mm: 0.0,
             over_sewn: false,
             cloth: DEFAULT_CLOTH,
             machine: None,
             min_stitch_mm: DEFAULT_MIN_STITCH_MM,
             lock: Lock::default(),
             narrow_satin_mm: DEFAULT_NARROW_SATIN_MM,
+            chats: None,
         }
     }
 }
@@ -155,6 +177,7 @@ impl Settings {
                     s.hoop = parse_hoop(v).or_else(old).unwrap_or(DEFAULT_HOOP);
                 }
                 "connect" => s.connect_mm = v.parse().unwrap_or(0.0),
+                "blend" => s.blend_mm = v.parse::<f64>().unwrap_or(0.0).clamp(0.0, BLEND_MM_MOST),
                 "oversewn" => s.over_sewn = v == "1",
                 "cloth" if v.len() == 6 => {
                     if let Ok(n) = u32::from_str_radix(v, 16) {
@@ -168,6 +191,7 @@ impl Settings {
                     }
                 }
                 "lock" => s.lock = Lock::parse(v).unwrap_or_default(),
+                "chats" if is_chats_id(v) => s.chats = Some(v.into()),
                 "narrowsatin" => {
                     if let Some(m) = v.parse::<f64>().ok().filter(|m| m.is_finite()) {
                         s.narrow_satin_mm =
@@ -192,6 +216,9 @@ impl Settings {
                 " connect={}",
                 crate::params::fmt_num(self.connect_mm)
             ));
+        }
+        if self.blend_mm > 0.0 {
+            s.push_str(&format!(" blend={}", crate::params::fmt_num(self.blend_mm)));
         }
         if self.over_sewn {
             s.push_str(" oversewn=1");
@@ -221,6 +248,9 @@ impl Settings {
                 " narrowsatin={}",
                 crate::params::fmt_num(self.narrow_satin_mm)
             ));
+        }
+        if let Some(id) = self.chats.as_deref().filter(|v| is_chats_id(v)) {
+            s.push_str(&format!(" chats={id}"));
         }
         s
     }
@@ -270,6 +300,8 @@ pub struct Document {
     /// when the SVG is read, so asking whether an object is lettering
     /// doesn't parse the whole SVG.
     pub(crate) lettering_ids: HashSet<String>,
+    /// The prompts agents made elements for (by element id; see [`PROMPT_ATTR`]).
+    prompts: HashMap<String, String>,
     /// The SVG as usvg read it at the last import (outlines and transforms
     /// are read from it rather than parsing the SVG again). Shared by the
     /// document's copies (undo steps).
@@ -372,6 +404,7 @@ impl Document {
             next_uid: 0,
             next_group,
             lettering_ids: HashSet::new(),
+            prompts: HashMap::new(),
             tree: None,
             root_ts: Default::default(),
             lettering_memo: Default::default(),
@@ -400,8 +433,10 @@ impl Document {
     fn import(&mut self, old_uids: &HashMap<(String, Part), usize>) -> Result<()> {
         self.rev = next_rev();
         // (The lettering ids come from the same parse as the shapes.)
-        let lettering_ids = |doc: &roxmltree::Document| -> HashSet<String> {
-            doc.descendants()
+        // (And the prompts agents made elements for.)
+        let lettering_ids = |doc: &roxmltree::Document| {
+            let ids: HashSet<String> = doc
+                .descendants()
                 .filter(|n| {
                     n.is_element()
                         && (n.attribute("data-tl-lettering").is_some()
@@ -409,10 +444,23 @@ impl Document {
                                 && n.attribute("id").is_some_and(lettering::has_type_tokens)))
                 })
                 .filter_map(|n| n.attribute("id").map(str::to_string))
-                .collect()
+                .collect();
+            let prompts: HashMap<String, String> = doc
+                .descendants()
+                .filter_map(|n| {
+                    Some((
+                        n.attribute("id")?.to_string(),
+                        n.attribute(PROMPT_ATTR)?.to_string(),
+                    ))
+                })
+                .collect();
+            (ids, prompts)
         };
-        let (mut shapes, tree, ids) = svg::load_with_tree_and(self.xml.as_bytes(), lettering_ids)?;
-        self.lettering_ids = ids.unwrap_or_default();
+        let (mut shapes, tree, found) =
+            svg::load_with_tree_and(self.xml.as_bytes(), lettering_ids)?;
+        let (ids, prompts) = found.unwrap_or_default();
+        self.lettering_ids = ids;
+        self.prompts = prompts;
         self.tree = Some(std::sync::Arc::new(tree));
         shapes.retain(|s| !self.removed_parts.contains(&(s.id.clone(), s.part)));
         for s in &mut shapes {
@@ -923,6 +971,14 @@ impl Document {
             remove_overlaps: self.settings.remove_overlaps,
             hat_order: self.settings.hat_order,
             connect: self.settings.connect_mm * 10.0,
+            blend: self.settings.blend_mm * 10.0,
+            // (Only where it's asked about: the plan needn't be made
+            // again for a new cloth color otherwise.)
+            cloth: if self.settings.blend_mm > 0.0 {
+                self.settings.cloth
+            } else {
+                crate::design::PlanOptions::default().cloth
+            },
             over_sewn: self.settings.over_sewn,
             // (A hair under, so a stitch that's exactly the shortest
             // allowed isn't dropped for a rounding error in its length.)
@@ -1127,6 +1183,64 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+impl Document {
+    /// The prompt an agent made object `i` for, if it was kept.
+    pub fn prompt(&self, i: usize) -> Option<&str> {
+        self.prompts
+            .get(&self.shapes.get(i)?.id)
+            .map(String::as_str)
+    }
+
+    /// Keep `prompt` with objects `indices` (on their elements, so it's
+    /// saved, copied and moved with them); replaces any kept before.
+    pub fn set_prompt(&mut self, indices: &[usize], prompt: &str) -> Result<()> {
+        let uids: HashSet<usize> = indices
+            .iter()
+            .filter_map(|&i| self.shapes.get(i))
+            .map(|s| s.uid)
+            .collect();
+        if uids.is_empty() {
+            return Ok(());
+        }
+        self.sync()?;
+        let ids: HashSet<String> = self
+            .shapes
+            .iter()
+            .filter(|s| uids.contains(&s.uid))
+            .map(|s| s.id.clone())
+            .collect();
+        // (A line break kept as one: a bare one in an attribute reads back
+        // as a space.)
+        let value = xml_escape(prompt).replace('\n', "&#10;");
+        let doc = roxmltree::Document::parse(&self.xml).context("parsing document")?;
+        let by_id = elements_by_id(&doc);
+        let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        for id in &ids {
+            let Some(n) = by_id.get(id.as_str()) else {
+                continue;
+            };
+            match n.attributes().find(|a| a.name() == PROMPT_ATTR) {
+                Some(a) => edits.push((a.range_value(), value.clone())),
+                None => {
+                    let at = n.range().start
+                        + 1
+                        + n.tag_name().name().len()
+                        + root_prefix_len(&self.xml, n.range().start);
+                    edits.push((at..at, format!(" {PROMPT_ATTR}=\"{value}\"")));
+                }
+            }
+        }
+        drop(by_id);
+        drop(doc);
+        edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));
+        for (r, t) in edits {
+            self.xml.replace_range(r, &t);
+        }
+        let map = self.uid_map(&HashMap::new());
+        self.import(&map)
+    }
+}
+
 /// The highest number among the ids ZigZag numbers (`tl-drawing-7`, `tl-7`,
 /// `drawing_7_fill`…) in a document. The ones it makes from here on come
 /// after it, so none is the id of something an earlier session left in
@@ -1249,6 +1363,44 @@ use crate::geom::{affine_inv as mat_inv, affine_mul as mat_mul};
 
 #[cfg(test)]
 mod tests {
+    /// What Blend comes to on the designs in `ZIGZAG_DESIGNS`: the cuts
+    /// with it off, and at 6 and 12 mm (with the gaps it sews across).
+    #[test]
+    #[ignore]
+    fn blend_on_designs_of_your_own() {
+        let Some(dir) = std::env::var_os("ZIGZAG_DESIGNS") else {
+            return;
+        };
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "svg"))
+            .collect();
+        files.sort();
+        for f in files {
+            let Ok(mut d) = super::Document::open(&f) else {
+                continue;
+            };
+            let mut row = format!("{:<18}", f.file_name().unwrap().to_string_lossy());
+            for b in [0.0, 6.0, 12.0] {
+                d.settings.blend_mm = b;
+                let t = std::time::Instant::now();
+                let p = d.plan();
+                let ms = t.elapsed().as_millis();
+                let bent = p.blends.iter().filter(|w| w.len() > 2).count();
+                row.push_str(&format!(" [{ms} ms, {bent} bent]"));
+                let shows: f64 = crate::checks::exposed_travel(&p).iter().map(|e| e.mm).sum();
+                row.push_str(&format!(
+                    "  blend {b:>2}: {:>3} cuts, {:>3} blended, {:>5.1} mm showing",
+                    p.trim_count(),
+                    p.blends.len(),
+                    shows
+                ));
+            }
+            eprintln!("{row}");
+        }
+    }
+
     use super::*;
 
     const ILLUSTRATOR: &str = r##"<?xml version="1.0" encoding="UTF-8"?>

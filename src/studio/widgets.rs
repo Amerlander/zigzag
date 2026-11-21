@@ -100,15 +100,11 @@ pub fn allowed_kinds(s: &Shape) -> Vec<Kind> {
     }
 }
 
-pub fn normalize_angle(mut deg: f64) -> f64 {
+pub fn normalize_angle(deg: f64) -> f64 {
     // Rows have no direction: 30° and 210° are the same fill.
-    while deg > 90.0 {
-        deg -= 180.0;
-    }
-    while deg <= -90.0 {
-        deg += 180.0;
-    }
-    deg
+    // (Not by stepping there: an agent's 1e300 would never arrive.)
+    let d = deg.rem_euclid(180.0);
+    if d > 90.0 { d - 180.0 } else { d }
 }
 
 pub fn fmt_int(n: usize) -> String {

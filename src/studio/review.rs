@@ -99,6 +99,8 @@ pub struct Version {
     pub label: String,
     pub doc: Document,
     pub design: Design,
+    /// The stitches' bounds (walking them every frame adds up).
+    pub bounds: zigzag::geom::Bounds,
     /// Tells its stitches apart when drawing (see `paint_stitches_in`).
     pub generation: u64,
     /// The document's fingerprint (see [`doc_key`]).
@@ -124,6 +126,9 @@ pub struct Turn {
     /// Started by an agent connected from outside (`start_variants`), not
     /// a prompt in the Agent panel.
     pub outside: bool,
+    /// The design's problems when the prompt went (what's new after is
+    /// the turn's doing).
+    pub problems: Vec<(Option<String>, String)>,
 }
 
 /// What covers the canvas instead of the document.
@@ -200,7 +205,12 @@ pub struct Review {
     /// only taken again when that moves.)
     watch: Option<(crate::app::Tool, u64, u64)>,
     /// A note was sent while the agent was busy: it goes when it's done.
-    pub queued: bool,
+    /// (For the document with this recovery number.)
+    pub queued: Option<u32>,
+    /// What the person chose in a comparison since the last prompt, for
+    /// the agent to be told with the next.
+    /// (With the document it was chosen in.)
+    pub chose: Option<(u32, String)>,
     next_id: u32,
     next_turn: u64,
     next_gen: u64,
@@ -209,6 +219,16 @@ pub struct Review {
 }
 
 impl Review {
+    /// What's watched while comments are pinned, to put back after a look
+    /// at another document (see `Studio::visit`).
+    pub(crate) fn watch_kept(&self) -> Option<(crate::app::Tool, u64, u64)> {
+        self.watch
+    }
+
+    pub(crate) fn watch_put(&mut self, w: Option<(crate::app::Tool, u64, u64)>) {
+        self.watch = w;
+    }
+
     /// How many notes on document `tab` go with the next prompt.
     pub fn pending(&self, tab: u32) -> usize {
         self.notes
@@ -225,8 +245,11 @@ impl Review {
     }
 
     /// The Agent panel's turn that ended at line `k` of the transcript.
-    pub fn turn_ending_at(&self, k: usize) -> Option<&Turn> {
-        self.turns.iter().find(|t| !t.outside && t.end == Some(k))
+    /// The panel's turn on document `tab` that ended at line `k` of its chat.
+    pub fn turn_ending_at(&self, k: usize, tab: u32) -> Option<&Turn> {
+        self.turns
+            .iter()
+            .find(|t| !t.outside && t.tab == tab && t.end == Some(k))
     }
 
     pub fn turn(&self, id: u64) -> Option<&Turn> {
@@ -694,6 +717,7 @@ impl Studio {
             label: label.into(),
             doc: self.doc.clone(),
             design: self.design.clone(),
+            bounds: self.design.bounds(),
             generation: (1 << 48) + self.review.next_gen,
             key: doc_key(&self.doc),
         }
@@ -701,8 +725,13 @@ impl Studio {
 
     /// Put `doc` in place of the document, as one undo step.
     fn restore(&mut self, doc: Document) {
+        // (The design, not where it's saved or what it's called: that may
+        // have changed since the version was kept.)
         let _ = self.structural(|d| {
+            let (path, name) = (d.path.take(), std::mem::take(&mut d.name));
             *d = doc;
+            d.path = path;
+            d.name = name;
             Ok(())
         });
         self.selected = self
@@ -720,7 +749,7 @@ impl Studio {
                 n.state = NoteState::Sent;
             }
         }
-        self.review.queued = false;
+        self.review.queued = None;
         self.begin_turn_without_notes(prompt, start);
     }
 
@@ -742,16 +771,21 @@ impl Studio {
             variants: Vec::new(),
             collecting: false,
             outside: false,
+            problems: self.problems(),
         });
         self.review.prune();
     }
 
     /// The agent finished (or stopped): what it made of the design.
     pub(crate) fn end_turn(&mut self) {
-        // A new chat: its turns go with it (an outside agent's stay).
+        // A new chat: its turns go with it (an outside agent's stay, and
+        // so do other documents', whose chats are their own).
         let lines = self.agent.log.len();
+        let here = self.session.rec;
         let before = self.review.turns.len();
-        self.review.turns.retain(|t| t.outside || t.start < lines);
+        self.review
+            .turns
+            .retain(|t| t.outside || t.tab != here || t.start < lines);
         if self.review.turns.len() != before {
             let showing = self.review.showing;
             if let Some(Showing::Before(id) | Showing::Compare(id)) = showing
@@ -764,16 +798,11 @@ impl Studio {
             .review
             .turns
             .iter()
-            .position(|t| !t.outside && t.end.is_none())
+            .position(|t| !t.outside && t.tab == here && t.end.is_none())
         else {
             return;
         };
         self.review.turns[k].end = Some(lines.saturating_sub(1));
-        if self.review.turns[k].tab != self.session.rec {
-            // (Another document came forward while it worked.)
-            self.review.turns[k].collecting = false;
-            return;
-        }
         let changed = doc_key(&self.doc) != self.review.turns[k].before.key;
         if self.review.turns[k].collecting {
             self.review.turns[k].collecting = false;
@@ -788,13 +817,42 @@ impl Studio {
             }
         } else if changed {
             self.review.turns[k].after = Some(self.version("After"));
+            // What it left wrong that wasn't before: said, with the way
+            // to have it put right.
+            // (Problems: not the notes on how something will be sewn.)
+            let new: Vec<Value> = self
+                .new_problems(&self.review.turns[k].problems)
+                .into_iter()
+                .filter(|p| p["level"] != "note")
+                .collect();
+            if let Some(first) = new.first() {
+                let what = first["message"]
+                    .as_str()
+                    .unwrap_or("a problem")
+                    .trim_end_matches('.');
+                let more = match new.len() - 1 {
+                    0 => String::new(),
+                    n => format!(" (and {n} more)"),
+                };
+                self.agent.log.push(crate::agent::Entry::Error(format!(
+                    "The design has problems it didn't have before: {what}{more}. The Issues list has them all, and Fix sends them to the agent."
+                )));
+            }
         }
+    }
+
+    /// A document was closed: its notes and versions go with it.
+    pub(crate) fn forget_review(&mut self, tab: u32) {
+        self.leave_review();
+        self.review.notes.retain(|n| n.tab != tab);
+        self.review.turns.retain(|t| t.tab != tab);
+        self.review.queued = None;
     }
 
     /// Another document came forward: what covered the canvas was the
     /// last one's.
     pub(crate) fn leave_review(&mut self) {
-        self.review.showing = None;
+        self.close_compare();
         self.review.annotating = false;
         self.review.editing = None;
         self.review.press = None;
@@ -887,7 +945,7 @@ impl Studio {
         self.review.selected = None;
         self.review.watch = on.then(|| (self.tool, doc_key(&self.doc), self.doc.rev()));
         if on {
-            self.review.showing = None;
+            self.close_compare();
         } else {
             self.finish_note();
             // (The eye that hides the markers goes with the bar.)
@@ -1363,7 +1421,12 @@ impl Studio {
                                     .desired_width(w)
                                     .min_size(Vec2::new(w, BUTTON))
                                     .align(egui::Align2::LEFT_CENTER)
-                                    .return_key(None),
+                                    // (Enter sends, below; Shift-Enter is
+                                    // the field's own new line, at the caret.)
+                                    .return_key(egui::KeyboardShortcut::new(
+                                        egui::Modifiers::SHIFT,
+                                        Key::Enter,
+                                    )),
                             );
                             r.widget_info(|| {
                                 egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Comment")
@@ -1375,9 +1438,6 @@ impl Studio {
                                 ui.input(|i| (i.key_pressed(Key::Enter), i.modifiers.shift));
                             if r.has_focus() && enter && !shift {
                                 send = true;
-                            }
-                            if r.has_focus() && enter && shift {
-                                text.push('\n');
                             }
                             if ui.input(|i| i.key_pressed(Key::Escape)) {
                                 esc = true;
@@ -1408,7 +1468,7 @@ impl Studio {
     /// for later), or when it's done with what it's doing.
     fn send_notes(&mut self, ctx: &egui::Context) {
         if self.agent.running() {
-            self.review.queued = true;
+            self.review.queued = Some(self.session.rec);
             return;
         }
         let typed = std::mem::take(&mut self.agent.prompt);
@@ -1418,8 +1478,8 @@ impl Studio {
 
     /// A note sent while the agent was busy goes once it's done.
     pub(crate) fn send_queued_notes(&mut self, ctx: &egui::Context) {
-        if self.review.queued && !self.agent.running() {
-            self.review.queued = false;
+        if self.review.queued == Some(self.session.rec) && !self.agent.running() {
+            self.review.queued = None;
             if self.review.pending(self.session.rec) > 0 {
                 self.send_notes(ctx);
             }
@@ -1554,7 +1614,7 @@ impl Studio {
             NotesAction::Edit(id) => {
                 self.review.editing = Some(id);
                 self.review.focus = true;
-                self.review.showing = None;
+                self.close_compare();
             }
             NotesAction::Remove(id) => {
                 self.review.notes.retain(|n| n.id != id);
@@ -1612,6 +1672,19 @@ impl Studio {
                         Pane::Variant(k) => format!("Using version {} ({label}).", letter(k)),
                         _ => format!("Using the {}.", label.to_lowercase()),
                     };
+                    self.review.chose = Some((
+                        self.session.rec,
+                        match pane {
+                            Pane::Variant(k) => format!("version {} ({label})", letter(k)),
+                            _ => format!("the {}", label.to_lowercase()),
+                        },
+                    ));
+                }
+                // The person has chosen: the round is over, whoever's it
+                // was (an agent still finishing mustn't put the original
+                // back over the choice).
+                if let Some(t) = self.review.turn_mut(turn) {
+                    t.collecting = false;
                 }
                 self.close_compare();
             }
@@ -1828,20 +1901,19 @@ impl Studio {
         }
         // Everything they show, to fit them all.
         let mut b = zigzag::geom::Bounds::empty();
-        let mut add = |d: &Design| {
-            let x = d.bounds();
+        let mut add = |x: zigzag::geom::Bounds| {
             if !x.is_empty() {
                 b.add(x.min);
                 b.add(x.max);
             }
         };
-        add(&t.before.design);
-        t.variants.iter().for_each(|v| add(&v.design));
+        add(t.before.bounds);
+        t.variants.iter().for_each(|v| add(v.bounds));
         if let Some(a) = &t.after {
-            add(&a.design);
+            add(a.bounds);
         }
         if live {
-            add(&self.design);
+            add(self.design.bounds());
         }
         let aspect = if b.is_empty() {
             1.0
@@ -2038,6 +2110,7 @@ impl Studio {
 
     /// `resolve_note`: the agent dealt with a note.
     pub(crate) fn tool_resolve_note(&mut self, args: &Value) -> Result<ToolResult, String> {
+        // (The document being worked on: in front, or visited.)
         let here = self.session.rec;
         let number = args
             .get("number")
@@ -2049,12 +2122,23 @@ impl Studio {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let n = self
+        // (One that was sent before one that wasn't, should a number have
+        // come round again.)
+        let open =
+            |n: &Note, state: NoteState| n.tab == here && n.number == number && n.state == state;
+        let k = self
             .review
             .notes
-            .iter_mut()
-            .find(|n| n.tab == here && n.number == number && n.state != NoteState::Resolved)
+            .iter()
+            .position(|n| open(n, NoteState::Sent))
+            .or_else(|| {
+                self.review
+                    .notes
+                    .iter()
+                    .position(|n| open(n, NoteState::Open))
+            })
             .ok_or(format!("no open note {number}"))?;
+        let n = &mut self.review.notes[k];
         n.state = NoteState::Resolved;
         n.reply = reply;
         Ok(ToolResult::text(format!("Resolved note {number}.")))
@@ -2103,6 +2187,7 @@ impl Studio {
             variants: Vec::new(),
             collecting: true,
             outside: true,
+            problems: Vec::new(),
         });
         self.review.prune();
         self.review.open(Showing::Compare(id));
@@ -2684,6 +2769,87 @@ mod tests {
         assert_eq!(t.variants[1].label, "Version B");
         assert!(t.after.is_none());
         assert_eq!(doc_key(&h.state().doc), original);
+    }
+
+    #[test]
+    fn a_version_chosen_while_the_agent_finishes_stays_chosen() {
+        let mut h = studio();
+        h.state_mut()
+            .agent
+            .log
+            .push(crate::agent::Entry::You("two".into()));
+        h.state_mut().begin_turn("two".into(), 0);
+        h.state_mut().run_mcp_call("start_variants", &json!({}));
+        h.state_mut()
+            .run_mcp_call("set_object", &json!({ "object": "sun", "kind": "satin" }));
+        h.state_mut()
+            .run_mcp_call("save_variant", &json!({ "label": "Satin" }));
+        // The person picks it before the agent has said its last word.
+        let turn = h.state().review.turns[0].id;
+        let chosen = h.state().review.turns[0].variants[0].key.clone();
+        h.state_mut().turn_action(TurnAction::Use {
+            turn,
+            pane: Pane::Variant(0),
+        });
+        assert_eq!(doc_key(&h.state().doc), chosen);
+        h.state_mut()
+            .agent
+            .log
+            .push(crate::agent::Entry::Done(String::new()));
+        h.run_steps(3);
+        let t = &h.state().review.turns[0];
+        assert_eq!(t.variants.len(), 1, "no copy of the choice kept");
+        assert_eq!(doc_key(&h.state().doc), chosen, "the choice stays");
+    }
+
+    #[test]
+    fn a_turn_that_only_leaves_notes_on_the_sewing_isnt_said_to_leave_problems() {
+        let mut h = studio();
+        h.state_mut()
+            .agent
+            .log
+            .push(crate::agent::Entry::You("wider".into()));
+        h.state_mut().begin_turn("wider".into(), 0);
+        // A satin wide enough that its stitches are split: a note, not a problem.
+        h.state_mut().run_mcp_call(
+            "add_svg",
+            &json!({ "svg": r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 60"><path id="bar_satin" d="M5 30 L55 30" stroke="#222" stroke-width="9" fill="none"/></svg>"##, "width_mm": 50 }),
+        );
+        let s = h.state();
+        assert!(
+            s.issues
+                .iter()
+                .any(|i| i.level == zigzag::checks::Level::Info),
+            "{:?}",
+            s.issues
+        );
+        let only_notes = s
+            .issues
+            .iter()
+            .all(|i| i.level == zigzag::checks::Level::Info);
+        h.state_mut()
+            .agent
+            .log
+            .push(crate::agent::Entry::Done(String::new()));
+        h.run_steps(3);
+        let said = h.state().agent.log.iter().any(
+            |e| matches!(e, crate::agent::Entry::Error(m) if m.contains("didn't have before")),
+        );
+        assert_eq!(said, !only_notes, "{:?}", h.state().issues);
+    }
+
+    #[test]
+    fn a_note_waiting_for_the_agent_doesnt_go_once_its_stopped() {
+        let mut h = studio();
+        h.state_mut().add_note(P::new(0.0, 0.0), None);
+        let rec = h.state().session.rec;
+        h.state_mut().review.queued = Some(rec);
+        // Stop (nothing running here: the flag is what the frame reads).
+        h.state_mut().agent.stop();
+        h.run_steps(2);
+        assert!(h.state().review.queued.is_none());
+        assert!(!h.state().agent.running());
+        assert!(h.state().agent.log.is_empty(), "nothing was sent");
     }
 
     #[test]

@@ -40,6 +40,12 @@ pub struct TraceOptions {
     /// Thread colours to use: each traced colour becomes the nearest of these.
     /// Empty keeps the image's own colours.
     pub threads: Vec<[u8; 3]>,
+    /// Threads already in use (a design's own): a traced colour within
+    /// `palette_reach` of one becomes it, before `threads` are looked at.
+    pub palette: Vec<[u8; 3]>,
+    /// How far (CIEDE2000) a colour may be from a palette thread and still
+    /// become it.
+    pub palette_reach: f64,
 }
 
 impl Default for TraceOptions {
@@ -53,6 +59,8 @@ impl Default for TraceOptions {
             speckle_mm: 1.0,
             width_mm: 80.0,
             threads: Vec::new(),
+            palette: Vec::new(),
+            palette_reach: 10.0,
         }
     }
 }
@@ -168,6 +176,7 @@ pub fn trace(img: &Image, o: &TraceOptions) -> Result<Traced> {
         r,
         mm,
         &o.threads,
+        (&o.palette, o.palette_reach),
         o.remove_background,
         method,
     ))
@@ -245,6 +254,7 @@ fn to_svg(
     r: &Raster,
     mm: f64,
     threads: &[[u8; 3]],
+    palette: (&[[u8; 3]], f64),
     remove_white: bool,
     method: &'static str,
 ) -> Traced {
@@ -267,7 +277,18 @@ fn to_svg(
         if d.is_empty() || (remove_white && white && p.stroke.is_some()) {
             continue;
         }
-        let c = nearest(p.color, threads);
+        // A thread already in use if one is near, else the chart's nearest.
+        let c = match palette.0.first() {
+            Some(_) => {
+                let n = nearest(p.color, palette.0);
+                if crate::formats::perceptual_distance(p.color, n) <= palette.1 {
+                    n
+                } else {
+                    nearest(p.color, threads)
+                }
+            }
+            None => nearest(p.color, threads),
+        };
         match used.iter_mut().find(|(u, _)| *u == c) {
             Some(u) => u.1 += p.pixels,
             None => used.push((c, p.pixels)),
@@ -321,6 +342,30 @@ mod tests {
             }
         });
         Image { raster }
+    }
+
+    #[test]
+    fn a_colour_near_a_palette_thread_becomes_it_and_a_far_one_stays_its_own() {
+        // The logo's red is a shade off the palette's; its blue is far from it.
+        let o = TraceOptions {
+            palette: vec![[200, 20, 35]],
+            ..Default::default()
+        };
+        let t = trace(&logo(200, 100), &o).unwrap();
+        assert!(t.colors.contains(&[200, 20, 35]), "{:?}", t.colors);
+        assert!(!t.colors.contains(&[220, 30, 40]));
+        assert!(
+            t.colors.iter().any(|c| c[2] > 150),
+            "the blue is kept: {:?}",
+            t.colors
+        );
+        // Out of reach: the red keeps its own colour.
+        let near = TraceOptions {
+            palette_reach: 0.5,
+            ..o
+        };
+        let t = trace(&logo(200, 100), &near).unwrap();
+        assert!(!t.colors.contains(&[200, 20, 35]), "{:?}", t.colors);
     }
 
     #[test]
