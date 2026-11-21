@@ -1,29 +1,25 @@
 # Changelog
 
-## 0.1.6 — 2026-11-19
+## 0.1.7 — 2026-11-20
 
-- Satin lettering is read stroke by stroke, with Corners (Cut, Auto or
-  Mitred) in the Stitch panel and an even zigzag; more letters sew in one
-  piece of thread.
-- Object › Break into Columns makes a satin shape the two-rail columns
-  it's sewn as, to reorder and reshape.
-- Settings › General can hide the advanced settings in the Stitch and
-  Document panels.
-- Annotate pins comments on the canvas for the agent; each prompt keeps
-  the design before it, to flip back to, set side by side or revert to;
-  and the agent can make versions to choose from.
-- Agents can reshape a column's rails and rungs, turn text into shapes,
-  and measure whether a change made the stitching cleaner.
-- Issues checks the stitches themselves: too short, too long, pieces a
-  trimmer can miss, piled needle points and thread.
-- Scaled text says its new height, new text starts in the last font, and
-  new objects in a reopened design no longer repeat an id.
+- Each design keeps its chats with the agent; paste or drop images into
+  the prompt, and type `/` for commands (model, effort, history, fix).
+- The agent can review a design before it's sewn, offer choices as a
+  card, align, combine and rename objects, and route a thread round a cut.
+- Blend in the Document panel sews across gaps where the thread is close
+  in color to what it crosses, instead of cutting.
+- Files open in the ZigZag window that's already running; Windows keeps
+  its open tabs and settings.
+- A failing agent tool or a malformed design no longer crashes the app.
 
-[Full release notes](packaging/releases/0.1.6.md)
-· [Downloads](https://github.com/simpsoka/zigzag/releases/tag/v0.1.6)
+[Full release notes](packaging/releases/0.1.7.md)
+· [Downloads](https://github.com/simpsoka/zigzag/releases/tag/v0.1.7)
 
 ## Previous releases
 
+- [0.1.6](packaging/releases/0.1.6.md): satin lettering read stroke by
+  stroke with Corners, Break into Columns, Annotate and versions for the
+  agent, stitch checks in Issues.
 - [0.1.5](packaging/releases/0.1.5.md): Rotate, Curvature, Blob Brush,
   Lasso, Shape Builder, Knife and Eyedropper tools, Layers with the top at
   the top, a movable task bar, interface size.
